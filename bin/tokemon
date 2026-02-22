@@ -263,8 +263,8 @@ def _resolve_range(range_args: list[str]) -> Tuple[datetime, datetime, str]:
             start = _shift_months(end, -1)
             return start, end, preset
         if preset == "year":
-            start = now.replace(year=now.year - 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-            end = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+            end = now
+            start = _shift_months(end, -12)
             return start, end, preset
         raise ValueError(
             "range must be one of [current_week|week|month|year] or two dates: YYYY-MM-DD YYYY-MM-DD"

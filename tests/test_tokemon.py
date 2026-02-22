@@ -540,7 +540,7 @@ class TokemonCliTest(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("daily|weekly|monthly", result.stderr)
 
-    def test_range_presets_relative_and_last_calendar_year(self) -> None:
+    def test_range_presets_relative_and_trailing_windows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             env = {
@@ -562,17 +562,7 @@ class TokemonCliTest(unittest.TestCase):
             self.assertEqual(month_start, _shift_months(month_end, -1))
 
             year_start, year_end = read_range("year")
-            self.assertEqual(year_start.month, 1)
-            self.assertEqual(year_start.day, 1)
-            self.assertEqual(year_start.hour, 0)
-            self.assertEqual(year_start.minute, 0)
-            self.assertEqual(year_start.second, 0)
-            self.assertEqual(year_end.month, 1)
-            self.assertEqual(year_end.day, 1)
-            self.assertEqual(year_end.hour, 0)
-            self.assertEqual(year_end.minute, 0)
-            self.assertEqual(year_end.second, 0)
-            self.assertEqual(year_start.year, year_end.year - 1)
+            self.assertEqual(year_start, _shift_months(year_end, -12))
 
             current_week_start, current_week_end = read_range("current_week")
             self.assertEqual(current_week_end - current_week_start, timedelta(days=7))
