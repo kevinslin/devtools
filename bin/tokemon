@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""Token usage reporting CLI.
+
+Usage:
+  tokemon report [range] [...options]
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import sys
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
+from typing import Dict, Iterable, Iterator, Optional, Tuple
+
+TOKEN_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+UNKNOWN_WORKSPACE = "(unknown)"
+
+
+@dataclass
+class UsageRecord:
+    timestamp: datetime
+    workspace: str
+    metrics: Dict[str, int]
+
+
+def _local_tz():
+    return datetime.now().astimezone().tzinfo
+
+
+def _safe_int(value: object) -> int:
+    try:
+        num = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return num if num > 0 else 0
+
+
+def _parse_timestamp(raw: object) -> Optional[datetime]:
+    if not isinstance(raw, str) or not raw:
+        return None
+    text = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_local_tz())
+    return parsed.astimezone(_local_tz())
+
+
+def _normalize_codex_totals(raw: object) -> Optional[Dict[str, int]]:
+    if not isinstance(raw, dict):
+        return None
+    return {field: _safe_int(raw.get(field, 0)) for field in TOKEN_FIELDS}
+
+
+def _normalize_claude_usage(raw: object) -> Optional[Dict[str, int]]:
+    if not isinstance(raw, dict):
+        return None
+    input_tokens = _safe_int(raw.get("input_tokens", 0))
+    cached_input_tokens = _safe_int(raw.get("cache_creation_input_tokens", 0)) + _safe_int(
+        raw.get("cache_read_input_tokens", 0)
+    )
+    output_tokens = _safe_int(raw.get("output_tokens", 0))
+    reasoning_output_tokens = _safe_int(raw.get("reasoning_output_tokens", 0))
+    total_tokens = input_tokens + cached_input_tokens + output_tokens + reasoning_output_tokens
+    return {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": reasoning_output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _delta_metrics(current: Dict[str, int], previous: Optional[Dict[str, int]]) -> Dict[str, int]:
+    if previous is None:
+        return current.copy()
+    delta: Dict[str, int] = {}
+    for key in TOKEN_FIELDS:
+        current_value = current.get(key, 0)
+        previous_value = previous.get(key, 0)
+        diff = current_value - previous_value
+        delta[key] = diff if diff >= 0 else current_value
+    return delta
+
+
+def _is_nonzero(metrics: Dict[str, int]) -> bool:
+    return any(metrics.get(field, 0) > 0 for field in TOKEN_FIELDS)
+
+
+def _iter_jsonl(path: Path) -> Iterator[dict]:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    item = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    yield item
+    except OSError:
+        return
+
+
+def _codex_files() -> Iterable[Path]:
+    sessions_root = Path(os.environ.get("TOKEMON_CODEX_SESSIONS_ROOT", "~/.codex/sessions")).expanduser()
+    archived_root = Path(os.environ.get("TOKEMON_CODEX_ARCHIVED_ROOT", "~/.codex/archived_sessions")).expanduser()
+    if sessions_root.exists():
+        yield from sorted(sessions_root.rglob("*.jsonl"))
+    if archived_root.exists():
+        yield from sorted(archived_root.glob("*.jsonl"))
+
+
+def _claude_files() -> Iterable[Path]:
+    projects_root = Path(os.environ.get("TOKEMON_CLAUDE_PROJECTS_ROOT", "~/.claude/projects")).expanduser()
+    if projects_root.exists():
+        yield from sorted(projects_root.rglob("*.jsonl"))
+
+
+def _iter_codex_usage(start: datetime, end: datetime) -> Iterator[UsageRecord]:
+    for path in _codex_files():
+        previous_totals: Optional[Dict[str, int]] = None
+        workspace = UNKNOWN_WORKSPACE
+        for item in _iter_jsonl(path):
+            item_type = item.get("type")
+            if item_type == "session_meta":
+                payload = item.get("payload")
+                if isinstance(payload, dict):
+                    cwd = payload.get("cwd")
+                    if isinstance(cwd, str) and cwd:
+                        workspace = cwd
+                continue
+
+            if item_type != "event_msg":
+                continue
+            payload = item.get("payload")
+            if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                continue
+            info = payload.get("info")
+            if not isinstance(info, dict):
+                continue
+            current_totals = _normalize_codex_totals(info.get("total_token_usage"))
+            if current_totals is None:
+                continue
+
+            delta = _delta_metrics(current_totals, previous_totals)
+            previous_totals = current_totals
+            if not _is_nonzero(delta):
+                continue
+
+            ts = _parse_timestamp(item.get("timestamp"))
+            if ts is None or ts < start or ts >= end:
+                continue
+            yield UsageRecord(timestamp=ts, workspace=workspace, metrics=delta)
+
+
+def _iter_claude_usage(start: datetime, end: datetime) -> Iterator[UsageRecord]:
+    best_by_message: Dict[Tuple[str, str], UsageRecord] = {}
+
+    for path in _claude_files():
+        for item in _iter_jsonl(path):
+            if item.get("type") != "assistant":
+                continue
+            message = item.get("message")
+            if not isinstance(message, dict):
+                continue
+            message_id = message.get("id")
+            if not isinstance(message_id, str) or not message_id:
+                continue
+            session_id = item.get("sessionId")
+            if not isinstance(session_id, str) or not session_id:
+                session_id = str(path)
+            usage = _normalize_claude_usage(message.get("usage"))
+            if usage is None:
+                continue
+            ts = _parse_timestamp(item.get("timestamp"))
+            if ts is None:
+                continue
+            workspace = item.get("cwd")
+            if not isinstance(workspace, str) or not workspace:
+                workspace = UNKNOWN_WORKSPACE
+
+            key = (session_id, message_id)
+            existing = best_by_message.get(key)
+            if existing is None:
+                best_by_message[key] = UsageRecord(timestamp=ts, workspace=workspace, metrics=usage)
+                continue
+
+            merged = {field: max(existing.metrics.get(field, 0), usage.get(field, 0)) for field in TOKEN_FIELDS}
+            merged_timestamp = ts if ts > existing.timestamp else existing.timestamp
+            merged_workspace = existing.workspace if existing.workspace != UNKNOWN_WORKSPACE else workspace
+            best_by_message[key] = UsageRecord(
+                timestamp=merged_timestamp,
+                workspace=merged_workspace,
+                metrics=merged,
+            )
+
+    for record in best_by_message.values():
+        if record.timestamp < start or record.timestamp >= end:
+            continue
+        if not _is_nonzero(record.metrics):
+            continue
+        yield record
+
+
+def _start_of_week_sunday(when: datetime) -> datetime:
+    days_since_sunday = (when.weekday() + 1) % 7
+    midnight = when.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight - timedelta(days=days_since_sunday)
+
+
+def _next_month_start(when: datetime) -> datetime:
+    if when.month == 12:
+        return when.replace(year=when.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    return when.replace(month=when.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def _resolve_range(range_args: list[str]) -> Tuple[datetime, datetime, str]:
+    now = datetime.now().astimezone()
+    tzinfo = _local_tz()
+
+    if not range_args:
+        range_args = ["current_week"]
+
+    if len(range_args) == 1:
+        preset = range_args[0]
+        if preset == "current_week":
+            start = _start_of_week_sunday(now)
+            end = start + timedelta(days=7)
+            return start, end, preset
+        if preset == "week":
+            end = _start_of_week_sunday(now)
+            start = end - timedelta(days=7)
+            return start, end, preset
+        if preset == "month":
+            start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            end = _next_month_start(start)
+            return start, end, preset
+        if preset == "year":
+            start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+            end = start.replace(year=start.year + 1)
+            return start, end, preset
+        raise ValueError(
+            "range must be one of [current_week|week|month|year] or two dates: YYYY-MM-DD YYYY-MM-DD"
+        )
+
+    if len(range_args) == 2:
+        try:
+            start_date = date.fromisoformat(range_args[0])
+            end_date = date.fromisoformat(range_args[1])
+        except ValueError as exc:
+            raise ValueError("invalid date range, expected YYYY-MM-DD YYYY-MM-DD") from exc
+        if end_date < start_date:
+            raise ValueError("end date must be >= start date")
+        start = datetime.combine(start_date, time.min, tzinfo=tzinfo)
+        # End date is inclusive in user input, so convert to exclusive bound.
+        end = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=tzinfo)
+        return start, end, f"{start_date.isoformat()}..{end_date.isoformat()}"
+
+    raise ValueError("range accepts either one preset or two dates")
+
+
+def _bucket_start(ts: datetime, sum_by_minutes: int) -> datetime:
+    bucket_seconds = sum_by_minutes * 60
+    epoch = int(ts.timestamp())
+    start_epoch = epoch - (epoch % bucket_seconds)
+    return datetime.fromtimestamp(start_epoch, tz=ts.tzinfo)
+
+
+def _aggregate_rows(records: Iterable[UsageRecord], sum_by_minutes: int, group_by: Optional[str]) -> list[dict]:
+    aggregated: Dict[Tuple[datetime, str], Dict[str, int]] = {}
+    for record in records:
+        bucket = _bucket_start(record.timestamp, sum_by_minutes)
+        group_key = record.workspace if group_by == "workspace" else ""
+        key = (bucket, group_key)
+        if key not in aggregated:
+            aggregated[key] = {field: 0 for field in TOKEN_FIELDS}
+        target = aggregated[key]
+        for field in TOKEN_FIELDS:
+            target[field] += record.metrics.get(field, 0)
+
+    rows: list[dict] = []
+    for (bucket, group_key), metrics in sorted(aggregated.items(), key=lambda item: (item[0][0], item[0][1])):
+        row = {"bucket": bucket.isoformat(timespec="minutes")}
+        if group_by == "workspace":
+            row["workspace"] = group_key
+        for field in TOKEN_FIELDS:
+            row[field] = metrics[field]
+        rows.append(row)
+    return rows
+
+
+def _write_csv(rows: list[dict], group_by: Optional[str]) -> None:
+    fieldnames = ["bucket"]
+    if group_by == "workspace":
+        fieldnames.append("workspace")
+    fieldnames.extend(TOKEN_FIELDS)
+    writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+
+
+def _write_json(rows: list[dict], provider: str, range_name: str, start: datetime, end: datetime, sum_by: int, group_by: Optional[str]) -> None:
+    payload = {
+        "provider": provider,
+        "range": range_name,
+        "start": start.isoformat(timespec="seconds"),
+        "end_exclusive": end.isoformat(timespec="seconds"),
+        "sum_by_minutes": sum_by,
+        "group_by": group_by or "none",
+        "rows": rows,
+    }
+    json.dump(payload, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+
+
+def _run_report(args: argparse.Namespace) -> int:
+    if args.sum_by <= 0:
+        print("error: --sum-by must be a positive integer", file=sys.stderr)
+        return 2
+
+    group_by = None if args.group_by == "none" else args.group_by
+    try:
+        start, end, range_name = _resolve_range(args.range)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.provider == "codex":
+        records = list(_iter_codex_usage(start, end))
+    else:
+        records = list(_iter_claude_usage(start, end))
+    rows = _aggregate_rows(records, args.sum_by, group_by)
+
+    if args.format == "csv":
+        _write_csv(rows, group_by)
+    else:
+        _write_json(rows, args.provider, range_name, start, end, args.sum_by, group_by)
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Token usage reporting for Codex/Claude sessions.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    report = subparsers.add_parser("report", help="Report token usage")
+    report.add_argument(
+        "range",
+        nargs="*",
+        help="Preset [current_week|week|month|year] or date range: YYYY-MM-DD YYYY-MM-DD",
+    )
+    report.add_argument(
+        "--sum-by",
+        dest="sum_by",
+        type=int,
+        default=60,
+        metavar="duration_in_minutes",
+        help="Bucket duration in minutes (default: 60)",
+    )
+    report.add_argument(
+        "--group-by",
+        choices=["none", "workspace"],
+        default="none",
+        help="Grouping strategy (default: none)",
+    )
+    report.add_argument(
+        "--format",
+        choices=["csv", "json"],
+        default="csv",
+        help="Output format (default: csv)",
+    )
+    report.add_argument(
+        "--provider",
+        choices=["codex", "claude"],
+        default="codex",
+        help="Usage provider to parse (default: codex)",
+    )
+
+    return parser
+
+
+def main() -> int:
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    if args.command == "report":
+        return _run_report(args)
+
+    parser.print_help(sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
