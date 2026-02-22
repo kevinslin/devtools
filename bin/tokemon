@@ -2,7 +2,7 @@
 """Token usage reporting CLI.
 
 Usage:
-  tokemon report [range] [...options]
+  tokemon [range] [...options]
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ TOKEN_FIELDS = (
     "reasoning_output_tokens",
     "total_tokens",
 )
+SUM_BY_PRESETS = ("daily", "weekly", "monthly")
 UNKNOWN_WORKSPACE = "(unknown)"
 
 
@@ -275,17 +276,48 @@ def _resolve_range(range_args: list[str]) -> Tuple[datetime, datetime, str]:
     raise ValueError("range accepts either one preset or two dates")
 
 
-def _bucket_start(ts: datetime, sum_by_minutes: int) -> datetime:
-    bucket_seconds = sum_by_minutes * 60
-    epoch = int(ts.timestamp())
-    start_epoch = epoch - (epoch % bucket_seconds)
-    return datetime.fromtimestamp(start_epoch, tz=ts.tzinfo)
+def _parse_sum_by(raw: str) -> Tuple[str, Optional[int], str]:
+    value = raw.strip().lower()
+    if value in SUM_BY_PRESETS:
+        return value, None, value
+
+    try:
+        minutes = int(value)
+    except ValueError as exc:
+        raise ValueError("--sum-by must be a positive integer or one of [daily|weekly|monthly]") from exc
+    if minutes <= 0:
+        raise ValueError("--sum-by must be a positive integer or one of [daily|weekly|monthly]")
+    return "minutes", minutes, str(minutes)
 
 
-def _aggregate_rows(records: Iterable[UsageRecord], sum_by_minutes: int, group_by: Optional[str]) -> list[dict]:
+def _bucket_start(ts: datetime, sum_by_mode: str, sum_by_minutes: Optional[int]) -> datetime:
+    if sum_by_mode == "minutes":
+        if sum_by_minutes is None:
+            raise ValueError("sum_by_minutes is required when sum_by_mode is minutes")
+        bucket_seconds = sum_by_minutes * 60
+        epoch = int(ts.timestamp())
+        start_epoch = epoch - (epoch % bucket_seconds)
+        return datetime.fromtimestamp(start_epoch, tz=ts.tzinfo)
+
+    if sum_by_mode == "daily":
+        return ts.replace(hour=0, minute=0, second=0, microsecond=0)
+    if sum_by_mode == "weekly":
+        return _start_of_week_sunday(ts)
+    if sum_by_mode == "monthly":
+        return ts.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    raise ValueError(f"unsupported sum_by mode: {sum_by_mode}")
+
+
+def _aggregate_rows(
+    records: Iterable[UsageRecord],
+    sum_by_mode: str,
+    sum_by_minutes: Optional[int],
+    group_by: Optional[str],
+) -> list[dict]:
     aggregated: Dict[Tuple[datetime, str], Dict[str, int]] = {}
     for record in records:
-        bucket = _bucket_start(record.timestamp, sum_by_minutes)
+        bucket = _bucket_start(record.timestamp, sum_by_mode, sum_by_minutes)
         group_key = record.workspace if group_by == "workspace" else ""
         key = (bucket, group_key)
         if key not in aggregated:
@@ -316,13 +348,23 @@ def _write_csv(rows: list[dict], group_by: Optional[str]) -> None:
         writer.writerow(row)
 
 
-def _write_json(rows: list[dict], provider: str, range_name: str, start: datetime, end: datetime, sum_by: int, group_by: Optional[str]) -> None:
+def _write_json(
+    rows: list[dict],
+    provider: str,
+    range_name: str,
+    start: datetime,
+    end: datetime,
+    sum_by: str,
+    sum_by_minutes: Optional[int],
+    group_by: Optional[str],
+) -> None:
     payload = {
         "provider": provider,
         "range": range_name,
         "start": start.isoformat(timespec="seconds"),
         "end_exclusive": end.isoformat(timespec="seconds"),
-        "sum_by_minutes": sum_by,
+        "sum_by": sum_by,
+        "sum_by_minutes": sum_by_minutes,
         "group_by": group_by or "none",
         "rows": rows,
     }
@@ -331,10 +373,11 @@ def _write_json(rows: list[dict], provider: str, range_name: str, start: datetim
 
 
 def _run_report(args: argparse.Namespace) -> int:
-    if args.sum_by <= 0:
-        print("error: --sum-by must be a positive integer", file=sys.stderr)
+    try:
+        sum_by_mode, sum_by_minutes, sum_by_label = _parse_sum_by(args.sum_by)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
-
     group_by = None if args.group_by == "none" else args.group_by
     try:
         start, end, range_name = _resolve_range(args.range)
@@ -344,52 +387,52 @@ def _run_report(args: argparse.Namespace) -> int:
 
     if args.provider == "codex":
         records = list(_iter_codex_usage(start, end))
-    else:
+    elif args.provider == "claude":
         records = list(_iter_claude_usage(start, end))
-    rows = _aggregate_rows(records, args.sum_by, group_by)
+    else:
+        records = list(_iter_codex_usage(start, end))
+        records.extend(_iter_claude_usage(start, end))
+    rows = _aggregate_rows(records, sum_by_mode, sum_by_minutes, group_by)
 
     if args.format == "csv":
         _write_csv(rows, group_by)
     else:
-        _write_json(rows, args.provider, range_name, start, end, args.sum_by, group_by)
+        _write_json(rows, args.provider, range_name, start, end, sum_by_label, sum_by_minutes, group_by)
     return 0
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Token usage reporting for Codex/Claude sessions.")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    report = subparsers.add_parser("report", help="Report token usage")
-    report.add_argument(
+    parser.add_argument(
         "range",
         nargs="*",
         help="Preset [current_week|week|month|year] or date range: YYYY-MM-DD YYYY-MM-DD",
     )
-    report.add_argument(
+    parser.add_argument(
         "--sum-by",
         dest="sum_by",
-        type=int,
-        default=60,
-        metavar="duration_in_minutes",
-        help="Bucket duration in minutes (default: 60)",
+        type=str,
+        default="60",
+        metavar="duration_in_minutes|daily|weekly|monthly",
+        help="Bucket by minutes or presets daily|weekly|monthly (default: 60)",
     )
-    report.add_argument(
+    parser.add_argument(
         "--group-by",
         choices=["none", "workspace"],
         default="none",
         help="Grouping strategy (default: none)",
     )
-    report.add_argument(
+    parser.add_argument(
         "--format",
         choices=["csv", "json"],
         default="csv",
         help="Output format (default: csv)",
     )
-    report.add_argument(
+    parser.add_argument(
         "--provider",
-        choices=["codex", "claude"],
+        choices=["codex", "claude", "all"],
         default="codex",
-        help="Usage provider to parse (default: codex)",
+        help="Usage provider to parse (default: codex, all=codex+claude)",
     )
 
     return parser
@@ -398,12 +441,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
-
-    if args.command == "report":
-        return _run_report(args)
-
-    parser.print_help(sys.stderr)
-    return 2
+    return _run_report(args)
 
 
 if __name__ == "__main__":

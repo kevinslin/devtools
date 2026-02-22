@@ -118,7 +118,6 @@ class TokemonCliTest(unittest.TestCase):
 
             result = self.run_cli(
                 [
-                    "report",
                     "2026-02-03",
                     "2026-02-03",
                     "--provider",
@@ -230,7 +229,6 @@ class TokemonCliTest(unittest.TestCase):
 
             result = self.run_cli(
                 [
-                    "report",
                     "2026-02-03",
                     "2026-02-03",
                     "--provider",
@@ -250,6 +248,7 @@ class TokemonCliTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             payload = json.loads(result.stdout)
             self.assertEqual(payload["provider"], "claude")
+            self.assertEqual(payload["sum_by"], "30")
             self.assertEqual(payload["sum_by_minutes"], 30)
             self.assertEqual(payload["group_by"], "none")
 
@@ -270,11 +269,90 @@ class TokemonCliTest(unittest.TestCase):
             self.assertEqual(second["reasoning_output_tokens"], 0)
             self.assertEqual(second["total_tokens"], 4)
 
+    def test_provider_all_combines_codex_and_claude(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sessions_root = tmp_path / "codex-sessions"
+            archived_root = tmp_path / "codex-archived"
+            claude_root = tmp_path / "claude-projects"
+            env = {
+                "TOKEMON_CODEX_SESSIONS_ROOT": str(sessions_root),
+                "TOKEMON_CODEX_ARCHIVED_ROOT": str(archived_root),
+                "TOKEMON_CLAUDE_PROJECTS_ROOT": str(claude_root),
+            }
+
+            _write_jsonl(
+                sessions_root / "2026/02/03/session.jsonl",
+                [
+                    {
+                        "timestamp": "2026-02-03T09:00:00-08:00",
+                        "type": "session_meta",
+                        "payload": {"cwd": "/repo/codex"},
+                    },
+                    {
+                        "timestamp": "2026-02-03T09:10:00-08:00",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {"total_token_usage": {"input_tokens": 10, "total_tokens": 10}},
+                        },
+                    },
+                ],
+            )
+
+            _write_jsonl(
+                claude_root / "project-a/session.jsonl",
+                [
+                    {
+                        "type": "assistant",
+                        "sessionId": "session-1",
+                        "cwd": "/repo/claude",
+                        "timestamp": "2026-02-03T09:20:00-08:00",
+                        "message": {
+                            "id": "msg-1",
+                            "usage": {
+                                "input_tokens": 2,
+                                "cache_creation_input_tokens": 0,
+                                "cache_read_input_tokens": 0,
+                                "output_tokens": 3,
+                            },
+                        },
+                    }
+                ],
+            )
+
+            result = self.run_cli(
+                [
+                    "2026-02-03",
+                    "2026-02-03",
+                    "--provider",
+                    "all",
+                    "--sum-by",
+                    "60",
+                    "--format",
+                    "json",
+                ],
+                env,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["provider"], "all")
+
+            rows = payload["rows"]
+            self.assertEqual(len(rows), 1, msg=result.stdout)
+            row = rows[0]
+            self.assertEqual(row["input_tokens"], 12)
+            self.assertEqual(row["cached_input_tokens"], 0)
+            self.assertEqual(row["output_tokens"], 3)
+            self.assertEqual(row["reasoning_output_tokens"], 0)
+            self.assertEqual(row["total_tokens"], 15)
+
     def test_invalid_range_exits_non_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             result = self.run_cli(
-                ["report", "invalid_range", "--provider", "codex"],
+                ["invalid_range", "--provider", "codex"],
                 {
                     "TOKEMON_CODEX_SESSIONS_ROOT": str(tmp_path / "codex-sessions"),
                     "TOKEMON_CODEX_ARCHIVED_ROOT": str(tmp_path / "codex-archived"),
@@ -283,6 +361,100 @@ class TokemonCliTest(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("range must be one of", result.stderr)
+
+    def test_sum_by_presets_daily_weekly_monthly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sessions_root = tmp_path / "codex-sessions"
+            archived_root = tmp_path / "codex-archived"
+            claude_root = tmp_path / "claude-projects"
+            env = {
+                "TOKEMON_CODEX_SESSIONS_ROOT": str(sessions_root),
+                "TOKEMON_CODEX_ARCHIVED_ROOT": str(archived_root),
+                "TOKEMON_CLAUDE_PROJECTS_ROOT": str(claude_root),
+            }
+
+            _write_jsonl(
+                sessions_root / "2026/02/03/session.jsonl",
+                [
+                    {
+                        "timestamp": "2026-01-31T12:00:00-08:00",
+                        "type": "session_meta",
+                        "payload": {"cwd": "/repo/demo"},
+                    },
+                    {
+                        "timestamp": "2026-01-31T12:00:00-08:00",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {"total_token_usage": {"input_tokens": 10, "total_tokens": 10}},
+                        },
+                    },
+                    {
+                        "timestamp": "2026-02-01T12:00:00-08:00",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {"total_token_usage": {"input_tokens": 30, "total_tokens": 30}},
+                        },
+                    },
+                    {
+                        "timestamp": "2026-02-07T12:00:00-08:00",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {"total_token_usage": {"input_tokens": 60, "total_tokens": 60}},
+                        },
+                    },
+                    {
+                        "timestamp": "2026-02-08T12:00:00-08:00",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {"total_token_usage": {"input_tokens": 100, "total_tokens": 100}},
+                        },
+                    },
+                ],
+            )
+
+            expected_by_preset = {
+                "daily": [10, 20, 30, 40],
+                "weekly": [10, 50, 40],
+                "monthly": [10, 90],
+            }
+
+            for preset, expected_totals in expected_by_preset.items():
+                result = self.run_cli(
+                    [
+                        "2026-01-31",
+                        "2026-02-08",
+                        "--provider",
+                        "codex",
+                        "--sum-by",
+                        preset,
+                        "--format",
+                        "csv",
+                    ],
+                    env,
+                )
+                self.assertEqual(result.returncode, 0, msg=f"{preset}: {result.stderr}\n{result.stdout}")
+                rows = list(csv.DictReader(result.stdout.splitlines()))
+                totals = [int(row["total_tokens"]) for row in rows]
+                self.assertEqual(totals, expected_totals, msg=f"{preset}: {result.stdout}")
+
+    def test_invalid_sum_by_exits_non_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result = self.run_cli(
+                ["2026-02-03", "2026-02-03", "--provider", "codex", "--sum-by", "hourlyish"],
+                {
+                    "TOKEMON_CODEX_SESSIONS_ROOT": str(tmp_path / "codex-sessions"),
+                    "TOKEMON_CODEX_ARCHIVED_ROOT": str(tmp_path / "codex-archived"),
+                    "TOKEMON_CLAUDE_PROJECTS_ROOT": str(tmp_path / "claude-projects"),
+                },
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("daily|weekly|monthly", result.stderr)
 
 
 if __name__ == "__main__":
