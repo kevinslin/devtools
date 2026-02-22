@@ -32,6 +32,7 @@ UNKNOWN_WORKSPACE = "(unknown)"
 class UsageRecord:
     timestamp: datetime
     workspace: str
+    provider: str
     metrics: Dict[str, int]
 
 
@@ -167,7 +168,7 @@ def _iter_codex_usage(start: datetime, end: datetime) -> Iterator[UsageRecord]:
             ts = _parse_timestamp(item.get("timestamp"))
             if ts is None or ts < start or ts >= end:
                 continue
-            yield UsageRecord(timestamp=ts, workspace=workspace, metrics=delta)
+            yield UsageRecord(timestamp=ts, workspace=workspace, provider="codex", metrics=delta)
 
 
 def _iter_claude_usage(start: datetime, end: datetime) -> Iterator[UsageRecord]:
@@ -199,7 +200,12 @@ def _iter_claude_usage(start: datetime, end: datetime) -> Iterator[UsageRecord]:
             key = (session_id, message_id)
             existing = best_by_message.get(key)
             if existing is None:
-                best_by_message[key] = UsageRecord(timestamp=ts, workspace=workspace, metrics=usage)
+                best_by_message[key] = UsageRecord(
+                    timestamp=ts,
+                    workspace=workspace,
+                    provider="claude",
+                    metrics=usage,
+                )
                 continue
 
             merged = {field: max(existing.metrics.get(field, 0), usage.get(field, 0)) for field in TOKEN_FIELDS}
@@ -208,6 +214,7 @@ def _iter_claude_usage(start: datetime, end: datetime) -> Iterator[UsageRecord]:
             best_by_message[key] = UsageRecord(
                 timestamp=merged_timestamp,
                 workspace=merged_workspace,
+                provider=existing.provider,
                 metrics=merged,
             )
 
@@ -318,7 +325,12 @@ def _aggregate_rows(
     aggregated: Dict[Tuple[datetime, str], Dict[str, int]] = {}
     for record in records:
         bucket = _bucket_start(record.timestamp, sum_by_mode, sum_by_minutes)
-        group_key = record.workspace if group_by == "workspace" else ""
+        if group_by == "workspace":
+            group_key = record.workspace
+        elif group_by == "provider":
+            group_key = record.provider
+        else:
+            group_key = ""
         key = (bucket, group_key)
         if key not in aggregated:
             aggregated[key] = {field: 0 for field in TOKEN_FIELDS}
@@ -331,6 +343,8 @@ def _aggregate_rows(
         row = {"bucket": bucket.isoformat(timespec="minutes")}
         if group_by == "workspace":
             row["workspace"] = group_key
+        elif group_by == "provider":
+            row["provider"] = group_key
         for field in TOKEN_FIELDS:
             row[field] = metrics[field]
         rows.append(row)
@@ -341,6 +355,8 @@ def _write_csv(rows: list[dict], group_by: Optional[str]) -> None:
     fieldnames = ["bucket"]
     if group_by == "workspace":
         fieldnames.append("workspace")
+    elif group_by == "provider":
+        fieldnames.append("provider")
     fieldnames.extend(TOKEN_FIELDS)
     writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
@@ -418,7 +434,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--group-by",
-        choices=["none", "workspace"],
+        choices=["none", "workspace", "provider"],
         default="none",
         help="Grouping strategy (default: none)",
     )

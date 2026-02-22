@@ -17,7 +17,7 @@ The design prioritizes:
 1. Support one command surface: `tokemon`.
 2. Support range presets and explicit date ranges.
 3. Support configurable time bucketing (`--sum-by`).
-4. Support optional grouping by workspace (`--group-by workspace`).
+4. Support optional grouping by workspace or provider (`--group-by workspace|provider`).
 5. Support CSV and JSON output (`--format`).
 6. Support provider modes `codex`, `claude`, and `all` (`codex+claude`).
 
@@ -29,7 +29,7 @@ The design prioritizes:
 
 ## Command Contract
 ```sh
-tokemon [range] [--sum-by N] [--group-by none|workspace] [--format csv|json] [--provider codex|claude|all]
+tokemon [range] [--sum-by N] [--group-by none|workspace|provider] [--format csv|json] [--provider codex|claude|all]
 ```
 
 ### Range semantics
@@ -122,6 +122,7 @@ Intermediate records use:
 2. Group key:
    - none: `""`
    - workspace: normalized workspace string.
+   - provider: provider label (`codex` or `claude`).
 3. Aggregate by summing each metric per `(bucket, group)` pair.
 4. Sort output by `(bucket, group)` ascending.
 
@@ -130,7 +131,8 @@ Intermediate records use:
 Columns:
 1. `bucket`
 2. `workspace` (only when `--group-by workspace`)
-3. token fields in fixed order
+3. `provider` (only when `--group-by provider`)
+4. token fields in fixed order
 
 ### JSON (`--format json`)
 Envelope:

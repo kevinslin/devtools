@@ -90,7 +90,7 @@ Key functions:
 ### 6. Aggregation engine
 Responsibilities:
 1. Compute bucket boundaries from `--sum-by`.
-2. Build composite keys `(bucket, group)` where group is optionally workspace.
+2. Build composite keys `(bucket, group)` where group is optionally workspace or provider.
 3. Sum metrics in fixed token-field order.
 4. Produce sorted row output.
 
