@@ -18,7 +18,11 @@ tokemon [range] [--sum-by N|daily|weekly|monthly] [--group-by none|workspace|pro
 ## Arguments
 
 - `range`:
-  - Presets: `current_week` (default), `week`, `month`, `year`
+  - Presets:
+    - `current_week`: current Sunday-start week window
+    - `week`: trailing 7 days relative to now
+    - `month`: trailing 1 calendar month relative to now
+    - `year`: last calendar year (`Jan 1` previous year to `Jan 1` current year)
   - Explicit date range: `YYYY-MM-DD YYYY-MM-DD` (inclusive end date)
 
 ## Options

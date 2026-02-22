@@ -36,9 +36,9 @@ tokemon [range] [--sum-by N] [--group-by none|workspace|provider] [--format csv|
 1. Default: `current_week`.
 2. Presets:
    - `current_week`: Sunday 00:00 local time through next Sunday 00:00 (exclusive).
-   - `week`: previous full Sunday-Saturday week.
-   - `month`: current calendar month.
-   - `year`: current calendar year.
+   - `week`: trailing 7-day window relative to now.
+   - `month`: trailing 1-calendar-month window relative to now.
+   - `year`: last calendar year (`Jan 1` previous year through `Jan 1` current year, exclusive).
 3. Explicit range: `YYYY-MM-DD YYYY-MM-DD` with inclusive end date.
    - Internally converted to `[start@00:00, (end+1 day)@00:00)` for exclusive upper bound filtering.
 

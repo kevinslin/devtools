@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from calendar import monthrange
 import csv
+from datetime import datetime, timedelta
 import json
 import os
 import subprocess
@@ -11,6 +13,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "bin" / "tokemon"
+
+
+def _shift_months(when: datetime, months: int) -> datetime:
+    raw_month = when.month - 1 + months
+    year = when.year + (raw_month // 12)
+    month = (raw_month % 12) + 1
+    day = min(when.day, monthrange(year, month)[1])
+    return when.replace(year=year, month=month, day=day)
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -529,6 +539,48 @@ class TokemonCliTest(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("daily|weekly|monthly", result.stderr)
+
+    def test_range_presets_relative_and_last_calendar_year(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env = {
+                "TOKEMON_CODEX_SESSIONS_ROOT": str(tmp_path / "codex-sessions"),
+                "TOKEMON_CODEX_ARCHIVED_ROOT": str(tmp_path / "codex-archived"),
+                "TOKEMON_CLAUDE_PROJECTS_ROOT": str(tmp_path / "claude-projects"),
+            }
+
+            def read_range(preset: str) -> tuple[datetime, datetime]:
+                result = self.run_cli([preset, "--provider", "codex", "--format", "json"], env)
+                self.assertEqual(result.returncode, 0, msg=f"{preset}: {result.stderr}\n{result.stdout}")
+                payload = json.loads(result.stdout)
+                return datetime.fromisoformat(payload["start"]), datetime.fromisoformat(payload["end_exclusive"])
+
+            week_start, week_end = read_range("week")
+            self.assertEqual(week_end - week_start, timedelta(days=7))
+
+            month_start, month_end = read_range("month")
+            self.assertEqual(month_start, _shift_months(month_end, -1))
+
+            year_start, year_end = read_range("year")
+            self.assertEqual(year_start.month, 1)
+            self.assertEqual(year_start.day, 1)
+            self.assertEqual(year_start.hour, 0)
+            self.assertEqual(year_start.minute, 0)
+            self.assertEqual(year_start.second, 0)
+            self.assertEqual(year_end.month, 1)
+            self.assertEqual(year_end.day, 1)
+            self.assertEqual(year_end.hour, 0)
+            self.assertEqual(year_end.minute, 0)
+            self.assertEqual(year_end.second, 0)
+            self.assertEqual(year_start.year, year_end.year - 1)
+
+            current_week_start, current_week_end = read_range("current_week")
+            self.assertEqual(current_week_end - current_week_start, timedelta(days=7))
+            # Python weekday(): Monday=0 ... Sunday=6
+            self.assertEqual(current_week_start.weekday(), 6)
+            self.assertEqual(current_week_start.hour, 0)
+            self.assertEqual(current_week_start.minute, 0)
+            self.assertEqual(current_week_start.second, 0)
 
 
 if __name__ == "__main__":

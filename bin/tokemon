@@ -12,6 +12,7 @@ import csv
 import json
 import os
 import sys
+from calendar import monthrange
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -232,10 +233,12 @@ def _start_of_week_sunday(when: datetime) -> datetime:
     return midnight - timedelta(days=days_since_sunday)
 
 
-def _next_month_start(when: datetime) -> datetime:
-    if when.month == 12:
-        return when.replace(year=when.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-    return when.replace(month=when.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
+def _shift_months(when: datetime, months: int) -> datetime:
+    raw_month = when.month - 1 + months
+    year = when.year + (raw_month // 12)
+    month = (raw_month % 12) + 1
+    day = min(when.day, monthrange(year, month)[1])
+    return when.replace(year=year, month=month, day=day)
 
 
 def _resolve_range(range_args: list[str]) -> Tuple[datetime, datetime, str]:
@@ -252,16 +255,16 @@ def _resolve_range(range_args: list[str]) -> Tuple[datetime, datetime, str]:
             end = start + timedelta(days=7)
             return start, end, preset
         if preset == "week":
-            end = _start_of_week_sunday(now)
+            end = now
             start = end - timedelta(days=7)
             return start, end, preset
         if preset == "month":
-            start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            end = _next_month_start(start)
+            end = now
+            start = _shift_months(end, -1)
             return start, end, preset
         if preset == "year":
-            start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-            end = start.replace(year=start.year + 1)
+            start = now.replace(year=now.year - 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+            end = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
             return start, end, preset
         raise ValueError(
             "range must be one of [current_week|week|month|year] or two dates: YYYY-MM-DD YYYY-MM-DD"
