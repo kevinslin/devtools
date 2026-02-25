@@ -1,6 +1,6 @@
-# Tools
+# Devtools
 
-Small local CLIs for day-to-day developer workflows.
+A bunch of usefull tools. Designed by human. Made by codex. 
 
 ## CLI index
 
