@@ -66,3 +66,24 @@ tokemon 2026-02-01 2026-02-15 --sum-by 30 --format json --provider all
 
 CSV output is intended for shell pipelines and spreadsheets.
 JSON output includes metadata (`provider`, `range`, `sum_by`, `group_by`) plus aggregated rows.
+
+## Column descriptions
+
+Each output row (CSV row or JSON `rows[]` item) includes:
+
+- `bucket`: bucket start timestamp in local timezone
+- `input_tokens`: aggregated input tokens for the bucket/group
+- `cached_input_tokens`: aggregated cached input tokens
+- `output_tokens`: aggregated output tokens
+- `reasoning_output_tokens`: aggregated reasoning output tokens
+- `total_tokens`: aggregated total token count
+
+Optional row columns based on `--group-by`:
+
+- `workspace`: present only when `--group-by workspace`
+- `provider`: present only when `--group-by provider`
+
+Provider note:
+
+- For Codex logs, `total_tokens` is based on provider-reported totals where cached/reasoning are subsets of input/output.
+- For Claude logs, `total_tokens` is computed as `input_tokens + cached_input_tokens + output_tokens + reasoning_output_tokens`.
