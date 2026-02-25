@@ -12,7 +12,7 @@ tokemon
 ## Command
 
 ```sh
-tokemon [range] [--sum-by N|daily|weekly|monthly] [--group-by none|workspace|provider] [--format csv|json] [--provider codex|claude|all]
+tokemon [range] [--sum-by N|daily|weekly|monthly] [--group-by none|workspace|session|provider] [--format csv|json] [--provider codex|claude|all]
 ```
 
 ## Arguments
@@ -28,7 +28,7 @@ tokemon [range] [--sum-by N|daily|weekly|monthly] [--group-by none|workspace|pro
 ## Options
 
 - `--sum-by`: bucket size by minutes (for example `15`, `60`) or presets `daily|weekly|monthly` (default: `60`)
-- `--group-by`: `none|workspace|provider` (default: `none`)
+- `--group-by`: `none|workspace|session|provider` (default: `none`)
 - `--format`: `csv|json` (default: `csv`)
 - `--provider`: `codex|claude|all` (default: `codex`)
 
@@ -43,6 +43,9 @@ tokemon current_week --group-by workspace
 
 # combine codex + claude and group by provider
 tokemon current_week --provider all --group-by provider --format csv
+
+# combine codex + claude and group by session
+tokemon current_week --provider all --group-by session --format csv
 
 # explicit date range, 30-minute buckets, json output
 tokemon 2026-02-01 2026-02-15 --sum-by 30 --format json --provider all
@@ -81,6 +84,7 @@ Each output row (CSV row or JSON `rows[]` item) includes:
 Optional row columns based on `--group-by`:
 
 - `workspace`: present only when `--group-by workspace`
+- `session`: present only when `--group-by session`
 - `provider`: present only when `--group-by provider`
 
 Provider note:

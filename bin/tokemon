@@ -33,6 +33,7 @@ UNKNOWN_WORKSPACE = "(unknown)"
 class UsageRecord:
     timestamp: datetime
     workspace: str
+    session: str
     provider: str
     metrics: Dict[str, int]
 
@@ -139,6 +140,7 @@ def _iter_codex_usage(start: datetime, end: datetime) -> Iterator[UsageRecord]:
     for path in _codex_files():
         previous_totals: Optional[Dict[str, int]] = None
         workspace = UNKNOWN_WORKSPACE
+        session = path.stem
         for item in _iter_jsonl(path):
             item_type = item.get("type")
             if item_type == "session_meta":
@@ -147,6 +149,9 @@ def _iter_codex_usage(start: datetime, end: datetime) -> Iterator[UsageRecord]:
                     cwd = payload.get("cwd")
                     if isinstance(cwd, str) and cwd:
                         workspace = cwd
+                    session_id = payload.get("id")
+                    if isinstance(session_id, str) and session_id:
+                        session = session_id
                 continue
 
             if item_type != "event_msg":
@@ -169,7 +174,13 @@ def _iter_codex_usage(start: datetime, end: datetime) -> Iterator[UsageRecord]:
             ts = _parse_timestamp(item.get("timestamp"))
             if ts is None or ts < start or ts >= end:
                 continue
-            yield UsageRecord(timestamp=ts, workspace=workspace, provider="codex", metrics=delta)
+            yield UsageRecord(
+                timestamp=ts,
+                workspace=workspace,
+                session=session,
+                provider="codex",
+                metrics=delta,
+            )
 
 
 def _iter_claude_usage(start: datetime, end: datetime) -> Iterator[UsageRecord]:
@@ -204,6 +215,7 @@ def _iter_claude_usage(start: datetime, end: datetime) -> Iterator[UsageRecord]:
                 best_by_message[key] = UsageRecord(
                     timestamp=ts,
                     workspace=workspace,
+                    session=session_id,
                     provider="claude",
                     metrics=usage,
                 )
@@ -215,6 +227,7 @@ def _iter_claude_usage(start: datetime, end: datetime) -> Iterator[UsageRecord]:
             best_by_message[key] = UsageRecord(
                 timestamp=merged_timestamp,
                 workspace=merged_workspace,
+                session=existing.session,
                 provider=existing.provider,
                 metrics=merged,
             )
@@ -330,6 +343,8 @@ def _aggregate_rows(
         bucket = _bucket_start(record.timestamp, sum_by_mode, sum_by_minutes)
         if group_by == "workspace":
             group_key = record.workspace
+        elif group_by == "session":
+            group_key = record.session
         elif group_by == "provider":
             group_key = record.provider
         else:
@@ -346,6 +361,8 @@ def _aggregate_rows(
         row = {"bucket": bucket.isoformat(timespec="minutes")}
         if group_by == "workspace":
             row["workspace"] = group_key
+        elif group_by == "session":
+            row["session"] = group_key
         elif group_by == "provider":
             row["provider"] = group_key
         for field in TOKEN_FIELDS:
@@ -358,6 +375,8 @@ def _write_csv(rows: list[dict], group_by: Optional[str]) -> None:
     fieldnames = ["bucket"]
     if group_by == "workspace":
         fieldnames.append("workspace")
+    elif group_by == "session":
+        fieldnames.append("session")
     elif group_by == "provider":
         fieldnames.append("provider")
     fieldnames.extend(TOKEN_FIELDS)
@@ -437,7 +456,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--group-by",
-        choices=["none", "workspace", "provider"],
+        choices=["none", "workspace", "session", "provider"],
         default="none",
         help="Grouping strategy (default: none)",
     )

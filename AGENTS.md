@@ -13,4 +13,5 @@ For every CLI in this project, keep `README.md` updated.
   - Entry point path (for example, `bin/<tool>`)
   - One-line description of what the CLI does
   - Link to detailed docs if they exist
-- If a CLI is renamed or removed, update or remove its `README.md` entry in the same change.
+- If a CLI is renamed or removed, update or remove its `README.md` entry in the same change. Similarly, also update its usage docs
+
