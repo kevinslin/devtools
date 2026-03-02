@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""Manage git branches and worktrees.
+
+Usage:
+  arbor clean [--base BRANCH] [--dry-run] [--force]
+"""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+class ArborError(RuntimeError):
+    """Raised when arbor cannot continue due to an invalid git state."""
+
+
+@dataclass
+class WorktreeEntry:
+    path: Path
+    branch: str | None
+
+
+def _run_git(repo: Path, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        stderr = result.stderr.strip() or result.stdout.strip() or "git command failed"
+        raise ArborError(f"git {' '.join(args)}: {stderr}")
+    return result
+
+
+def _repo_root() -> Path:
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or "not inside a git repository"
+        raise ArborError(stderr)
+    return Path(result.stdout.strip()).resolve()
+
+
+def _current_branch(repo: Path) -> str | None:
+    result = _run_git(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"], check=False)
+    branch = result.stdout.strip()
+    return branch if result.returncode == 0 and branch else None
+
+
+def _detect_base_ref(repo: Path) -> str:
+    remote_head = _run_git(
+        repo,
+        ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+        check=False,
+    )
+    remote_name = remote_head.stdout.strip()
+    if remote_head.returncode == 0 and remote_name:
+        return remote_name
+
+    current = _current_branch(repo)
+    if current:
+        return current
+
+    raise ArborError("cannot infer a base branch; use --base <branch>")
+
+
+def _normalize_branch_name(ref: str) -> str:
+    if ref.startswith("refs/heads/"):
+        return ref.removeprefix("refs/heads/")
+    if ref.startswith("refs/remotes/origin/"):
+        return ref.removeprefix("refs/remotes/origin/")
+    if ref.startswith("origin/"):
+        return ref.removeprefix("origin/")
+    return ref
+
+
+def _merged_local_branches(repo: Path, base_ref: str) -> set[str]:
+    result = _run_git(
+        repo,
+        ["for-each-ref", "--format=%(refname:short)", "--merged", base_ref, "refs/heads"],
+    )
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def _parse_worktrees(raw: str) -> list[WorktreeEntry]:
+    entries: list[WorktreeEntry] = []
+    current: dict[str, str] = {}
+    for line in raw.splitlines():
+        if not line.strip():
+            if current:
+                path = current.get("worktree")
+                if path:
+                    branch_ref = current.get("branch")
+                    branch = _normalize_branch_name(branch_ref) if branch_ref else None
+                    entries.append(WorktreeEntry(path=Path(path), branch=branch))
+            current = {}
+            continue
+        key, _, value = line.partition(" ")
+        current[key] = value
+
+    if current:
+        path = current.get("worktree")
+        if path:
+            branch_ref = current.get("branch")
+            branch = _normalize_branch_name(branch_ref) if branch_ref else None
+            entries.append(WorktreeEntry(path=Path(path), branch=branch))
+
+    return entries
+
+
+def _list_worktrees(repo: Path) -> list[WorktreeEntry]:
+    result = _run_git(repo, ["worktree", "list", "--porcelain"])
+    return _parse_worktrees(result.stdout)
+
+
+def _cmd_clean(base_arg: str | None, dry_run: bool, force: bool) -> int:
+    repo = _repo_root()
+    base_ref = base_arg or _detect_base_ref(repo)
+    merged = _merged_local_branches(repo, base_ref)
+
+    if not merged:
+        print(f"Base reference: {base_ref}")
+        print("No merged local branches found.")
+        return 0
+
+    base_branch = _normalize_branch_name(base_ref)
+    current = _current_branch(repo)
+    protected = {base_branch}
+    if current:
+        protected.add(current)
+
+    removed_worktrees: list[Path] = []
+    planned_worktree_removals: list[WorktreeEntry] = []
+    deleted_branches: list[str] = []
+    skipped_branches: list[str] = []
+    failures: list[str] = []
+
+    worktrees = _list_worktrees(repo)
+    for entry in worktrees:
+        if entry.path.resolve() == repo.resolve():
+            continue
+        if not entry.branch or entry.branch not in merged:
+            continue
+        if entry.branch in protected:
+            skipped_branches.append(entry.branch)
+            continue
+
+        if dry_run:
+            planned_worktree_removals.append(entry)
+            removed_worktrees.append(entry.path)
+            continue
+
+        remove_args = ["worktree", "remove"]
+        if force:
+            remove_args.append("--force")
+        remove_args.append(str(entry.path))
+        result = _run_git(repo, remove_args, check=False)
+        if result.returncode == 0:
+            removed_worktrees.append(entry.path)
+            continue
+
+        err = result.stderr.strip() or result.stdout.strip() or f"failed to remove worktree {entry.path}"
+        failures.append(f"worktree {entry.path}: {err}")
+
+    if dry_run:
+        active_branches = {entry.branch for entry in worktrees if entry.branch}
+        for entry in planned_worktree_removals:
+            if entry.branch:
+                active_branches.discard(entry.branch)
+    else:
+        active_branches = {entry.branch for entry in _list_worktrees(repo) if entry.branch}
+
+    for branch in sorted(merged):
+        if branch in protected:
+            skipped_branches.append(branch)
+            continue
+        if branch in active_branches:
+            skipped_branches.append(branch)
+            continue
+
+        if dry_run:
+            deleted_branches.append(branch)
+            continue
+
+        result = _run_git(repo, ["branch", "-d", branch], check=False)
+        if result.returncode == 0:
+            deleted_branches.append(branch)
+            continue
+
+        err = result.stderr.strip() or result.stdout.strip() or f"failed to delete branch {branch}"
+        failures.append(f"branch {branch}: {err}")
+
+    print(f"Base reference: {base_ref}")
+    if dry_run and force:
+        worktree_action = "would force remove worktree"
+    elif dry_run:
+        worktree_action = "would remove worktree"
+    elif force:
+        worktree_action = "force removed worktree"
+    else:
+        worktree_action = "removed worktree"
+    branch_action = "would delete branch" if dry_run else "deleted branch"
+    for path in removed_worktrees:
+        print(f"{worktree_action}: {path}")
+    for branch in deleted_branches:
+        print(f"{branch_action}: {branch}")
+    for branch in sorted(set(skipped_branches)):
+        print(f"skipped branch: {branch}")
+
+    print(
+        "clean complete: "
+        f"{len(removed_worktrees)} worktrees removed, "
+        f"{len(deleted_branches)} branches deleted, "
+        f"{len(set(skipped_branches))} branches skipped"
+    )
+    if dry_run:
+        print("dry-run mode: no changes made")
+
+    if failures:
+        for error in failures:
+            print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Manage git branches and worktrees.")
+    subparsers = parser.add_subparsers(dest="command")
+
+    clean_parser = subparsers.add_parser(
+        "clean",
+        help="Remove fully merged local branches and their linked worktrees.",
+    )
+    clean_parser.add_argument(
+        "--base",
+        help="Base branch/reference for merge checks (default: origin HEAD or current branch).",
+    )
+    clean_parser.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="Preview removals without modifying branches or worktrees.",
+    )
+    clean_parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Force worktree removal, including worktrees with modified files.",
+    )
+
+    args = parser.parse_args(argv)
+    if args.command == "clean":
+        return _cmd_clean(args.base, args.dry_run, args.force)
+
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ArborError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
