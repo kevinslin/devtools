@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+"""Report today's ag-ledger sessions and whether they are still active.
+
+Usage:
+  ag-man [--filter key=value] [--group-by workspace]
+
+Options:
+  --filter key=value  Filter sessions by key=value. Allowed keys are json keys in the output.
+  --group-by workspace  Group output by workspace.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+
+ENTRY_TIME_FORMAT = "%Y-%m-%d %H:%M"
+DEFAULT_LEDGER_ROOT = Path("~/.llm/ag-ledger").expanduser()
+ENV_LEDGER_ROOT = "META_LEDGER_ROOT"
+SESSION_START_RE = re.compile(r"^\s*session start\b", re.IGNORECASE)
+PS_FIXTURE_FILE_ENV = "AG_MAN_PS_OUTPUT_FILE"
+TMUX_FIXTURE_FILE_ENV = "AG_MAN_TMUX_OUTPUT_FILE"
+CODEX_STATE_DB_ENV = "AG_MAN_CODEX_STATE_DB"
+OUTPUT_KEYS = (
+    "workspace",
+    "agent_session",
+    "tmux_session",
+    "tmux_window",
+    "tmux_pane",
+    "tmux_pane_id",
+    "status",
+    "pid",
+)
+
+
+@dataclass(frozen=True)
+class StartedSession:
+    workspace: str
+    agent_session: str
+    started_at: datetime
+
+
+@dataclass(frozen=True)
+class ProcessInfo:
+    pid: int
+    ppid: int
+    tty: str | None
+    command: str
+
+
+@dataclass(frozen=True)
+class TmuxPane:
+    tmux_session: str
+    tmux_window: str
+    tmux_pane: int | None
+    tmux_pane_id: int | None
+    pane_pid: int
+    pane_tty: str | None
+
+
+def _resolve_ledger_root() -> Path:
+    raw = os.environ.get(ENV_LEDGER_ROOT)
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return DEFAULT_LEDGER_ROOT.resolve()
+
+
+def _ledger_path_for_today(root: Path, now: datetime) -> Path:
+    return root / "data" / f"ledger-{now.strftime('%Y-%m-%d')}.md"
+
+
+def _parse_entry_time(raw: object) -> datetime | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.strptime(raw, ENTRY_TIME_FORMAT)
+    except ValueError:
+        return None
+
+
+def _iter_jsonl(path: Path):
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    item = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    yield item
+    except OSError:
+        return
+
+
+def _collect_started_sessions_today(now: datetime | None = None) -> list[StartedSession]:
+    current = now or datetime.now()
+    ledger_path = _ledger_path_for_today(_resolve_ledger_root(), current)
+    first_start_by_session: dict[str, StartedSession] = {}
+
+    for entry in _iter_jsonl(ledger_path) or []:
+        message = entry.get("msg")
+        if not isinstance(message, str) or not SESSION_START_RE.search(message):
+            continue
+        session_id = entry.get("session")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        workspace = entry.get("workspace")
+        if not isinstance(workspace, str):
+            workspace = ""
+        started_at = _parse_entry_time(entry.get("time"))
+        if started_at is None:
+            continue
+
+        current_first = first_start_by_session.get(session_id)
+        candidate = StartedSession(workspace=workspace, agent_session=session_id, started_at=started_at)
+        if current_first is None or started_at < current_first.started_at:
+            first_start_by_session[session_id] = candidate
+
+    return sorted(first_start_by_session.values(), key=lambda row: (row.started_at, row.agent_session))
+
+
+def _read_command_output(cmd: list[str], fixture_env: str) -> str:
+    fixture_path = os.environ.get(fixture_env)
+    if fixture_path:
+        try:
+            return Path(fixture_path).read_text(encoding="utf-8")
+        except OSError:
+            return ""
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except OSError:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout
+
+
+def _load_processes() -> list[ProcessInfo]:
+    output = _read_command_output(["ps", "-axo", "pid=,ppid=,tty=,command="], PS_FIXTURE_FILE_ENV)
+    rows: list[ProcessInfo] = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        tty = _normalize_ps_tty(parts[2])
+        rows.append(ProcessInfo(pid=pid, ppid=ppid, tty=tty, command=parts[3]))
+    rows.sort(key=lambda row: row.pid)
+    return rows
+
+
+def _load_tmux_panes() -> list[TmuxPane]:
+    output = _read_command_output(
+        [
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\t#{window_index}:#{window_name}\t#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}",
+        ],
+        TMUX_FIXTURE_FILE_ENV,
+    )
+    panes: list[TmuxPane] = []
+    for line in output.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 6:
+            continue
+        session_name, window_label, pane_index_raw, pane_label, pane_pid_raw, pane_tty_raw = parts
+        try:
+            pane_pid = int(pane_pid_raw)
+        except ValueError:
+            continue
+        pane_index = _parse_optional_int(pane_index_raw)
+        pane_id = _parse_tmux_pane_id(pane_label)
+        panes.append(
+            TmuxPane(
+                tmux_session=session_name,
+                tmux_window=window_label,
+                tmux_pane=pane_index,
+                tmux_pane_id=pane_id,
+                pane_pid=pane_pid,
+                pane_tty=pane_tty_raw or None,
+            )
+        )
+    return panes
+
+
+def _normalize_ps_tty(raw: str) -> str | None:
+    value = raw.strip()
+    if not value or set(value) <= {"?"}:
+        return None
+    if value.startswith("/dev/"):
+        return value
+    return f"/dev/{value}"
+
+
+def _parse_tmux_pane_id(raw: str) -> int | None:
+    value = raw.strip()
+    if not value:
+        return None
+    if value.startswith("%"):
+        value = value[1:]
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _parse_optional_int(raw: str) -> int | None:
+    value = raw.strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _looks_like_uuid(value: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}", value))
+
+
+def _resolve_codex_state_db() -> Path:
+    raw = os.environ.get(CODEX_STATE_DB_ENV)
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path("~/.codex/state_5.sqlite").expanduser().resolve()
+
+
+def _parse_pid_from_process_uuid(raw: str) -> int | None:
+    match = re.match(r"pid:(\d+):", raw)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _load_thread_pid_map(session_ids: list[str]) -> dict[str, int]:
+    candidate_ids = [sid for sid in session_ids if _looks_like_uuid(sid)]
+    if not candidate_ids:
+        return {}
+
+    db_path = _resolve_codex_state_db()
+    if not db_path.exists():
+        return {}
+
+    placeholders = ",".join("?" for _ in candidate_ids)
+    query = (
+        "SELECT thread_id, process_uuid "
+        "FROM logs "
+        f"WHERE thread_id IN ({placeholders}) AND process_uuid IS NOT NULL "
+        "ORDER BY ts DESC, id DESC"
+    )
+
+    by_thread: dict[str, int] = {}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.25)
+    except sqlite3.Error:
+        return {}
+
+    try:
+        cursor = conn.execute(query, candidate_ids)
+        for thread_id, process_uuid in cursor:
+            if not isinstance(thread_id, str) or thread_id in by_thread:
+                continue
+            if not isinstance(process_uuid, str):
+                continue
+            pid = _parse_pid_from_process_uuid(process_uuid)
+            if pid is None:
+                continue
+            by_thread[thread_id] = pid
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+
+    return by_thread
+
+
+def _load_alias_thread_map(session_ids: list[str]) -> dict[str, str]:
+    aliases = [sid for sid in session_ids if sid and not _looks_like_uuid(sid)]
+    if not aliases:
+        return {}
+
+    db_path = _resolve_codex_state_db()
+    if not db_path.exists():
+        return {}
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.25)
+    except sqlite3.Error:
+        return {}
+
+    by_alias: dict[str, str] = {}
+    try:
+        for alias in aliases:
+            like_pattern = f"%ag-ledger append {alias} %"
+            regex = re.compile(rf"\bag-ledger append\s+{re.escape(alias)}(?=\s|\"|$)")
+            cursor = conn.execute(
+                "SELECT thread_id, message FROM logs "
+                "WHERE thread_id IS NOT NULL AND message IS NOT NULL AND message LIKE ? "
+                "ORDER BY ts DESC, id DESC LIMIT 50",
+                (like_pattern,),
+            )
+            for thread_id, message in cursor:
+                if not isinstance(thread_id, str) or not isinstance(message, str):
+                    continue
+                if not _looks_like_uuid(thread_id):
+                    continue
+                if not regex.search(message):
+                    continue
+                by_alias[alias] = thread_id
+                break
+    except sqlite3.Error:
+        return by_alias
+    finally:
+        conn.close()
+
+    return by_alias
+
+
+def _session_match_pattern(session_id: str) -> re.Pattern[str]:
+    escaped = re.escape(session_id)
+    return re.compile(rf"(?<![A-Za-z0-9._-]){escaped}(?![A-Za-z0-9._-])")
+
+
+def _find_active_process(session_id: str, processes: list[ProcessInfo]) -> ProcessInfo | None:
+    pattern = _session_match_pattern(session_id)
+    exactish: list[ProcessInfo] = [row for row in processes if pattern.search(row.command)]
+    if exactish:
+        return exactish[0]
+
+    substring: list[ProcessInfo] = [row for row in processes if session_id in row.command]
+    if substring:
+        return substring[0]
+    return None
+
+
+def _pane_for_process(
+    proc: ProcessInfo,
+    panes: list[TmuxPane],
+    ppid_by_pid: dict[int, int],
+    process_by_pid: dict[int, ProcessInfo],
+) -> TmuxPane | None:
+    pane_by_pid = {pane.pane_pid: pane for pane in panes}
+    pane_by_tty = {pane.pane_tty: pane for pane in panes if pane.pane_tty}
+    seen: set[int] = set()
+    current_pid = proc.pid
+    for _ in range(64):
+        if current_pid in seen or current_pid <= 0:
+            break
+        seen.add(current_pid)
+
+        current_proc = process_by_pid.get(current_pid)
+        if current_proc is not None and current_proc.tty:
+            tty_match = pane_by_tty.get(current_proc.tty)
+            if tty_match is not None:
+                return tty_match
+
+        pane = pane_by_pid.get(current_pid)
+        if pane is not None:
+            return pane
+        current_pid = ppid_by_pid.get(current_pid, 0)
+    return None
+
+
+def _build_rows() -> list[dict[str, object]]:
+    started_sessions = _collect_started_sessions_today()
+    processes = _load_processes()
+    panes = _load_tmux_panes()
+    ppid_by_pid = {proc.pid: proc.ppid for proc in processes}
+    process_by_pid = {proc.pid: proc for proc in processes}
+    ledger_session_ids = [started.agent_session for started in started_sessions]
+    alias_thread_map = _load_alias_thread_map(ledger_session_ids)
+    resolved_session_ids = [alias_thread_map.get(session_id, session_id) for session_id in ledger_session_ids]
+    thread_pid_map = _load_thread_pid_map(resolved_session_ids)
+
+    rows: list[dict[str, object]] = []
+    seen_resolved_sessions: set[str] = set()
+    for started in started_sessions:
+        resolved_session = alias_thread_map.get(started.agent_session, started.agent_session)
+        if resolved_session in seen_resolved_sessions:
+            continue
+        seen_resolved_sessions.add(resolved_session)
+        active_proc = None
+        mapped_pid = thread_pid_map.get(resolved_session)
+        if mapped_pid is not None:
+            active_proc = process_by_pid.get(mapped_pid)
+        if active_proc is None:
+            active_proc = _find_active_process(resolved_session, processes)
+        if active_proc is None and resolved_session != started.agent_session:
+            active_proc = _find_active_process(started.agent_session, processes)
+        if active_proc is None:
+            rows.append(
+                {
+                    "workspace": started.workspace,
+                    "agent_session": resolved_session,
+                    "tmux_session": None,
+                    "tmux_window": None,
+                    "tmux_pane": None,
+                    "tmux_pane_id": None,
+                    "status": "inactive",
+                    "pid": None,
+                }
+            )
+            continue
+
+        pane = _pane_for_process(active_proc, panes, ppid_by_pid, process_by_pid)
+        rows.append(
+            {
+                "workspace": started.workspace,
+                "agent_session": resolved_session,
+                "tmux_session": None if pane is None else pane.tmux_session,
+                "tmux_window": None if pane is None else pane.tmux_window,
+                "tmux_pane": None if pane is None else pane.tmux_pane,
+                "tmux_pane_id": None if pane is None else pane.tmux_pane_id,
+                "status": "active",
+                "pid": active_proc.pid,
+            }
+        )
+    return rows
+
+
+def _parse_filters(raw_filters: list[str]) -> tuple[list[tuple[str, str]] | None, str | None]:
+    parsed: list[tuple[str, str]] = []
+    for item in raw_filters:
+        if "=" not in item:
+            return None, f"invalid --filter '{item}': expected key=value"
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if key not in OUTPUT_KEYS:
+            allowed = ", ".join(OUTPUT_KEYS)
+            return None, f"invalid --filter key '{key}': allowed keys are {allowed}"
+        parsed.append((key, value))
+    return parsed, None
+
+
+def _value_matches_filter(row_value: object, expected_raw: str) -> bool:
+    if row_value is None:
+        return expected_raw.lower() in {"null", "none", ""}
+    return str(row_value) == expected_raw
+
+
+def _apply_filters(rows: list[dict[str, object]], filters: list[tuple[str, str]]) -> list[dict[str, object]]:
+    if not filters:
+        return rows
+    matched: list[dict[str, object]] = []
+    for row in rows:
+        ok = True
+        for key, expected in filters:
+            if key not in row or not _value_matches_filter(row.get(key), expected):
+                ok = False
+                break
+        if ok:
+            matched.append(row)
+    return matched
+
+
+def _group_rows(rows: list[dict[str, object]], group_by: str | None) -> list[dict[str, object]]:
+    if group_by is None:
+        return rows
+    if group_by != "workspace":
+        return rows
+
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for row in rows:
+        workspace = row.get("workspace")
+        key = workspace if isinstance(workspace, str) else ""
+        grouped.setdefault(key, []).append(row)
+
+    out: list[dict[str, object]] = []
+    for workspace in sorted(grouped):
+        sessions = grouped[workspace]
+        out.append(
+            {
+                "workspace": workspace,
+                "sessions": sessions,
+            }
+        )
+    return out
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="ag-man",
+        description="List today's ag-ledger sessions and whether their process is active.",
+    )
+    parser.add_argument(
+        "--filter",
+        dest="filters",
+        action="append",
+        default=[],
+        metavar="key=value",
+        help="Filter sessions by key=value. Allowed keys are json keys in the output.",
+    )
+    parser.add_argument(
+        "--group-by",
+        choices=("workspace",),
+        help="Group output by workspace.",
+    )
+    args = parser.parse_args()
+
+    parsed_filters, filter_error = _parse_filters(args.filters)
+    if filter_error is not None:
+        print(filter_error, file=sys.stderr)
+        return 2
+
+    rows = _build_rows()
+    rows = _apply_filters(rows, parsed_filters or [])
+    rows = _group_rows(rows, args.group_by)
+
+    for row in rows:
+        print(json.dumps(row, ensure_ascii=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
