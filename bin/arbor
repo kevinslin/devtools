@@ -3,11 +3,15 @@
 
 Usage:
   arbor clean [--base BRANCH] [--dry-run] [--force]
+  arbor delete <target> [--force]
+  arbor checkout [worktree]
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -24,6 +28,12 @@ class WorktreeEntry:
     branch: str | None
 
 
+@dataclass
+class WorktreeMatch:
+    entry: WorktreeEntry
+    matched_by_path: bool
+
+
 def _run_git(repo: Path, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         ["git", *args],
@@ -38,9 +48,10 @@ def _run_git(repo: Path, args: list[str], *, check: bool = True) -> subprocess.C
     return result
 
 
-def _repo_root() -> Path:
+def _repo_root(cwd: Path | None = None) -> Path:
     result = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
+        cwd=cwd,
         capture_output=True,
         text=True,
         check=False,
@@ -121,6 +132,113 @@ def _parse_worktrees(raw: str) -> list[WorktreeEntry]:
 def _list_worktrees(repo: Path) -> list[WorktreeEntry]:
     result = _run_git(repo, ["worktree", "list", "--porcelain"])
     return _parse_worktrees(result.stdout)
+
+
+def _common_git_dir(repo: Path) -> Path:
+    result = _run_git(repo, ["rev-parse", "--git-common-dir"])
+    common_dir = Path(result.stdout.strip())
+    if common_dir.is_absolute():
+        return common_dir.resolve()
+    return (repo / common_dir).resolve()
+
+
+def _shared_repo_root(repo: Path) -> Path:
+    return _common_git_dir(repo).parent.resolve()
+
+
+def _local_branch_exists(repo: Path, branch: str) -> bool:
+    result = _run_git(repo, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], check=False)
+    return result.returncode == 0
+
+
+def _match_worktree_target(repo: Path, target: str, worktrees: list[WorktreeEntry]) -> WorktreeMatch | None:
+    cwd = Path.cwd()
+    non_primary = [entry for entry in worktrees if entry.path.resolve() != repo.resolve()]
+    normalized_target_path = Path(target).expanduser().resolve(strict=False) if Path(target).is_absolute() else None
+
+    path_matches: list[WorktreeEntry] = []
+    for entry in non_primary:
+        tokens = {str(entry.path), str(entry.path.resolve())}
+        try:
+            tokens.add(os.path.relpath(entry.path, cwd))
+        except ValueError:
+            pass
+        if target in tokens or (normalized_target_path and entry.path.resolve() == normalized_target_path):
+            path_matches.append(entry)
+
+    if len(path_matches) == 1:
+        return WorktreeMatch(entry=path_matches[0], matched_by_path=True)
+    if len(path_matches) > 1:
+        raise ArborError(f"multiple worktrees match path {target}; use a more specific path")
+
+    name_matches = [entry for entry in non_primary if entry.path.name == target]
+    if len(name_matches) == 1:
+        return WorktreeMatch(entry=name_matches[0], matched_by_path=False)
+    if len(name_matches) > 1:
+        raise ArborError(f"multiple worktrees match name {target}; use a path instead")
+    return None
+
+
+def _remove_worktree(repo: Path, path: Path, *, force: bool) -> None:
+    remove_args = ["worktree", "remove"]
+    if force:
+        remove_args.append("--force")
+    remove_args.append(str(path))
+    result = _run_git(repo, remove_args, check=False)
+    if result.returncode == 0:
+        return
+
+    err = result.stderr.strip() or result.stdout.strip() or f"failed to remove worktree {path}"
+    raise ArborError(f"worktree {path}: {err}")
+
+
+def _delete_branch(repo: Path, branch: str) -> None:
+    result = _run_git(repo, ["branch", "-D", branch], check=False)
+    if result.returncode == 0:
+        return
+
+    err = result.stderr.strip() or result.stdout.strip() or f"failed to delete branch {branch}"
+    raise ArborError(f"branch {branch}: {err}")
+
+
+def _checkout_is_dirty(repo: Path) -> bool:
+    result = _run_git(repo, ["status", "--short"])
+    return bool(result.stdout.strip())
+
+
+def _remove_stale_worktree(repo: Path, worktree_path: Path) -> None:
+    remove_result = _run_git(repo, ["worktree", "remove", "--force", str(worktree_path)], check=False)
+    remove_error = remove_result.stderr.strip() or remove_result.stdout.strip()
+    worktree_exists = worktree_path.exists()
+    still_registered = any(entry.path.resolve() == worktree_path.resolve() for entry in _list_worktrees(repo))
+
+    if worktree_exists or still_registered:
+        if worktree_exists:
+            try:
+                shutil.rmtree(worktree_path)
+            except OSError as exc:
+                raise ArborError(f"worktree {worktree_path}: failed to remove directory: {exc}") from exc
+        _run_git(repo, ["worktree", "prune"])
+
+    worktree_exists = worktree_path.exists()
+    still_registered = any(entry.path.resolve() == worktree_path.resolve() for entry in _list_worktrees(repo))
+    if worktree_exists or still_registered:
+        err = remove_error or f"failed to remove worktree {worktree_path}"
+        raise ArborError(f"worktree {worktree_path}: {err}")
+
+
+def _resolve_checkout_worktree(target: str | None) -> tuple[Path, Path]:
+    current_checkout = _repo_root()
+    repo_root = _shared_repo_root(current_checkout)
+    if target is None:
+        if current_checkout.resolve() == repo_root.resolve():
+            raise ArborError("checkout requires a worktree path when run from the main repo checkout")
+        return current_checkout.resolve(), repo_root
+
+    worktree_match = _match_worktree_target(repo_root, target, _list_worktrees(repo_root))
+    if not worktree_match:
+        raise ArborError(f"no linked worktree matches {target}")
+    return worktree_match.entry.path.resolve(), repo_root
 
 
 def _cmd_clean(base_arg: str | None, dry_run: bool, force: bool) -> int:
@@ -233,6 +351,72 @@ def _cmd_clean(base_arg: str | None, dry_run: bool, force: bool) -> int:
     return 0
 
 
+def _cmd_delete(target: str, force: bool) -> int:
+    repo = _repo_root()
+    worktrees = _list_worktrees(repo)
+    worktree_match = _match_worktree_target(repo, target, worktrees)
+    branch_exists = _local_branch_exists(repo, target)
+
+    if worktree_match and (worktree_match.matched_by_path or not branch_exists):
+        _remove_worktree(repo, worktree_match.entry.path, force=force)
+        action = "force removed worktree" if force else "removed worktree"
+        print(f"{action}: {worktree_match.entry.path}")
+        return 0
+
+    if not branch_exists:
+        raise ArborError(f"no local branch or linked worktree matches {target}")
+
+    current = _current_branch(repo)
+    if current == target:
+        raise ArborError(f"cannot delete the current branch: {target}")
+
+    linked_worktrees = [
+        entry
+        for entry in worktrees
+        if entry.branch == target and entry.path.resolve() != repo.resolve()
+    ]
+    for entry in linked_worktrees:
+        _remove_worktree(repo, entry.path, force=force)
+        action = "force removed worktree" if force else "removed worktree"
+        print(f"{action}: {entry.path}")
+
+    _delete_branch(repo, target)
+    print(f"deleted branch: {target}")
+    return 0
+
+
+def _cmd_checkout(target: str | None) -> int:
+    worktree_path, repo_root = _resolve_checkout_worktree(target)
+    if worktree_path.resolve() == repo_root.resolve():
+        raise ArborError(f"{worktree_path} is already the main repo checkout")
+
+    branch_name = _current_branch(worktree_path)
+    if not branch_name:
+        raise ArborError(f"worktree is detached and cannot be converted automatically: {worktree_path}")
+
+    dirty_locations: list[str] = []
+    if _checkout_is_dirty(worktree_path):
+        dirty_locations.append(f"worktree checkout has uncommitted changes: {worktree_path}")
+    if _checkout_is_dirty(repo_root):
+        dirty_locations.append(f"main repo checkout has uncommitted changes: {repo_root}")
+    if dirty_locations:
+        raise ArborError("; ".join(dirty_locations))
+
+    _run_git(worktree_path, ["switch", "--detach"])
+    _run_git(repo_root, ["switch", "--ignore-other-worktrees", branch_name])
+    _remove_stale_worktree(repo_root, worktree_path)
+
+    main_status = _run_git(repo_root, ["status", "--short", "--branch"])
+    removed = not worktree_path.exists() and not any(
+        entry.path.resolve() == worktree_path.resolve() for entry in _list_worktrees(repo_root)
+    )
+    print(f"main checkout: {repo_root}")
+    print(f"branch: {branch_name}")
+    print(f"worktree removed: {'yes' if removed else 'no'}")
+    print(main_status.stdout.strip())
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Manage git branches and worktrees.")
     subparsers = parser.add_subparsers(dest="command")
@@ -258,9 +442,38 @@ def main(argv: list[str] | None = None) -> int:
         help="Force worktree removal, including worktrees with modified files.",
     )
 
+    delete_parser = subparsers.add_parser(
+        "delete",
+        help="Delete a local branch or remove a linked worktree target.",
+    )
+    delete_parser.add_argument(
+        "target",
+        help="Branch name, linked worktree path, or unique linked worktree directory name.",
+    )
+    delete_parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Force worktree removal when the target worktree contains modified files.",
+    )
+
+    checkout_parser = subparsers.add_parser(
+        "checkout",
+        help="Convert a linked worktree checkout back into the main repo checkout.",
+    )
+    checkout_parser.add_argument(
+        "worktree",
+        nargs="?",
+        help="Linked worktree path or unique directory name. Defaults to the current worktree when run inside one.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "clean":
         return _cmd_clean(args.base, args.dry_run, args.force)
+    if args.command == "delete":
+        return _cmd_delete(args.target, args.force)
+    if args.command == "checkout":
+        return _cmd_checkout(args.worktree)
 
     parser.print_help()
     return 2
