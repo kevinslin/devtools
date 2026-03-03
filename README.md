@@ -4,7 +4,7 @@ A bunch of usefull tools. Designed by human. Made by codex.
 
 ## CLI index
 
-- `arbor` (`bin/arbor`): Manage git branches/worktrees with merged cleanup, direct deletion, and worktree-to-main checkout conversion; detailed usage in [`docs/arbor/usage.md`](docs/arbor/usage.md).
+- `arbor` (`bin/arbor`): Manage git branches/worktrees with merged cleanup, direct deletion, worktree-to-main checkout conversion, and force-with-lease pushing; detailed usage in [`docs/arbor/usage.md`](docs/arbor/usage.md).
 - `tokemon` (`bin/tokemon`): Report token usage from local Codex and Claude session logs; detailed usage in [`docs/tokemon/usage.md`](docs/tokemon/usage.md).
 - `json_lint.py` (`bin/json_lint.py`): Validate JSON from a file path or stdin; detailed usage in [`docs/json_lint/usage.md`](docs/json_lint/usage.md).
 - `ag-man` (`bin/ag-man`): List today's `ag-ledger` session starts as JSONL with active/inactive process and tmux status, with optional `--filter key=value` and `--group-by workspace`.

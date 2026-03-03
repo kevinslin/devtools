@@ -32,6 +32,16 @@ class ArborCliTest(unittest.TestCase):
             check=False,
         )
 
+    def run_git_dir(
+        self, git_dir: Path, args: list[str]
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", f"--git-dir={git_dir}", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
     def setup_repo(self, root: Path) -> Path:
         repo = root / "repo"
         repo.mkdir(parents=True, exist_ok=True)
@@ -50,6 +60,17 @@ class ArborCliTest(unittest.TestCase):
         commit = self.run_git(repo, ["commit", "-m", "initial commit"])
         self.assertEqual(commit.returncode, 0, msg=commit.stderr)
         return repo
+
+    def setup_remote(self, root: Path, repo: Path) -> Path:
+        remote = root / "origin.git"
+        init = self.run_git(root, ["init", "--bare", str(remote)])
+        self.assertEqual(init.returncode, 0, msg=init.stderr)
+
+        add_remote = self.run_git(repo, ["remote", "add", "origin", str(remote)])
+        self.assertEqual(add_remote.returncode, 0, msg=add_remote.stderr)
+        push_main = self.run_git(repo, ["push", "-u", "origin", "main"])
+        self.assertEqual(push_main.returncode, 0, msg=push_main.stderr)
+        return remote
 
     def test_clean_removes_merged_worktree_and_branch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -422,6 +443,61 @@ class ArborCliTest(unittest.TestCase):
             current_branch = self.run_git(repo, ["branch", "--show-current"])
             self.assertEqual(current_branch.returncode, 0, msg=current_branch.stderr)
             self.assertEqual(current_branch.stdout.strip(), "main")
+
+    def test_push_force_force_pushes_current_branch_with_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = self.setup_repo(tmp_path)
+            remote = self.setup_remote(tmp_path, repo)
+
+            checkout = self.run_git(repo, ["checkout", "-b", "feature/push-force"])
+            self.assertEqual(checkout.returncode, 0, msg=checkout.stderr)
+            (repo / "push_force.txt").write_text("first version\n", encoding="utf-8")
+            add = self.run_git(repo, ["add", "push_force.txt"])
+            self.assertEqual(add.returncode, 0, msg=add.stderr)
+            commit = self.run_git(repo, ["commit", "-m", "add push-force branch"])
+            self.assertEqual(commit.returncode, 0, msg=commit.stderr)
+
+            initial_push = self.run_git(
+                repo, ["push", "-u", "origin", "feature/push-force"]
+            )
+            self.assertEqual(initial_push.returncode, 0, msg=initial_push.stderr)
+
+            (repo / "push_force.txt").write_text(
+                "rewritten version\n", encoding="utf-8"
+            )
+            add = self.run_git(repo, ["add", "push_force.txt"])
+            self.assertEqual(add.returncode, 0, msg=add.stderr)
+            amend = self.run_git(repo, ["commit", "--amend", "-m", "rewrite history"])
+            self.assertEqual(amend.returncode, 0, msg=amend.stderr)
+            local_head = self.run_git(repo, ["rev-parse", "HEAD"])
+            self.assertEqual(local_head.returncode, 0, msg=local_head.stderr)
+
+            result = self.run_cli(repo, ["push-force"])
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn(
+                "force pushed branch: feature/push-force -> origin/feature/push-force",
+                result.stdout,
+            )
+
+            remote_head = self.run_git_dir(
+                remote,
+                ["show-ref", "--verify", "--hash", "refs/heads/feature/push-force"],
+            )
+            self.assertEqual(remote_head.returncode, 0, msg=remote_head.stderr)
+            self.assertEqual(remote_head.stdout.strip(), local_head.stdout.strip())
+
+    def test_push_force_refuses_detached_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = self.setup_repo(tmp_path)
+
+            detach = self.run_git(repo, ["checkout", "--detach"])
+            self.assertEqual(detach.returncode, 0, msg=detach.stderr)
+
+            result = self.run_cli(repo, ["push-force"])
+            self.assertEqual(result.returncode, 1, msg=result.stderr)
+            self.assertIn("push-force requires a named branch", result.stderr)
 
 
 if __name__ == "__main__":

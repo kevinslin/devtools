@@ -1,6 +1,7 @@
 # arbor usage
 
 `arbor` is a git hygiene helper for cleaning up, deleting, and re-homing linked worktrees.
+It can also force-push the current branch with lease.
 
 ## Commands
 
@@ -8,6 +9,7 @@
 arbor clean [--base BRANCH] [--dry-run] [--force]
 arbor delete <target> [--force]
 arbor checkout [worktree]
+arbor push-force
 ```
 
 ## What `clean` does
@@ -51,6 +53,15 @@ deleting the branch.
 4. Detaches the worktree, switches the main repo checkout onto that branch, and
    removes the old linked worktree checkout.
 
+## What `push-force` does
+
+1. Resolves the current local branch and refuses to run from a detached `HEAD`.
+2. Uses that branch's configured upstream remote/branch when available.
+3. Falls back to `origin/<current-branch>` when no upstream is configured.
+4. If there is no `origin`, falls back to the only configured remote when there
+   is exactly one remote.
+5. Runs `git push --force-with-lease <remote> HEAD:<branch>`.
+
 ## Examples
 
 ```bash
@@ -81,6 +92,9 @@ arbor checkout ../wt-feature-my-branch
 
 # run from inside a linked worktree and convert the current checkout
 arbor checkout
+
+# force-push the current branch with lease to its upstream/origin branch
+arbor push-force
 ```
 
 ## Exit codes

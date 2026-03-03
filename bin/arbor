@@ -5,6 +5,7 @@ Usage:
   arbor clean [--base BRANCH] [--dry-run] [--force]
   arbor delete <target> [--force]
   arbor checkout [worktree]
+  arbor push-force
 """
 
 from __future__ import annotations
@@ -204,6 +205,34 @@ def _delete_branch(repo: Path, branch: str) -> None:
 def _checkout_is_dirty(repo: Path) -> bool:
     result = _run_git(repo, ["status", "--short"])
     return bool(result.stdout.strip())
+
+
+def _list_remotes(repo: Path) -> list[str]:
+    result = _run_git(repo, ["remote"])
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _resolve_push_target(repo: Path) -> tuple[str, str]:
+    branch = _current_branch(repo)
+    if not branch:
+        raise ArborError("push-force requires a named branch; current HEAD is detached")
+
+    remote_result = _run_git(repo, ["config", "--get", f"branch.{branch}.remote"], check=False)
+    merge_result = _run_git(repo, ["config", "--get", f"branch.{branch}.merge"], check=False)
+    remote = remote_result.stdout.strip()
+    merge_ref = merge_result.stdout.strip()
+    if remote and merge_ref:
+        return remote, _normalize_branch_name(merge_ref)
+
+    remotes = _list_remotes(repo)
+    if "origin" in remotes:
+        return "origin", branch
+    if len(remotes) == 1:
+        return remotes[0], branch
+
+    raise ArborError(
+        f"cannot infer a push remote for branch {branch}; configure an upstream or add an origin remote"
+    )
 
 
 def _remove_stale_worktree(repo: Path, worktree_path: Path) -> None:
@@ -417,6 +446,27 @@ def _cmd_checkout(target: str | None) -> int:
     return 0
 
 
+def _cmd_push_force() -> int:
+    repo = _repo_root()
+    branch = _current_branch(repo)
+    if not branch:
+        raise ArborError("push-force requires a named branch; current HEAD is detached")
+
+    remote, remote_branch = _resolve_push_target(repo)
+    result = subprocess.run(
+        ["git", "push", "--force-with-lease", remote, f"HEAD:{remote_branch}"],
+        cwd=repo,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ArborError(
+            f"git push --force-with-lease {remote} HEAD:{remote_branch} failed with exit code {result.returncode}"
+        )
+    print(f"force pushed branch: {branch} -> {remote}/{remote_branch}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Manage git branches and worktrees.")
     subparsers = parser.add_subparsers(dest="command")
@@ -467,6 +517,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Linked worktree path or unique directory name. Defaults to the current worktree when run inside one.",
     )
 
+    subparsers.add_parser(
+        "push-force",
+        help="Force-push the current branch with lease to its upstream or inferred remote branch.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "clean":
         return _cmd_clean(args.base, args.dry_run, args.force)
@@ -474,6 +529,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_delete(args.target, args.force)
     if args.command == "checkout":
         return _cmd_checkout(args.worktree)
+    if args.command == "push-force":
+        return _cmd_push_force()
 
     parser.print_help()
     return 2
