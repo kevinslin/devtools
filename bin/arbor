@@ -5,6 +5,7 @@ Usage:
   arbor clean [--base BRANCH] [--dry-run] [--force]
   arbor delete <target> [--force]
   arbor checkout [worktree]
+  arbor convert-to-worktree [worktree] [--base BRANCH]
   arbor push-force
 """
 
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -210,6 +212,54 @@ def _checkout_is_dirty(repo: Path) -> bool:
 def _list_remotes(repo: Path) -> list[str]:
     result = _run_git(repo, ["remote"])
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _resolve_local_base_branch(repo: Path, current_branch: str, base_arg: str | None) -> str:
+    candidates: list[str] = []
+    if base_arg:
+        candidates.append(_normalize_branch_name(base_arg))
+    else:
+        remote_head = _run_git(
+            repo,
+            ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+            check=False,
+        )
+        remote_name = remote_head.stdout.strip()
+        if remote_head.returncode == 0 and remote_name:
+            candidates.append(_normalize_branch_name(remote_name))
+        candidates.extend(["main", "master"])
+
+    for candidate in candidates:
+        if candidate == current_branch:
+            continue
+        if _local_branch_exists(repo, candidate):
+            return candidate
+
+    raise ArborError(
+        "cannot infer a local base branch for convert-to-worktree; use --base <branch>"
+    )
+
+
+def _default_worktree_path(repo: Path, branch: str) -> Path:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", branch).strip("-") or "branch"
+    return (repo.parent / f"wt-{slug}").resolve()
+
+
+def _resolve_convert_worktree_path(repo: Path, target: str | None, branch: str) -> Path:
+    worktree_path = (
+        Path(target).expanduser().resolve(strict=False)
+        if target
+        else _default_worktree_path(repo, branch)
+    )
+    if worktree_path == repo.resolve():
+        raise ArborError("convert-to-worktree target cannot be the main repo checkout path")
+
+    worktrees = _list_worktrees(repo)
+    if any(entry.path.resolve() == worktree_path for entry in worktrees):
+        raise ArborError(f"worktree path is already linked: {worktree_path}")
+    if worktree_path.exists():
+        raise ArborError(f"worktree path already exists: {worktree_path}")
+    return worktree_path
 
 
 def _resolve_push_target(repo: Path) -> tuple[str, str]:
@@ -446,6 +496,53 @@ def _cmd_checkout(target: str | None) -> int:
     return 0
 
 
+def _cmd_convert_to_worktree(target: str | None, base_arg: str | None) -> int:
+    repo = _repo_root()
+    shared_repo = _shared_repo_root(repo)
+    if repo.resolve() != shared_repo.resolve():
+        raise ArborError("convert-to-worktree must be run from the main repo checkout")
+    if _checkout_is_dirty(repo):
+        raise ArborError(f"main repo checkout has uncommitted changes: {repo}")
+
+    branch = _current_branch(repo)
+    if not branch:
+        raise ArborError("convert-to-worktree requires a named branch; current HEAD is detached")
+
+    base_branch = _resolve_local_base_branch(repo, branch, base_arg)
+    worktree_path = _resolve_convert_worktree_path(repo, target, branch)
+
+    worktree_created = False
+    switched_main = False
+    try:
+        _run_git(repo, ["worktree", "add", "--detach", str(worktree_path), base_branch])
+        worktree_created = True
+        _run_git(repo, ["switch", base_branch])
+        switched_main = True
+        _run_git(worktree_path, ["switch", branch])
+    except ArborError as exc:
+        rollback_failures: list[str] = []
+        if switched_main:
+            rollback = _run_git(repo, ["switch", branch], check=False)
+            if rollback.returncode != 0:
+                rollback_err = rollback.stderr.strip() or rollback.stdout.strip() or "rollback failed"
+                rollback_failures.append(f"failed to switch main checkout back to {branch}: {rollback_err}")
+        if worktree_created:
+            try:
+                _remove_stale_worktree(repo, worktree_path)
+            except ArborError as cleanup_exc:
+                rollback_failures.append(str(cleanup_exc))
+        if rollback_failures:
+            raise ArborError(f"{exc}; rollback issues: {'; '.join(rollback_failures)}") from exc
+        raise
+
+    print(f"main checkout: {repo}")
+    print(f"base branch: {base_branch}")
+    print(f"branch moved to worktree: {branch}")
+    print(f"worktree: {worktree_path}")
+    print(_run_git(repo, ["status", "--short", "--branch"]).stdout.strip())
+    return 0
+
+
 def _cmd_push_force() -> int:
     repo = _repo_root()
     branch = _current_branch(repo)
@@ -517,6 +614,20 @@ def main(argv: list[str] | None = None) -> int:
         help="Linked worktree path or unique directory name. Defaults to the current worktree when run inside one.",
     )
 
+    convert_parser = subparsers.add_parser(
+        "convert-to-worktree",
+        help="Move the current branch from the main repo checkout into a linked worktree.",
+    )
+    convert_parser.add_argument(
+        "worktree",
+        nargs="?",
+        help="Linked worktree path to create. Defaults to a sibling `wt-<branch>` directory.",
+    )
+    convert_parser.add_argument(
+        "--base",
+        help="Local branch to leave checked out in the main repo (default: origin/HEAD, main, or master).",
+    )
+
     subparsers.add_parser(
         "push-force",
         help="Force-push the current branch with lease to its upstream or inferred remote branch.",
@@ -529,6 +640,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_delete(args.target, args.force)
     if args.command == "checkout":
         return _cmd_checkout(args.worktree)
+    if args.command == "convert-to-worktree":
+        return _cmd_convert_to_worktree(args.worktree, args.base)
     if args.command == "push-force":
         return _cmd_push_force()
 

@@ -499,6 +499,59 @@ class ArborCliTest(unittest.TestCase):
             self.assertEqual(result.returncode, 1, msg=result.stderr)
             self.assertIn("push-force requires a named branch", result.stderr)
 
+    def test_convert_to_worktree_moves_current_branch_to_linked_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = self.setup_repo(tmp_path)
+            worktree_dir = tmp_path / "wt-feature-convert"
+
+            checkout = self.run_git(repo, ["checkout", "-b", "feature/convert"])
+            self.assertEqual(checkout.returncode, 0, msg=checkout.stderr)
+            (repo / "convert.txt").write_text("convert branch\n", encoding="utf-8")
+            add = self.run_git(repo, ["add", "convert.txt"])
+            self.assertEqual(add.returncode, 0, msg=add.stderr)
+            commit = self.run_git(repo, ["commit", "-m", "add convert branch"])
+            self.assertEqual(commit.returncode, 0, msg=commit.stderr)
+
+            result = self.run_cli(repo, ["convert-to-worktree"])
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn(f"main checkout: {repo.resolve()}", result.stdout)
+            self.assertIn("base branch: main", result.stdout)
+            self.assertIn("branch moved to worktree: feature/convert", result.stdout)
+            self.assertIn(f"worktree: {worktree_dir.resolve()}", result.stdout)
+            self.assertTrue(worktree_dir.exists())
+
+            current_branch = self.run_git(repo, ["branch", "--show-current"])
+            self.assertEqual(current_branch.returncode, 0, msg=current_branch.stderr)
+            self.assertEqual(current_branch.stdout.strip(), "main")
+
+            worktree_branch = self.run_git(worktree_dir, ["branch", "--show-current"])
+            self.assertEqual(worktree_branch.returncode, 0, msg=worktree_branch.stderr)
+            self.assertEqual(worktree_branch.stdout.strip(), "feature/convert")
+
+            worktree_list = self.run_git(repo, ["worktree", "list", "--porcelain"])
+            self.assertEqual(worktree_list.returncode, 0, msg=worktree_list.stderr)
+            self.assertIn(str(worktree_dir.resolve()), worktree_list.stdout)
+
+    def test_convert_to_worktree_refuses_dirty_main_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = self.setup_repo(tmp_path)
+            worktree_dir = tmp_path / "wt-feature-dirty-convert"
+
+            checkout = self.run_git(repo, ["checkout", "-b", "feature/dirty-convert"])
+            self.assertEqual(checkout.returncode, 0, msg=checkout.stderr)
+            (repo / "dirty_convert.txt").write_text("dirty convert\n", encoding="utf-8")
+
+            result = self.run_cli(repo, ["convert-to-worktree", str(worktree_dir)])
+            self.assertEqual(result.returncode, 1, msg=result.stderr)
+            self.assertIn("main repo checkout has uncommitted changes", result.stderr)
+            self.assertFalse(worktree_dir.exists())
+
+            current_branch = self.run_git(repo, ["branch", "--show-current"])
+            self.assertEqual(current_branch.returncode, 0, msg=current_branch.stderr)
+            self.assertEqual(current_branch.stdout.strip(), "feature/dirty-convert")
+
 
 if __name__ == "__main__":
     unittest.main()

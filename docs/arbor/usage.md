@@ -1,6 +1,6 @@
 # arbor usage
 
-`arbor` is a git hygiene helper for cleaning up, deleting, and re-homing linked worktrees.
+`arbor` is a git hygiene helper for cleaning up, deleting, re-homing, and creating linked worktrees.
 It can also force-push the current branch with lease.
 
 ## Commands
@@ -9,6 +9,7 @@ It can also force-push the current branch with lease.
 arbor clean [--base BRANCH] [--dry-run] [--force]
 arbor delete <target> [--force]
 arbor checkout [worktree]
+arbor convert-to-worktree [worktree] [--base BRANCH]
 arbor push-force
 ```
 
@@ -53,6 +54,17 @@ deleting the branch.
 4. Detaches the worktree, switches the main repo checkout onto that branch, and
    removes the old linked worktree checkout.
 
+## What `convert-to-worktree` does
+
+1. Requires you to run it from the main repo checkout on a named branch.
+2. Refuses to proceed when the main checkout has uncommitted changes.
+3. Chooses the branch to leave in the main checkout from `--base`, then
+   `origin/HEAD`, then local `main` or `master`.
+4. Creates a new linked worktree directory, defaulting to a sibling
+   `wt-<branch>` path when `[worktree]` is omitted.
+5. Switches the main checkout to the base branch and moves the original branch
+   into the new worktree.
+
 ## What `push-force` does
 
 1. Resolves the current local branch and refuses to run from a detached `HEAD`.
@@ -92,6 +104,12 @@ arbor checkout ../wt-feature-my-branch
 
 # run from inside a linked worktree and convert the current checkout
 arbor checkout
+
+# move the current branch out of the main repo and into a default worktree path
+arbor convert-to-worktree
+
+# do the same move but pick the destination path and base branch explicitly
+arbor convert-to-worktree ../wt-feature-my-branch --base main
 
 # force-push the current branch with lease to its upstream/origin branch
 arbor push-force
