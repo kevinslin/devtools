@@ -1,6 +1,6 @@
 # Tokemon
 
-Tokemon is a local CLI for reporting token usage from Codex and Claude session logs.
+Tokemon is a local CLI for reporting token usage from Codex and Claude session logs. Its JSON output is also used as the data backend for the Tokemon macOS menu-bar app.
 
 ## Quickstart
 
@@ -8,6 +8,21 @@ Tokemon is a local CLI for reporting token usage from Codex and Claude session l
 # default: current_week, hourly buckets, csv, provider=codex
 tokemon
 ```
+
+## Menu app
+
+Build and open the native menu-bar app with:
+
+```sh
+bin/tokemon-menuapp
+```
+
+The menu app opens from the macOS menu bar, stays open until you click the icon again, and supports:
+
+- `Today`: hourly token totals
+- `Week`: daily token totals across the last 7 days
+- `Month`: weekly token totals across the trailing month window
+- `Year`: monthly token totals across the last 12 calendar months
 
 ## Command
 
