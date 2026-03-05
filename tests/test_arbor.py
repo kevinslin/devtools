@@ -218,7 +218,7 @@ class ArborCliTest(unittest.TestCase):
             self.assertEqual(branch_exists.returncode, 0, msg=branch_exists.stderr)
             self.assertEqual(branch_exists.stdout.strip(), "")
 
-    def test_delete_branch_removes_linked_worktree_and_branch(self) -> None:
+    def test_remove_branch_removes_linked_worktree_and_branch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             repo = self.setup_repo(tmp_path)
@@ -240,7 +240,7 @@ class ArborCliTest(unittest.TestCase):
             )
             self.assertEqual(add_worktree.returncode, 0, msg=add_worktree.stderr)
 
-            result = self.run_cli(repo, ["delete", "feature/delete-branch"])
+            result = self.run_cli(repo, ["remove", "feature/delete-branch"])
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertIn("removed worktree:", result.stdout)
             self.assertIn("deleted branch: feature/delete-branch", result.stdout)
@@ -252,7 +252,7 @@ class ArborCliTest(unittest.TestCase):
             self.assertEqual(branch_exists.returncode, 0, msg=branch_exists.stderr)
             self.assertEqual(branch_exists.stdout.strip(), "")
 
-    def test_delete_worktree_by_name_keeps_branch(self) -> None:
+    def test_remove_worktree_by_name_keeps_branch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             repo = self.setup_repo(tmp_path)
@@ -276,7 +276,7 @@ class ArborCliTest(unittest.TestCase):
             )
             self.assertEqual(add_worktree.returncode, 0, msg=add_worktree.stderr)
 
-            result = self.run_cli(repo, ["delete", worktree_dir.name])
+            result = self.run_cli(repo, ["remove", worktree_dir.name])
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertIn(f"removed worktree: {worktree_dir.resolve()}", result.stdout)
             self.assertNotIn("deleted branch:", result.stdout)
@@ -288,7 +288,7 @@ class ArborCliTest(unittest.TestCase):
             self.assertEqual(branch_exists.returncode, 0, msg=branch_exists.stderr)
             self.assertIn("feature/delete-worktree", branch_exists.stdout)
 
-    def test_delete_branch_force_removes_dirty_linked_worktree(self) -> None:
+    def test_remove_branch_force_removes_dirty_linked_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             repo = self.setup_repo(tmp_path)
@@ -313,12 +313,12 @@ class ArborCliTest(unittest.TestCase):
                 "dirty worktree\n", encoding="utf-8"
             )
 
-            non_force = self.run_cli(repo, ["delete", "feature/delete-dirty"])
+            non_force = self.run_cli(repo, ["remove", "feature/delete-dirty"])
             self.assertEqual(non_force.returncode, 1, msg=non_force.stderr)
             self.assertTrue(worktree_dir.exists())
             self.assertIn("contains modified or untracked files", non_force.stderr)
 
-            force = self.run_cli(repo, ["delete", "feature/delete-dirty", "--force"])
+            force = self.run_cli(repo, ["remove", "feature/delete-dirty", "--force"])
             self.assertEqual(force.returncode, 0, msg=force.stderr)
             self.assertIn("force removed worktree:", force.stdout)
             self.assertIn("deleted branch: feature/delete-dirty", force.stdout)
@@ -329,6 +329,75 @@ class ArborCliTest(unittest.TestCase):
             )
             self.assertEqual(branch_exists.returncode, 0, msg=branch_exists.stderr)
             self.assertEqual(branch_exists.stdout.strip(), "")
+
+    def test_remove_multiple_targets_branch_and_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = self.setup_repo(tmp_path)
+            branch_target = "feature/remove-multi-branch"
+            branch_worktree = tmp_path / "wt-feature-remove-multi-branch"
+            worktree_target_branch = "feature/remove-multi-worktree"
+            worktree_target = tmp_path / "wt-feature-remove-multi-worktree"
+
+            checkout = self.run_git(repo, ["checkout", "-b", branch_target])
+            self.assertEqual(checkout.returncode, 0, msg=checkout.stderr)
+            (repo / "remove_multi_branch.txt").write_text(
+                "remove multi branch\n", encoding="utf-8"
+            )
+            add = self.run_git(repo, ["add", "remove_multi_branch.txt"])
+            self.assertEqual(add.returncode, 0, msg=add.stderr)
+            commit = self.run_git(repo, ["commit", "-m", "add remove multi branch"])
+            self.assertEqual(commit.returncode, 0, msg=commit.stderr)
+
+            back_to_main = self.run_git(repo, ["checkout", "main"])
+            self.assertEqual(back_to_main.returncode, 0, msg=back_to_main.stderr)
+            add_worktree = self.run_git(
+                repo, ["worktree", "add", str(branch_worktree), branch_target]
+            )
+            self.assertEqual(add_worktree.returncode, 0, msg=add_worktree.stderr)
+
+            checkout = self.run_git(repo, ["checkout", "-b", worktree_target_branch])
+            self.assertEqual(checkout.returncode, 0, msg=checkout.stderr)
+            (repo / "remove_multi_worktree.txt").write_text(
+                "remove multi worktree\n", encoding="utf-8"
+            )
+            add = self.run_git(repo, ["add", "remove_multi_worktree.txt"])
+            self.assertEqual(add.returncode, 0, msg=add.stderr)
+            commit = self.run_git(repo, ["commit", "-m", "add remove multi worktree"])
+            self.assertEqual(commit.returncode, 0, msg=commit.stderr)
+
+            back_to_main = self.run_git(repo, ["checkout", "main"])
+            self.assertEqual(back_to_main.returncode, 0, msg=back_to_main.stderr)
+            add_worktree = self.run_git(
+                repo, ["worktree", "add", str(worktree_target), worktree_target_branch]
+            )
+            self.assertEqual(add_worktree.returncode, 0, msg=add_worktree.stderr)
+
+            result = self.run_cli(
+                repo, ["remove", branch_target, worktree_target.name]
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn(
+                f"removed worktree: {branch_worktree.resolve()}",
+                result.stdout,
+            )
+            self.assertIn(f"deleted branch: {branch_target}", result.stdout)
+            self.assertIn(
+                f"removed worktree: {worktree_target.resolve()}",
+                result.stdout,
+            )
+            self.assertFalse(branch_worktree.exists())
+            self.assertFalse(worktree_target.exists())
+
+            branch_removed = self.run_git(repo, ["branch", "--list", branch_target])
+            self.assertEqual(branch_removed.returncode, 0, msg=branch_removed.stderr)
+            self.assertEqual(branch_removed.stdout.strip(), "")
+
+            branch_kept = self.run_git(
+                repo, ["branch", "--list", worktree_target_branch]
+            )
+            self.assertEqual(branch_kept.returncode, 0, msg=branch_kept.stderr)
+            self.assertIn(worktree_target_branch, branch_kept.stdout)
 
     def test_checkout_worktree_moves_branch_back_to_main_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

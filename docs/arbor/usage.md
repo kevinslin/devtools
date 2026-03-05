@@ -1,13 +1,13 @@
 # arbor usage
 
-`arbor` is a git hygiene helper for cleaning up, deleting, re-homing, and creating linked worktrees.
+`arbor` is a git hygiene helper for cleaning up, removing, re-homing, and creating linked worktrees.
 It can also force-push the current branch with lease.
 
 ## Commands
 
 ```bash
 arbor clean [--base BRANCH] [--dry-run] [--force]
-arbor delete <target> [--force]
+arbor remove <target> [<target> ...] [--force]
 arbor checkout [worktree]
 arbor convert-to-worktree [worktree] [--base BRANCH]
 arbor push-force
@@ -25,23 +25,25 @@ arbor push-force
 
 `clean` never deletes the base branch and never deletes the current branch.
 
-When `--dry-run` (or `-n`) is passed, `arbor` prints what it would remove/delete
+When `--dry-run` (or `-n`) is passed, `arbor` prints what it would remove
 without making any repository changes.
 
 When `--force` (or `-f`) is passed, `arbor` force-removes merged worktrees,
 including worktrees with modified files.
 
-## What `delete` does
+## What `remove` does
 
-1. Resolves `<target>` as either:
+1. Resolves each `<target>` as either:
 - A local branch name.
 - A linked worktree path.
 - A unique linked worktree directory name.
-2. If the target is a branch and that branch is checked out in a linked worktree,
+2. If a target is a branch and that branch is checked out in a linked worktree,
    removes the linked worktree first.
-3. Force-deletes the local branch.
+3. Deletes targeted local branches.
+4. Processes all targets in order; if any target fails, `arbor` exits with code 1
+   after reporting errors.
 
-When `--force` (or `-f`) is passed, `delete` force-removes dirty worktrees before
+When `--force` (or `-f`) is passed, `remove` force-removes dirty worktrees before
 deleting the branch.
 
 ## What `checkout` does
@@ -89,15 +91,18 @@ arbor clean --base main --dry-run
 # force cleanup of merged worktrees even if they are dirty
 arbor clean --base main --force
 
-# delete a local branch, also removing its linked worktree if present
-arbor delete feature/my-branch
+# remove a local branch, also removing its linked worktree if present
+arbor remove feature/my-branch
 
 # remove a linked worktree by path or unique directory name
-arbor delete ../wt-feature-my-branch
-arbor delete wt-feature-my-branch
+arbor remove ../wt-feature-my-branch
+arbor remove wt-feature-my-branch
 
-# force-remove a dirty worktree while deleting its branch
-arbor delete feature/my-branch --force
+# remove multiple targets in one command
+arbor remove feature/my-branch wt-feature-another
+
+# force-remove a dirty worktree while removing its branch
+arbor remove feature/my-branch --force
 
 # move a linked worktree branch back into the main repo checkout
 arbor checkout ../wt-feature-my-branch

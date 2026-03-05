@@ -3,7 +3,7 @@
 
 Usage:
   arbor clean [--base BRANCH] [--dry-run] [--force]
-  arbor delete <target> [--force]
+  arbor remove <target> [<target> ...] [--force]
   arbor checkout [worktree]
   arbor convert-to-worktree [worktree] [--base BRANCH]
   arbor push-force
@@ -430,8 +430,7 @@ def _cmd_clean(base_arg: str | None, dry_run: bool, force: bool) -> int:
     return 0
 
 
-def _cmd_delete(target: str, force: bool) -> int:
-    repo = _repo_root()
+def _remove_target(repo: Path, target: str, force: bool) -> None:
     worktrees = _list_worktrees(repo)
     worktree_match = _match_worktree_target(repo, target, worktrees)
     branch_exists = _local_branch_exists(repo, target)
@@ -440,7 +439,7 @@ def _cmd_delete(target: str, force: bool) -> int:
         _remove_worktree(repo, worktree_match.entry.path, force=force)
         action = "force removed worktree" if force else "removed worktree"
         print(f"{action}: {worktree_match.entry.path}")
-        return 0
+        return
 
     if not branch_exists:
         raise ArborError(f"no local branch or linked worktree matches {target}")
@@ -461,7 +460,18 @@ def _cmd_delete(target: str, force: bool) -> int:
 
     _delete_branch(repo, target)
     print(f"deleted branch: {target}")
-    return 0
+
+
+def _cmd_remove(targets: list[str], force: bool) -> int:
+    repo = _repo_root()
+    had_errors = False
+    for target in targets:
+        try:
+            _remove_target(repo, target, force)
+        except ArborError as exc:
+            print(f"error: {target}: {exc}", file=sys.stderr)
+            had_errors = True
+    return 1 if had_errors else 0
 
 
 def _cmd_checkout(target: str | None) -> int:
@@ -589,15 +599,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Force worktree removal, including worktrees with modified files.",
     )
 
-    delete_parser = subparsers.add_parser(
-        "delete",
-        help="Delete a local branch or remove a linked worktree target.",
+    remove_parser = subparsers.add_parser(
+        "remove",
+        help="Remove one or more local branches or linked worktree targets.",
     )
-    delete_parser.add_argument(
-        "target",
-        help="Branch name, linked worktree path, or unique linked worktree directory name.",
+    remove_parser.add_argument(
+        "targets",
+        nargs="+",
+        help="One or more branch names, linked worktree paths, or unique linked worktree directory names.",
     )
-    delete_parser.add_argument(
+    remove_parser.add_argument(
         "-f",
         "--force",
         action="store_true",
@@ -636,8 +647,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "clean":
         return _cmd_clean(args.base, args.dry_run, args.force)
-    if args.command == "delete":
-        return _cmd_delete(args.target, args.force)
+    if args.command == "remove":
+        return _cmd_remove(args.targets, args.force)
     if args.command == "checkout":
         return _cmd_checkout(args.worktree)
     if args.command == "convert-to-worktree":
