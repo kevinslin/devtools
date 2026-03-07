@@ -100,15 +100,114 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 
     .diagram {{
       padding: 0.75rem;
+      display: grid;
+      gap: 0.75rem;
+    }}
+
+    .diagram-toolbar {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      padding: 0.25rem 0.1rem 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }}
+
+    .diagram-toolbar-group {{
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      flex-wrap: wrap;
+    }}
+
+    .diagram-toolbar button {{
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.86);
+      color: var(--ink);
+      border-radius: 999px;
+      padding: 0.42rem 0.72rem;
+      font: inherit;
+      cursor: pointer;
+      transition: background 120ms ease, transform 120ms ease, border-color 120ms ease;
+    }}
+
+    .diagram-toolbar button:hover {{
+      background: rgba(13, 138, 168, 0.14);
+      border-color: rgba(13, 138, 168, 0.28);
+      transform: translateY(-1px);
+    }}
+
+    .diagram-zoom-label {{
+      min-width: 4rem;
+      text-align: center;
+      font-variant-numeric: tabular-nums;
+      color: var(--ink);
+      font-weight: 600;
+    }}
+
+    .diagram-viewport {{
+      position: relative;
       overflow: auto;
+      min-height: min(72vh, 48rem);
+      max-height: min(72vh, 48rem);
+      padding: 1rem;
+      border-radius: 20px;
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(240, 249, 252, 0.88)),
+        linear-gradient(90deg, rgba(16, 50, 74, 0.05) 1px, transparent 1px),
+        linear-gradient(rgba(16, 50, 74, 0.05) 1px, transparent 1px);
+      background-size: auto, 24px 24px, 24px 24px;
+      border: 1px solid rgba(16, 50, 74, 0.08);
+    }}
+
+    .diagram-stage-wrap {{
+      min-width: 100%;
+      min-height: 100%;
+      width: max-content;
+    }}
+
+    .diagram-stage {{
+      position: relative;
+      margin: 0 auto;
     }}
 
     .diagram .mermaid {{
-      min-width: fit-content;
+      min-width: 0;
       margin: 0;
-      padding: 1rem;
-      border-radius: 18px;
-      background: rgba(255, 255, 255, 0.78);
+      padding: 0;
+      border-radius: 0;
+      background: transparent;
+    }}
+
+    .diagram .mermaid svg {{
+      display: block;
+      transform-origin: top left;
+    }}
+
+    .note-hover-tooltip {{
+      position: fixed;
+      z-index: 30;
+      max-width: min(34rem, calc(100vw - 1.5rem));
+      padding: 0.75rem 0.9rem;
+      border-radius: 14px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      background: rgba(16, 50, 74, 0.94);
+      color: #f7fbff;
+      box-shadow: 0 16px 36px rgba(8, 29, 42, 0.25);
+      font-size: 0.95rem;
+      line-height: 1.4;
+      pointer-events: none;
+      white-space: normal;
+      word-break: break-word;
+      opacity: 0;
+      transform: translateY(6px);
+      transition: opacity 120ms ease, transform 120ms ease;
+    }}
+
+    .note-hover-tooltip[data-visible="true"] {{
+      opacity: 1;
+      transform: translateY(0);
     }}
 
     details {{
@@ -155,21 +254,203 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       <p class="caption"><a href="/source.mmd">download source</a></p>
     </section>
     <section class="panel diagram">
-      <pre class="mermaid">{diagram}</pre>
+      <div class="diagram-toolbar">
+        <div class="diagram-toolbar-group">
+          <span>View</span>
+          <strong class="diagram-zoom-label" id="diagram-zoom-label">100%</strong>
+        </div>
+        <div class="diagram-toolbar-group">
+          <button type="button" id="diagram-fit-button">Fit</button>
+          <button type="button" id="diagram-zoom-out-button">-</button>
+          <button type="button" id="diagram-zoom-in-button">+</button>
+        </div>
+      </div>
+      <div class="diagram-viewport" id="diagram-viewport">
+        <div class="diagram-stage-wrap">
+          <div class="diagram-stage" id="diagram-stage">
+            <pre class="mermaid" id="diagram-mermaid">{diagram}</pre>
+          </div>
+        </div>
+      </div>
     </section>
     <details class="panel">
       <summary>Source</summary>
       <pre class="source">{diagram}</pre>
     </details>
   </main>
+  <div class="note-hover-tooltip" id="note-hover-tooltip" hidden></div>
   <script type="module">
     import mermaid from "{mermaid_url}";
 
     mermaid.initialize({{
-      startOnLoad: true,
+      startOnLoad: false,
+      sequence: {{
+        useMaxWidth: false,
+      }},
+      flowchart: {{
+        useMaxWidth: false,
+      }},
       securityLevel: "strict",
       theme: "neutral",
     }});
+
+    const tooltip = document.getElementById("note-hover-tooltip");
+    const viewport = document.getElementById("diagram-viewport");
+    const stage = document.getElementById("diagram-stage");
+    const zoomLabel = document.getElementById("diagram-zoom-label");
+    const fitButton = document.getElementById("diagram-fit-button");
+    const zoomOutButton = document.getElementById("diagram-zoom-out-button");
+    const zoomInButton = document.getElementById("diagram-zoom-in-button");
+    const mermaidRoot = document.getElementById("diagram-mermaid");
+    const ZOOM_STEP = 0.15;
+    const MAX_SCALE = 3;
+    let diagramMetrics = null;
+    let fitScale = 1;
+    let currentScale = 1;
+
+    function getNoteLabel(noteTextNode) {{
+      const tspans = Array.from(noteTextNode.querySelectorAll("tspan"))
+        .map((node) => (node.textContent || "").trim())
+        .filter(Boolean);
+      if (tspans.length > 0) {{
+        return tspans.join(" ");
+      }}
+      return (noteTextNode.textContent || "").trim();
+    }}
+
+    function positionTooltip(anchorRect) {{
+      if (tooltip.hidden) {{
+        return;
+      }}
+
+      const margin = 12;
+      const tooltipRect = tooltip.getBoundingClientRect();
+      let left = anchorRect.left + (anchorRect.width / 2) - (tooltipRect.width / 2);
+      left = Math.max(margin, Math.min(left, window.innerWidth - tooltipRect.width - margin));
+
+      let top = anchorRect.top - tooltipRect.height - margin;
+      if (top < margin) {{
+        top = Math.min(anchorRect.bottom + margin, window.innerHeight - tooltipRect.height - margin);
+      }}
+
+      tooltip.style.left = `${{left}}px`;
+      tooltip.style.top = `${{Math.max(margin, top)}}px`;
+    }}
+
+    function showTooltip(label, anchorRect) {{
+      tooltip.textContent = label;
+      tooltip.hidden = false;
+      tooltip.dataset.visible = "true";
+      positionTooltip(anchorRect);
+    }}
+
+    function hideTooltip() {{
+      tooltip.hidden = true;
+      delete tooltip.dataset.visible;
+    }}
+
+    function attachNoteHover(textNode) {{
+      const label = getNoteLabel(textNode);
+      if (!label) {{
+        return;
+      }}
+
+      const group = textNode.closest("g");
+      if (group && !group.querySelector("title")) {{
+        const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+        title.textContent = label;
+        group.prepend(title);
+      }}
+
+      const hoverTargets = [textNode];
+      const noteBox = group ? group.querySelector("rect.note") : null;
+      if (noteBox) {{
+        hoverTargets.push(noteBox);
+      }}
+
+      for (const target of hoverTargets) {{
+        target.style.cursor = "help";
+        target.addEventListener("mouseenter", () => showTooltip(label, target.getBoundingClientRect()));
+        target.addEventListener("mousemove", () => showTooltip(label, target.getBoundingClientRect()));
+        target.addEventListener("mouseleave", hideTooltip);
+      }}
+    }}
+
+    function installNoteHoverTooltips() {{
+      for (const textNode of document.querySelectorAll("svg .noteText")) {{
+        attachNoteHover(textNode);
+      }}
+    }}
+
+    function setZoomLabel(scale) {{
+      zoomLabel.textContent = `${{Math.round(scale * 100)}}%`;
+    }}
+
+    function readDiagramMetrics(svg) {{
+      const viewBox = svg.viewBox?.baseVal;
+      if (viewBox && viewBox.width > 0 && viewBox.height > 0) {{
+        return {{
+          width: viewBox.width,
+          height: viewBox.height,
+        }};
+      }}
+
+      const bbox = svg.getBBox();
+      return {{
+        width: Math.max(1, bbox.width),
+        height: Math.max(1, bbox.height),
+      }};
+    }}
+
+    function applyScale(scale) {{
+      const svg = mermaidRoot.querySelector("svg");
+      if (!svg || !diagramMetrics) {{
+        return;
+      }}
+
+      currentScale = Math.max(0.1, Math.min(scale, MAX_SCALE));
+      svg.style.width = `${{diagramMetrics.width}}px`;
+      svg.style.height = `${{diagramMetrics.height}}px`;
+      svg.style.maxWidth = "none";
+      svg.style.transform = `scale(${{currentScale}})`;
+      stage.style.width = `${{diagramMetrics.width * currentScale}}px`;
+      stage.style.height = `${{diagramMetrics.height * currentScale}}px`;
+      stage.dataset.scale = currentScale.toFixed(4);
+      setZoomLabel(currentScale);
+    }}
+
+    function fitDiagram() {{
+      if (!diagramMetrics) {{
+        return;
+      }}
+
+      const availableWidth = Math.max(1, viewport.clientWidth - 32);
+      const availableHeight = Math.max(1, viewport.clientHeight - 32);
+      fitScale = Math.min(1, availableWidth / diagramMetrics.width, availableHeight / diagramMetrics.height);
+      applyScale(fitScale);
+      viewport.scrollTop = 0;
+      viewport.scrollLeft = 0;
+    }}
+
+    function zoomBy(delta) {{
+      applyScale(currentScale + delta);
+    }}
+
+    await mermaid.run({{
+      querySelector: ".mermaid",
+    }});
+    const svg = mermaidRoot.querySelector("svg");
+    if (svg) {{
+      diagramMetrics = readDiagramMetrics(svg);
+      fitDiagram();
+      fitButton.addEventListener("click", fitDiagram);
+      zoomOutButton.addEventListener("click", () => zoomBy(-ZOOM_STEP));
+      zoomInButton.addEventListener("click", () => zoomBy(ZOOM_STEP));
+      window.addEventListener("resize", fitDiagram);
+    }}
+    installNoteHoverTooltips();
+    window.addEventListener("scroll", hideTooltip, true);
+    window.addEventListener("resize", hideTooltip);
   </script>
 </body>
 </html>

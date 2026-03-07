@@ -28,6 +28,11 @@ class FishyCliTest(unittest.TestCase):
         self.assertIn("A[Start]", body)
         self.assertIn("/source.mmd", body)
         self.assertIn("cdn.jsdelivr.net/npm/mermaid", body)
+        self.assertIn("note-hover-tooltip", body)
+        self.assertIn("installNoteHoverTooltips", body)
+        self.assertIn("diagram-fit-button", body)
+        self.assertIn("diagram-zoom-in-button", body)
+        self.assertIn("diagram-viewport", body)
 
         with urlopen(f"{url}/source.mmd", timeout=5) as response:
             source_body = response.read().decode("utf-8")
