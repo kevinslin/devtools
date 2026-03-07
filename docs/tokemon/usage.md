@@ -29,7 +29,7 @@ The menu app opens from the macOS menu bar, stays open until you click the icon 
 ## Command
 
 ```sh
-tokemon [range] [--sum-by N|daily|weekly|monthly] [--group-by none|workspace|session|provider] [--format csv|json] [--provider codex|claude|all]
+tokemon [range] [--sum-by N|daily|weekly|monthly] [--group-by none|workspace|session|provider] [--format csv|json] [--provider codex|claude|all] [--pretty]
 ```
 
 ## Arguments
@@ -48,6 +48,7 @@ tokemon [range] [--sum-by N|daily|weekly|monthly] [--group-by none|workspace|ses
 - `--group-by`: `none|workspace|session|provider` (default: `none`)
 - `--format`: `csv|json` (default: `csv`)
 - `--provider`: `codex|claude|all` (default: `codex`)
+- `--pretty`: format token counts using scientific notation with two decimal places (for example `5.33e9`)
 
 ## Examples
 
@@ -66,6 +67,9 @@ tokemon current_week --provider all --group-by session --format csv
 
 # explicit date range, 30-minute buckets, json output
 tokemon 2026-02-01 2026-02-15 --sum-by 30 --format json --provider all
+
+# pretty-print token counts for quick scanning
+tokemon week --provider all --pretty
 ```
 
 ## Data sources
@@ -92,6 +96,7 @@ Codex session files that replay the same `session_meta.payload.id` are reconcile
 
 CSV output is intended for shell pipelines and spreadsheets.
 JSON output includes metadata (`provider`, `range`, `sum_by`, `group_by`) plus aggregated rows.
+When `--pretty` is set, token fields in both CSV and JSON rows are rendered as strings in normalized scientific notation (for example `5.33e9`).
 
 ## Column descriptions
 

@@ -183,6 +183,64 @@ class TokemonCliTest(unittest.TestCase):
             self.assertEqual(second["reasoning_output_tokens"], "0")
             self.assertEqual(second["total_tokens"], "30")
 
+    def test_codex_report_csv_pretty_formats_token_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sessions_root = tmp_path / "codex-sessions"
+            archived_root = tmp_path / "codex-archived"
+            claude_root = tmp_path / "claude-projects"
+
+            _write_jsonl(
+                sessions_root / "2026/02/03/session.jsonl",
+                [
+                    {
+                        "timestamp": "2026-02-03T09:00:00-08:00",
+                        "type": "session_meta",
+                        "payload": {"cwd": "/repo/demo"},
+                    },
+                    {
+                        "timestamp": "2026-02-03T09:05:00-08:00",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "total_token_usage": {
+                                    "input_tokens": 5330000000,
+                                    "total_tokens": 5330000000,
+                                }
+                            },
+                        },
+                    },
+                ],
+            )
+
+            result = self.run_cli(
+                [
+                    "2026-02-03",
+                    "2026-02-03",
+                    "--provider",
+                    "codex",
+                    "--format",
+                    "csv",
+                    "--pretty",
+                ],
+                {
+                    "TOKEMON_CODEX_SESSIONS_ROOT": str(sessions_root),
+                    "TOKEMON_CODEX_ARCHIVED_ROOT": str(archived_root),
+                    "TOKEMON_CLAUDE_PROJECTS_ROOT": str(claude_root),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            rows = list(csv.DictReader(result.stdout.splitlines()))
+            self.assertEqual(len(rows), 1, msg=result.stdout)
+            row = rows[0]
+            self.assertEqual(row["input_tokens"], "5.33e9")
+            self.assertEqual(row["cached_input_tokens"], "0.00e0")
+            self.assertEqual(row["output_tokens"], "0.00e0")
+            self.assertEqual(row["reasoning_output_tokens"], "0.00e0")
+            self.assertEqual(row["total_tokens"], "5.33e9")
+
     def test_claude_report_json_dedupes_message_updates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -297,6 +355,66 @@ class TokemonCliTest(unittest.TestCase):
             self.assertEqual(second["output_tokens"], 1)
             self.assertEqual(second["reasoning_output_tokens"], 0)
             self.assertEqual(second["total_tokens"], 4)
+
+    def test_codex_report_json_pretty_formats_token_counts_as_strings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sessions_root = tmp_path / "codex-sessions"
+            archived_root = tmp_path / "codex-archived"
+            claude_root = tmp_path / "claude-projects"
+
+            _write_jsonl(
+                sessions_root / "2026/02/03/session.jsonl",
+                [
+                    {
+                        "timestamp": "2026-02-03T09:00:00-08:00",
+                        "type": "session_meta",
+                        "payload": {"cwd": "/repo/demo"},
+                    },
+                    {
+                        "timestamp": "2026-02-03T09:05:00-08:00",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "total_token_usage": {
+                                    "input_tokens": 5330000000,
+                                    "total_tokens": 5330000000,
+                                }
+                            },
+                        },
+                    },
+                ],
+            )
+
+            result = self.run_cli(
+                [
+                    "2026-02-03",
+                    "2026-02-03",
+                    "--provider",
+                    "codex",
+                    "--format",
+                    "json",
+                    "--pretty",
+                ],
+                {
+                    "TOKEMON_CODEX_SESSIONS_ROOT": str(sessions_root),
+                    "TOKEMON_CODEX_ARCHIVED_ROOT": str(archived_root),
+                    "TOKEMON_CLAUDE_PROJECTS_ROOT": str(claude_root),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            payload = json.loads(result.stdout)
+            rows = payload["rows"]
+            self.assertEqual(len(rows), 1, msg=result.stdout)
+            row = rows[0]
+            self.assertIsInstance(row["total_tokens"], str)
+            self.assertEqual(row["input_tokens"], "5.33e9")
+            self.assertEqual(row["cached_input_tokens"], "0.00e0")
+            self.assertEqual(row["output_tokens"], "0.00e0")
+            self.assertEqual(row["reasoning_output_tokens"], "0.00e0")
+            self.assertEqual(row["total_tokens"], "5.33e9")
 
     def test_provider_all_combines_codex_and_claude(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

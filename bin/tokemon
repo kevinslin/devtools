@@ -730,7 +730,29 @@ def _aggregate_rows(
     return rows
 
 
-def _write_csv(rows: list[dict], group_by: Optional[str]) -> None:
+def _format_scientific(value: int) -> str:
+    formatted = f"{value:.2e}"
+    mantissa, exponent = formatted.split("e", maxsplit=1)
+    sign = ""
+    digits = exponent
+    if digits.startswith(("+", "-")):
+        sign = "-" if digits[0] == "-" else ""
+        digits = digits[1:]
+    digits = digits.lstrip("0") or "0"
+    return f"{mantissa}e{sign}{digits}"
+
+
+def _pretty_rows(rows: list[dict]) -> list[dict]:
+    formatted_rows: list[dict] = []
+    for row in rows:
+        pretty_row = row.copy()
+        for field in TOKEN_FIELDS:
+            pretty_row[field] = _format_scientific(pretty_row[field])
+        formatted_rows.append(pretty_row)
+    return formatted_rows
+
+
+def _write_csv(rows: list[dict], group_by: Optional[str], pretty: bool) -> None:
     fieldnames = ["bucket"]
     if group_by == "workspace":
         fieldnames.append("workspace")
@@ -741,7 +763,8 @@ def _write_csv(rows: list[dict], group_by: Optional[str]) -> None:
     fieldnames.extend(TOKEN_FIELDS)
     writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
-    for row in rows:
+    output_rows = _pretty_rows(rows) if pretty else rows
+    for row in output_rows:
         writer.writerow(row)
 
 
@@ -754,6 +777,7 @@ def _write_json(
     sum_by: str,
     sum_by_minutes: Optional[int],
     group_by: Optional[str],
+    pretty: bool,
 ) -> None:
     payload = {
         "provider": provider,
@@ -763,7 +787,7 @@ def _write_json(
         "sum_by": sum_by,
         "sum_by_minutes": sum_by_minutes,
         "group_by": group_by or "none",
-        "rows": rows,
+        "rows": _pretty_rows(rows) if pretty else rows,
     }
     json.dump(payload, sys.stdout, indent=2)
     sys.stdout.write("\n")
@@ -792,9 +816,9 @@ def _run_report(args: argparse.Namespace) -> int:
     rows = _aggregate_rows(records, sum_by_mode, sum_by_minutes, group_by)
 
     if args.format == "csv":
-        _write_csv(rows, group_by)
+        _write_csv(rows, group_by, args.pretty)
     else:
-        _write_json(rows, args.provider, range_name, start, end, sum_by_label, sum_by_minutes, group_by)
+        _write_json(rows, args.provider, range_name, start, end, sum_by_label, sum_by_minutes, group_by, args.pretty)
     return 0
 
 
@@ -830,6 +854,11 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["codex", "claude", "all"],
         default="codex",
         help="Usage provider to parse (default: codex, all=codex+claude)",
+    )
+    parser.add_argument(
+        "--pretty",
+        action="store_true",
+        help="Format token counts using scientific notation with two decimal places",
     )
 
     return parser
