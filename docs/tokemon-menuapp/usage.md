@@ -32,3 +32,5 @@ Clicking the Tokemon menu-bar icon toggles a chart window with:
 
 The menu app reads from the bundled `tokemon` CLI and combines Codex plus Claude usage (`--provider all`).
 The window stays open when focus moves elsewhere and closes only when you click the menu-bar icon again or quit the app.
+Recent snapshots are cached on disk, so reopening the app or toggling ranges shows the last fetched chart immediately while a background refresh updates it.
+The underlying CLI also keeps a persistent Codex index, so repeated refreshes usually reuse unchanged session logs. Set `TOKEMON_INDEX_PATH` or `TOKEMON_DISABLE_INDEX=1` before launching the app if you need to relocate or bypass that index.

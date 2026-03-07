@@ -1,6 +1,7 @@
 # Tokemon
 
 Tokemon is a local CLI for reporting token usage from Codex and Claude session logs. Its JSON output is also used as the data backend for the Tokemon macOS menu-bar app.
+Codex queries maintain a persistent on-disk index so repeated runs can reuse unchanged session data instead of replaying the same raw logs.
 
 ## Quickstart
 
@@ -23,6 +24,7 @@ The menu app opens from the macOS menu bar, stays open until you click the icon 
 - `Week`: daily token totals across the last 7 days
 - `Month`: weekly token totals across the trailing month window
 - `Year`: monthly token totals across the last 12 calendar months
+- recent snapshot caching: the last loaded totals render immediately on reopen or range toggles while a background refresh updates them
 
 ## Command
 
@@ -74,11 +76,17 @@ tokemon 2026-02-01 2026-02-15 --sum-by 30 --format json --provider all
 - Claude:
   - `~/.claude/projects/**/*.jsonl`
 
+For explicit Codex date ranges, Tokemon prunes session discovery to the matching `~/.codex/sessions/YYYY/MM/DD` folders plus the prior spillover day when that standard date-based layout is present.
+The first Codex query against a given set of files populates the index; later queries reuse unchanged files and rescan only paths whose size or mtime changed.
+Codex session files that replay the same `session_meta.payload.id` are reconciled against that session's highest cumulative totals so resumed/snapshotted files do not double count token usage.
+
 ## Environment overrides
 
 - `TOKEMON_CODEX_SESSIONS_ROOT`
 - `TOKEMON_CODEX_ARCHIVED_ROOT`
 - `TOKEMON_CLAUDE_PROJECTS_ROOT`
+- `TOKEMON_INDEX_PATH`: override the SQLite index path (default: `~/Library/Caches/tokemon/index.sqlite3` on macOS, `XDG_CACHE_HOME/tokemon/index.sqlite3` or `~/.cache/tokemon/index.sqlite3` elsewhere)
+- `TOKEMON_DISABLE_INDEX=1`: bypass the Codex index and replay raw logs directly
 
 ## Output
 
