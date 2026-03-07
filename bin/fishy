@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""Serve Mermaid diagrams from stdin in a local browser.
+
+Usage:
+  fishy [path] [--host HOST] [--port PORT] [--title TITLE] [--no-open]
+"""
+
+from __future__ import annotations
+
+import argparse
+from functools import partial
+import html
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import re
+import sys
+import webbrowser
+
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 0
+DEFAULT_TITLE = "Fishy Mermaid Preview"
+MERMAID_MODULE_URL = "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs"
+FENCED_BLOCK_RE = re.compile(r"^(?P<fence>`{3,}|~{3,})(?P<info>[^\n`]*)$")
+
+PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f4fbff;
+      --panel: rgba(255, 255, 255, 0.9);
+      --ink: #10324a;
+      --muted: #537285;
+      --line: rgba(16, 50, 74, 0.14);
+      --accent: #0d8aa8;
+      --shadow: 0 24px 60px rgba(13, 61, 89, 0.12);
+    }}
+
+    * {{
+      box-sizing: border-box;
+    }}
+
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(48, 170, 196, 0.22), transparent 28rem),
+        linear-gradient(180deg, #eefaff 0%, var(--bg) 48%, #fcfeff 100%);
+    }}
+
+    main {{
+      width: min(1100px, calc(100vw - 2rem));
+      margin: 2rem auto;
+      display: grid;
+      gap: 1rem;
+    }}
+
+    .panel {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+    }}
+
+    .hero {{
+      padding: 1.25rem 1.5rem;
+    }}
+
+    .hero p {{
+      margin: 0;
+    }}
+
+    .eyebrow {{
+      color: var(--accent);
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }}
+
+    h1 {{
+      margin: 0.55rem 0 0.4rem;
+      font-size: clamp(2rem, 4vw, 3.4rem);
+      line-height: 0.95;
+    }}
+
+    .caption {{
+      color: var(--muted);
+      max-width: 52rem;
+    }}
+
+    .diagram {{
+      padding: 0.75rem;
+      overflow: auto;
+    }}
+
+    .diagram .mermaid {{
+      min-width: fit-content;
+      margin: 0;
+      padding: 1rem;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.78);
+    }}
+
+    details {{
+      overflow: hidden;
+    }}
+
+    summary {{
+      cursor: pointer;
+      list-style: none;
+      padding: 1rem 1.25rem;
+      font-weight: 600;
+    }}
+
+    summary::-webkit-details-marker {{
+      display: none;
+    }}
+
+    .source {{
+      margin: 0;
+      padding: 0 1.25rem 1.25rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--muted);
+      font-family: "SFMono-Regular", "Menlo", monospace;
+      font-size: 0.95rem;
+    }}
+
+    a {{
+      color: var(--accent);
+      text-decoration: none;
+    }}
+
+    a:hover {{
+      text-decoration: underline;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="panel hero">
+      <p class="eyebrow">fishy</p>
+      <h1>{title}</h1>
+      <p class="caption">Rendering Mermaid from stdin on a local server. Mermaid runtime loads in the browser, so the preview stays local while diagram parsing happens client-side.</p>
+      <p class="caption"><a href="/source.mmd">download source</a></p>
+    </section>
+    <section class="panel diagram">
+      <pre class="mermaid">{diagram}</pre>
+    </section>
+    <details class="panel">
+      <summary>Source</summary>
+      <pre class="source">{diagram}</pre>
+    </details>
+  </main>
+  <script type="module">
+    import mermaid from "{mermaid_url}";
+
+    mermaid.initialize({{
+      startOnLoad: true,
+      securityLevel: "strict",
+      theme: "neutral",
+    }});
+  </script>
+</body>
+</html>
+"""
+
+
+class FishyError(RuntimeError):
+    """Raised when fishy cannot continue."""
+
+
+class FishyHandler(BaseHTTPRequestHandler):
+    def __init__(self, *args, html_page: bytes, mermaid_source: bytes, **kwargs):
+        self._html_page = html_page
+        self._mermaid_source = mermaid_source
+        super().__init__(*args, **kwargs)
+
+    def do_GET(self) -> None:
+        if self.path in {"/", "/index.html"}:
+            self._send_bytes(self._html_page, "text/html; charset=utf-8")
+            return
+        if self.path == "/source.mmd":
+            self._send_bytes(self._mermaid_source, "text/plain; charset=utf-8")
+            return
+        if self.path == "/favicon.ico":
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.end_headers()
+            return
+
+        self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+    def log_message(self, format: str, *args) -> None:
+        return
+
+    def _send_bytes(self, payload: bytes, content_type: str) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Serve a Mermaid diagram locally from stdin or a file.")
+    parser.add_argument(
+        "path",
+        nargs="?",
+        help="Mermaid file path. Omit or use '-' to read from stdin.",
+    )
+    parser.add_argument(
+        "--host",
+        default=DEFAULT_HOST,
+        help=f"Address to bind (default: {DEFAULT_HOST}).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help="TCP port to bind (default: 0, which asks the OS for a free port).",
+    )
+    parser.add_argument(
+        "--title",
+        default=DEFAULT_TITLE,
+        help=f"Page title to display (default: {DEFAULT_TITLE!r}).",
+    )
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not open the preview in a browser automatically.",
+    )
+    return parser.parse_args()
+
+
+def _read_mermaid_source(path_arg: str | None) -> str:
+    if path_arg and path_arg != "-":
+        path = Path(path_arg).expanduser()
+        try:
+            source = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise FishyError(f"failed to read Mermaid file {path}: {exc}") from exc
+    else:
+        if sys.stdin.isatty():
+            raise FishyError("provide Mermaid via stdin or pass a Mermaid file path")
+        try:
+            source = sys.stdin.read()
+        except OSError as exc:
+            raise FishyError(f"failed to read Mermaid from stdin: {exc}") from exc
+
+    source = _normalize_mermaid_source(source)
+    if not source.strip():
+        raise FishyError("Mermaid definition is empty")
+    return source
+
+
+def _normalize_mermaid_source(source: str) -> str:
+    trimmed = source.strip()
+    if not trimmed:
+        return ""
+
+    lines = trimmed.splitlines()
+    if len(lines) >= 2:
+        opening = lines[0].strip()
+        closing = lines[-1].strip()
+        match = FENCED_BLOCK_RE.fullmatch(opening)
+        if match and closing == match.group("fence"):
+            return "\n".join(lines[1:-1]).strip("\n")
+
+    return source
+
+
+def _build_html_page(title: str, mermaid_source: str) -> str:
+    return PAGE_TEMPLATE.format(
+        title=html.escape(title),
+        diagram=html.escape(mermaid_source),
+        mermaid_url=html.escape(MERMAID_MODULE_URL, quote=True),
+    )
+
+
+def _display_host(bound_host: str, requested_host: str) -> str:
+    if requested_host in {"0.0.0.0", "::", ""}:
+        return "127.0.0.1"
+    return bound_host
+
+
+def main() -> int:
+    args = _parse_args()
+    if args.port < 0 or args.port > 65535:
+        print("fishy: --port must be between 0 and 65535", file=sys.stderr)
+        return 1
+
+    try:
+        mermaid_source = _read_mermaid_source(args.path)
+    except FishyError as exc:
+        print(f"fishy: {exc}", file=sys.stderr)
+        return 1
+
+    html_page = _build_html_page(args.title, mermaid_source).encode("utf-8")
+    handler = partial(
+        FishyHandler,
+        html_page=html_page,
+        mermaid_source=mermaid_source.encode("utf-8"),
+    )
+
+    try:
+        with ThreadingHTTPServer((args.host, args.port), handler) as server:
+            bound_host, bound_port = server.server_address[:2]
+            url = f"http://{_display_host(bound_host, args.host)}:{bound_port}"
+            print(f"fishy serving Mermaid preview at {url}", flush=True)
+            if not args.no_open:
+                webbrowser.open(url)
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                print("\nfishy stopped", flush=True)
+    except OSError as exc:
+        print(f"fishy: failed to start server: {exc}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

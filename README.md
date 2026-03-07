@@ -9,6 +9,7 @@ A bunch of usefull tools. Designed by human. Made by codex.
 - `tokemon-menuapp` (`bin/tokemon-menuapp`): Build and launch the native Tokemon macOS menu-bar app; detailed usage in [`docs/tokemon-menuapp/usage.md`](docs/tokemon-menuapp/usage.md).
 - `json_lint.py` (`bin/json_lint.py`): Validate JSON from a file path or stdin; detailed usage in [`docs/json_lint/usage.md`](docs/json_lint/usage.md).
 - `ag-man` (`bin/ag-man`): List today's `ag-ledger` session starts as JSONL with active/inactive process and tmux status, with optional `--filter key=value` and `--group-by workspace`.
+- `fishy` (`bin/fishy`): Serve a local Mermaid preview from stdin or a file path; detailed usage in [`docs/fishy/usage.md`](docs/fishy/usage.md).
 
 ## Docs layout
 
