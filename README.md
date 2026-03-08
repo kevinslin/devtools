@@ -4,6 +4,7 @@ A bunch of usefull tools. Designed by human. Made by codex.
 
 ## CLI index
 
+- `agent-sync` (`bin/agent-sync`): Bidirectionally sync selected agent-config files between a live folder and a git repo with file-level conflict detection and dry-run preview; detailed usage in [`docs/agent-sync/usage.md`](docs/agent-sync/usage.md).
 - `arbor` (`bin/arbor`): Manage git branches/worktrees with merged cleanup, multi-target removal, branch-to-worktree and worktree-to-main conversion, and force-with-lease pushing; detailed usage in [`docs/arbor/usage.md`](docs/arbor/usage.md).
 - `tokemon` (`bin/tokemon`): Report token usage from local Codex and Claude session logs, including the data backend used by the Tokemon menu app; detailed usage in [`docs/tokemon/usage.md`](docs/tokemon/usage.md).
 - `tokemon-menuapp` (`bin/tokemon-menuapp`): Build and launch the native Tokemon macOS menu-bar app; detailed usage in [`docs/tokemon-menuapp/usage.md`](docs/tokemon-menuapp/usage.md).
