@@ -1,0 +1,649 @@
+#!/usr/bin/env python3
+"""Detect and crop the video region inside a larger screen recording."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+
+EDGE_SAMPLE_FRAMES = 6
+
+
+@dataclass(frozen=True)
+class VideoInfo:
+    width: int
+    height: int
+    duration: float
+
+
+@dataclass(frozen=True)
+class BoundingBox:
+    x: int
+    y: int
+    width: int
+    height: int
+
+    @property
+    def crop_filter(self) -> str:
+        return f"crop={self.width}:{self.height}:{self.x}:{self.y}"
+
+
+@dataclass(frozen=True)
+class DetectionResult:
+    bbox: BoundingBox
+    source: str
+    detection_width: int
+    sampled_frames: int
+    scaled_width: int
+    scaled_height: int
+
+    def to_dict(self) -> dict[str, object]:
+        payload = asdict(self)
+        payload["bbox"]["crop_filter"] = self.bbox.crop_filter
+        payload["crop_filter"] = self.bbox.crop_filter
+        return payload
+
+
+class CliError(RuntimeError):
+    """User-facing error."""
+
+
+def _run_command(args: list[str], *, input_bytes: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            args,
+            input=input_bytes,
+            capture_output=True,
+            check=True,
+        )
+    except FileNotFoundError as exc:
+        raise CliError(f"required command not found: {args[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode("utf-8", errors="replace").strip()
+        message = stderr or f"command failed: {' '.join(args)}"
+        raise CliError(message) from exc
+
+
+def _require_command(name: str) -> None:
+    if shutil.which(name) is None:
+        raise CliError(f"required command not found on PATH: {name}")
+
+
+def _probe_video(path: Path) -> VideoInfo:
+    result = _run_command(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,duration",
+            "-of",
+            "json",
+            str(path),
+        ]
+    )
+    try:
+        payload = json.loads(result.stdout.decode("utf-8"))
+        stream = payload["streams"][0]
+        width = int(stream["width"])
+        height = int(stream["height"])
+        duration = float(stream.get("duration", 0.0) or 0.0)
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise CliError(f"failed to probe video metadata for {path}") from exc
+    return VideoInfo(width=width, height=height, duration=duration)
+
+
+def _percentile(values: list[float], fraction: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    index = round((len(ordered) - 1) * fraction)
+    index = min(len(ordered) - 1, max(0, index))
+    return ordered[index]
+
+
+def _smooth_profile(values: list[float], radius: int) -> list[float]:
+    if radius <= 0:
+        return values[:]
+    smoothed: list[float] = []
+    for index in range(len(values)):
+        left = max(0, index - radius)
+        right = min(len(values), index + radius + 1)
+        smoothed.append(sum(values[left:right]) / (right - left))
+    return smoothed
+
+
+def _longest_run(values: list[float], threshold: float, min_len: int) -> tuple[int, int] | None:
+    best: tuple[int, int] | None = None
+    start: int | None = None
+    for index, value in enumerate(values):
+        if value >= threshold:
+            if start is None:
+                start = index
+            continue
+        if start is None:
+            continue
+        if index - start >= min_len and (
+            best is None or index - start > (best[1] - best[0] + 1)
+        ):
+            best = (start, index - 1)
+        start = None
+    if start is not None and len(values) - start >= min_len:
+        if best is None or len(values) - start > (best[1] - best[0] + 1):
+            best = (start, len(values) - 1)
+    return best
+
+
+def _outer_run(values: list[float], threshold: float) -> tuple[int, int] | None:
+    indexes = [index for index, value in enumerate(values) if value >= threshold]
+    if not indexes:
+        return None
+    return indexes[0], indexes[-1]
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _pick_edge_peak(
+    edge_profile: list[float],
+    activity_profile: list[float],
+    start: int,
+    end: int,
+    *,
+    orientation: str,
+) -> int | None:
+    start = max(0, start)
+    end = min(len(edge_profile) - 1, end)
+    if start > end:
+        return None
+
+    window = edge_profile[start : end + 1]
+    baseline = _percentile(window, 0.4)
+    peak = max(window)
+    strength_floor = baseline + (peak - baseline) * 0.30
+    center = (start + end) / 2
+    activity_window = max(3, len(activity_profile) // 80)
+
+    best: tuple[float, float, float, int] | None = None
+    for index in range(start, end + 1):
+        left = edge_profile[index - 1] if index > 0 else edge_profile[index]
+        right = (
+            edge_profile[index + 1]
+            if index + 1 < len(edge_profile)
+            else edge_profile[index]
+        )
+        if edge_profile[index] < left or edge_profile[index] < right:
+            continue
+        if edge_profile[index] < strength_floor:
+            continue
+
+        before = _mean(activity_profile[max(0, index - activity_window) : index])
+        after = _mean(
+            activity_profile[index + 1 : min(len(activity_profile), index + 1 + activity_window)]
+        )
+        if orientation in {"left", "top"}:
+            transition = after - before
+        else:
+            transition = before - after
+
+        score = (
+            transition * 2.0
+            + (edge_profile[index] - baseline) * 0.6
+            - abs(index - center) * 0.05
+        )
+        candidate = (
+            score,
+            transition,
+            edge_profile[index],
+            -abs(index - center),
+            index,
+        )
+        if best is None or candidate > best:
+            best = candidate
+
+    if best is not None:
+        return best[-1]
+    return None
+
+
+def _extract_gray_frames(
+    path: Path,
+    *,
+    info: VideoInfo,
+    detection_width: int,
+    sample_count: int,
+) -> tuple[list[bytes], int, int]:
+    scaled_width = min(detection_width, info.width)
+    scaled_height = max(2, round(info.height * scaled_width / info.width))
+
+    filter_parts: list[str] = []
+    if info.duration > 4:
+        start = info.duration * 0.05
+        end = max(start + 1.0, info.duration * 0.95)
+        fps = max(sample_count / max(end - start, 1.0), 0.2)
+        filter_parts.append(f"trim=start={start:.6f}:end={end:.6f}")
+        filter_parts.append(f"fps={fps:.6f}")
+    elif info.duration > 0:
+        fps = max(sample_count / max(info.duration, 1.0), 0.5)
+        filter_parts.append(f"fps={fps:.6f}")
+    else:
+        filter_parts.append("fps=1")
+
+    filter_parts.append(f"scale={scaled_width}:{scaled_height}")
+    filter_parts.append("format=gray")
+
+    result = _run_command(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            str(path),
+            "-vf",
+            ",".join(filter_parts),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+        ]
+    )
+    frame_size = scaled_width * scaled_height
+    if frame_size <= 0 or len(result.stdout) < frame_size * 2:
+        raise CliError("failed to extract enough frames to detect a crop")
+
+    frame_count = len(result.stdout) // frame_size
+    frames = [
+        result.stdout[index * frame_size : (index + 1) * frame_size]
+        for index in range(frame_count)
+    ]
+    return frames, scaled_width, scaled_height
+
+
+def _activity_profiles(
+    frames: list[bytes],
+    width: int,
+    height: int,
+) -> tuple[list[float], list[float]]:
+    frame_size = width * height
+    activity = [0.0] * frame_size
+    pair_count = len(frames) - 1
+    for previous, current in zip(frames, frames[1:]):
+        for index, (left, right) in enumerate(zip(previous, current)):
+            activity[index] += abs(right - left)
+
+    col_profile = [0.0] * width
+    row_profile = [0.0] * height
+    for y_index in range(height):
+        row_offset = y_index * width
+        row_sum = 0.0
+        for x_index in range(width):
+            value = activity[row_offset + x_index] / pair_count
+            row_sum += value
+            col_profile[x_index] += value
+        row_profile[y_index] = row_sum / width
+    col_profile = [value / height for value in col_profile]
+    return col_profile, row_profile
+
+
+def _edge_profiles(
+    frames: list[bytes],
+    width: int,
+    height: int,
+) -> tuple[list[float], list[float]]:
+    if len(frames) <= EDGE_SAMPLE_FRAMES:
+        sampled = frames
+    else:
+        sampled = []
+        for index in range(EDGE_SAMPLE_FRAMES):
+            frame_index = round(index * (len(frames) - 1) / (EDGE_SAMPLE_FRAMES - 1))
+            sampled.append(frames[frame_index])
+
+    col_edges = [0.0] * (width - 1)
+    row_edges = [0.0] * (height - 1)
+    for frame in sampled:
+        for y_index in range(height):
+            row_offset = y_index * width
+            previous = frame[row_offset]
+            for x_index in range(1, width):
+                current = frame[row_offset + x_index]
+                col_edges[x_index - 1] += abs(current - previous)
+                previous = current
+
+        for y_index in range(1, height):
+            row_offset = y_index * width
+            previous_offset = (y_index - 1) * width
+            total = 0.0
+            for x_index in range(width):
+                total += abs(frame[row_offset + x_index] - frame[previous_offset + x_index])
+            row_edges[y_index - 1] += total / width
+
+    col_edges = [value / (len(sampled) * height) for value in col_edges]
+    row_edges = [value / len(sampled) for value in row_edges]
+    return col_edges, row_edges
+
+
+def _scaled_box_to_source(
+    scaled_left: int,
+    scaled_top: int,
+    scaled_right: int,
+    scaled_bottom: int,
+    *,
+    scaled_width: int,
+    scaled_height: int,
+    info: VideoInfo,
+) -> BoundingBox:
+    left = round((scaled_left / scaled_width) * info.width)
+    top = round((scaled_top / scaled_height) * info.height)
+    right = round(((scaled_right + 1) / scaled_width) * info.width)
+    bottom = round(((scaled_bottom + 1) / scaled_height) * info.height)
+
+    left = max(0, min(info.width - 2, left))
+    top = max(0, min(info.height - 2, top))
+    right = max(left + 2, min(info.width, right))
+    bottom = max(top + 2, min(info.height, bottom))
+
+    if left % 2 == 1:
+        left -= 1
+    if top % 2 == 1:
+        top -= 1
+    if (right - left) % 2 == 1:
+        if right < info.width:
+            right += 1
+        else:
+            left = max(0, left - 1)
+    if (bottom - top) % 2 == 1:
+        if bottom < info.height:
+            bottom += 1
+        else:
+            top = max(0, top - 1)
+
+    width = right - left
+    height = bottom - top
+    if width <= 0 or height <= 0:
+        raise CliError("detected an invalid crop box")
+    return BoundingBox(x=left, y=top, width=width, height=height)
+
+
+def detect_video_bbox(
+    path: Path,
+    *,
+    detection_width: int = 320,
+    sample_count: int = 24,
+) -> DetectionResult:
+    _require_command("ffmpeg")
+    _require_command("ffprobe")
+    if not path.is_file():
+        raise CliError(f"input video not found: {path}")
+    if detection_width < 64:
+        raise CliError("--detection-width must be at least 64")
+    if sample_count < 6:
+        raise CliError("--sample-count must be at least 6")
+
+    info = _probe_video(path)
+    frames, scaled_width, scaled_height = _extract_gray_frames(
+        path,
+        info=info,
+        detection_width=detection_width,
+        sample_count=sample_count,
+    )
+
+    col_profile, row_profile = _activity_profiles(frames, scaled_width, scaled_height)
+    col_profile = _smooth_profile(col_profile, max(2, scaled_width // 80))
+    row_profile = _smooth_profile(row_profile, max(2, scaled_height // 80))
+
+    col_baseline = _percentile(col_profile, 0.1)
+    row_baseline = _percentile(row_profile, 0.1)
+    col_peak = max(col_profile)
+    row_peak = max(row_profile)
+
+    inner_col = _longest_run(
+        col_profile,
+        col_baseline + (col_peak - col_baseline) * 0.45,
+        max(8, scaled_width // 14),
+    )
+    inner_row = _longest_run(
+        row_profile,
+        row_baseline + (row_peak - row_baseline) * 0.45,
+        max(6, scaled_height // 14),
+    )
+    outer_col = _outer_run(
+        col_profile,
+        col_baseline + (col_peak - col_baseline) * 0.03,
+    )
+    outer_row = _outer_run(
+        row_profile,
+        row_baseline + (row_peak - row_baseline) * 0.03,
+    )
+    if inner_col is None or inner_row is None or outer_col is None or outer_row is None:
+        raise CliError("could not find a stable moving region to crop")
+
+    edge_cols, edge_rows = _edge_profiles(frames, scaled_width, scaled_height)
+    edge_cols = _smooth_profile(edge_cols, max(1, scaled_width // 120))
+    edge_rows = _smooth_profile(edge_rows, max(1, scaled_height // 120))
+
+    margin_x = max(8, round(scaled_width * 0.04))
+    margin_y = max(6, round(scaled_height * 0.04))
+    left_edge = _pick_edge_peak(
+        edge_cols,
+        col_profile,
+        outer_col[0] - (margin_x * 2),
+        outer_col[0] + margin_x,
+        orientation="left",
+    )
+    right_edge = _pick_edge_peak(
+        edge_cols,
+        col_profile,
+        outer_col[1] - (margin_x * 2),
+        outer_col[1] + margin_x,
+        orientation="right",
+    )
+    top_edge = _pick_edge_peak(
+        edge_rows,
+        row_profile,
+        outer_row[0] - (margin_y * 2),
+        outer_row[0] + margin_y,
+        orientation="top",
+    )
+    bottom_edge = _pick_edge_peak(
+        edge_rows,
+        row_profile,
+        outer_row[1] - (margin_y * 2),
+        outer_row[1] + margin_y,
+        orientation="bottom",
+    )
+
+    scaled_left = left_edge if left_edge is not None else outer_col[0]
+    scaled_right = right_edge if right_edge is not None else outer_col[1]
+    scaled_top = top_edge if top_edge is not None else outer_row[0]
+    scaled_bottom = bottom_edge if bottom_edge is not None else outer_row[1]
+
+    scaled_left = max(0, scaled_left - 1)
+    scaled_top = max(0, scaled_top - 1)
+    scaled_right = min(scaled_width - 1, scaled_right + 1)
+    scaled_bottom = min(scaled_height - 1, scaled_bottom + 1)
+
+    bbox = _scaled_box_to_source(
+        scaled_left,
+        scaled_top,
+        scaled_right,
+        scaled_bottom,
+        scaled_width=scaled_width,
+        scaled_height=scaled_height,
+        info=info,
+    )
+    return DetectionResult(
+        bbox=bbox,
+        source=str(path.resolve()),
+        detection_width=detection_width,
+        sampled_frames=len(frames),
+        scaled_width=scaled_width,
+        scaled_height=scaled_height,
+    )
+
+
+def _print_detection(result: DetectionResult, fmt: str) -> None:
+    if fmt == "crop":
+        print(result.bbox.crop_filter)
+        return
+    json.dump(result.to_dict(), sys.stdout, indent=2)
+    print()
+
+
+def _crop_video(
+    input_path: Path,
+    output_path: Path,
+    bbox: BoundingBox,
+    *,
+    overwrite: bool,
+    crf: int,
+    preset: str,
+) -> None:
+    if output_path.exists() and not overwrite:
+        raise CliError(f"output already exists: {output_path}")
+
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y" if overwrite else "-n",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-map",
+        "0:s?",
+        "-vf",
+        bbox.crop_filter,
+        "-c:v",
+        "libx264",
+        "-preset",
+        preset,
+        "-crf",
+        str(crf),
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    _run_command(command)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Detect and crop the video portion inside a larger screen recording."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    detect_parser = subparsers.add_parser(
+        "detect",
+        help="Detect the embedded video bounding box.",
+    )
+    detect_parser.add_argument("input", type=Path, help="Input video path")
+    detect_parser.add_argument(
+        "--format",
+        choices=("json", "crop"),
+        default="json",
+        help="Output format (default: json)",
+    )
+    detect_parser.add_argument(
+        "--detection-width",
+        type=int,
+        default=320,
+        help="Scaled width used during detection (default: 320)",
+    )
+    detect_parser.add_argument(
+        "--sample-count",
+        type=int,
+        default=24,
+        help="Approximate number of frames to sample during detection (default: 24)",
+    )
+
+    crop_parser = subparsers.add_parser(
+        "crop",
+        help="Detect the embedded video bounding box and crop the source video.",
+    )
+    crop_parser.add_argument("input", type=Path, help="Input video path")
+    crop_parser.add_argument("output", type=Path, help="Output video path")
+    crop_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite the output file if it already exists",
+    )
+    crop_parser.add_argument(
+        "--format",
+        choices=("json", "crop"),
+        default="json",
+        help="How to print the detected box after cropping (default: json)",
+    )
+    crop_parser.add_argument(
+        "--detection-width",
+        type=int,
+        default=320,
+        help="Scaled width used during detection (default: 320)",
+    )
+    crop_parser.add_argument(
+        "--sample-count",
+        type=int,
+        default=24,
+        help="Approximate number of frames to sample during detection (default: 24)",
+    )
+    crop_parser.add_argument(
+        "--crf",
+        type=int,
+        default=18,
+        help="libx264 CRF for the cropped output (default: 18)",
+    )
+    crop_parser.add_argument(
+        "--preset",
+        default="medium",
+        help="libx264 preset for the cropped output (default: medium)",
+    )
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        detection = detect_video_bbox(
+            args.input,
+            detection_width=args.detection_width,
+            sample_count=args.sample_count,
+        )
+        if args.command == "detect":
+            _print_detection(detection, args.format)
+            return 0
+
+        _crop_video(
+            args.input,
+            args.output,
+            detection.bbox,
+            overwrite=args.overwrite,
+            crf=args.crf,
+            preset=args.preset,
+        )
+        _print_detection(detection, args.format)
+        return 0
+    except CliError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
