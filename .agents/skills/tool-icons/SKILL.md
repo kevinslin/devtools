@@ -7,7 +7,7 @@ dependencies:
 
 # tool-icons
 
-Generate a tool icon with `icon-gen`, save the assets under `docs/assets/`, then update both the root README and the tool usage doc to reference those assets in the repo's standard format.
+Generate a tool icon with `icon-gen`, save the assets under the repo-root `assets/` directory, then update both the root README and the tool usage doc to reference those assets in the repo's standard format.
 
 ## Workflow
 
@@ -18,16 +18,16 @@ Generate a tool icon with `icon-gen`, save the assets under `docs/assets/`, then
    - short alt text for the logo
 2. Set paths:
    - `ROOT_DIR=$(pwd)`
-   - `DOCS_ASSETS_DIR="$ROOT_DIR/docs/assets"`
+   - `ASSETS_DIR="$ROOT_DIR/assets"`
    - `README_PATH="$ROOT_DIR/README.md"`
    - `USAGE_PATH="$ROOT_DIR/docs/<tool>/usage.md"`
 3. Use the `icon-gen` dependency to create both assets for the tool:
-   - general icon path: `docs/assets/<tool>-logo.png`
-   - inline icon path: `docs/assets/<tool>-inline.png`
+   - general icon path: `assets/<tool>-logo.png`
+   - inline icon path: `assets/<tool>-inline.png`
 4. Update docs with `scripts/update_tool_docs.py`:
-   - downsize `docs/assets/<tool>-logo.png` to a maximum of `240px` on its longest side
+   - downsize `assets/<tool>-logo.png` to a maximum of `240px` on its longest side
    - rewrite the README bullet so the linked CLI name comes first, with no parenthesized path after the name
-   - place the inline icon immediately after the linked CLI name using the normalized `24x24` inline asset so bottoms stay aligned in the README
+   - place the inline icon immediately after the linked CLI name using a normalized high-resolution PNG so bottoms stay aligned in the README
    - add the centered logo block immediately after the `#` title in `docs/<tool>/usage.md`
 5. Verify both files:
    - the logo asset should be at most `240px` on its longest side
@@ -35,17 +35,18 @@ Generate a tool icon with `icon-gen`, save the assets under `docs/assets/`, then
    - the usage doc should contain exactly:
 
 ```html
-<div align="center"><img src="../assets/<tool>-logo.png" alt="<alt description>" width="120" /></div>
+<div align="center"><img src="../../assets/<tool>-logo.png" alt="<alt description>" width="120" /></div>
 ```
 
 ## Output contract
 
-- Write assets to `docs/assets/`.
+- Write assets to repo-root `assets/`.
 - Use these filenames:
-  - `docs/assets/<tool>-logo.png`
-  - `docs/assets/<tool>-inline.png`
-- Keep `docs/assets/<tool>-logo.png` at a maximum of `240px` on its longest side.
-- Render README inline icons as normalized `24x24` assets with `vertical-align: text-bottom`.
+  - `assets/<tool>-logo.png`
+  - `assets/<tool>-inline.png`
+- Keep `assets/<tool>-logo.png` at a maximum of `240px` on its longest side.
+- Normalize README inline icons to `256x256` PNG assets and render them at `24x24` with `vertical-align: text-bottom`.
+- Trim transparent padding, then pad back to the square canvas against the bottom edge so baseline alignment is consistent.
 - Keep the usage-doc logo block directly under the H1.
 - Keep the README bullet single-line.
 - Link the CLI name to its usage doc, for example `[fishy](docs/fishy/usage.md)`.
@@ -54,4 +55,4 @@ Generate a tool icon with `icon-gen`, save the assets under `docs/assets/`, then
 
 ## Commands
 
-- Doc wiring helper: `python3 .agents/skills/tool-icons/scripts/update_tool_docs.py --tool <tool> --readme README.md --usage docs/<tool>/usage.md --inline-src docs/assets/<tool>-inline.png --logo-src ../assets/<tool>-logo.png --alt "<alt description>"`
+- Doc wiring helper: `python3 .agents/skills/tool-icons/scripts/update_tool_docs.py --tool <tool> --readme README.md --usage docs/<tool>/usage.md --inline-src assets/<tool>-inline.png --logo-src ../../assets/<tool>-logo.png --alt "<alt description>"`

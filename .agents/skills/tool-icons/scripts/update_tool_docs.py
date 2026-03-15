@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import tempfile
 import os
 import pathlib
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 
 def downsize_logo_asset(usage_path: pathlib.Path, logo_src: str, max_dim: int) -> None:
@@ -25,10 +25,12 @@ def downsize_logo_asset(usage_path: pathlib.Path, logo_src: str, max_dim: int) -
     raise SystemExit("logo downsizing requires Pillow or macOS sips")
 
 
-def normalize_inline_asset(readme_path: pathlib.Path, inline_src: str, target_size: int) -> None:
+def normalize_inline_png(readme_path: pathlib.Path, inline_src: str, target_size: int) -> None:
     inline_path = (readme_path.parent / inline_src).resolve()
     if not inline_path.exists():
         raise SystemExit(f"inline asset not found: {inline_path}")
+    if inline_path.suffix.lower() != ".png":
+        raise SystemExit(f"inline asset must be a PNG: {inline_path}")
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg is required to normalize inline icons")
 
@@ -197,6 +199,7 @@ def main() -> int:
     parser.add_argument("--logo-src", required=True)
     parser.add_argument("--alt", required=True)
     parser.add_argument("--inline-width", type=int, default=24)
+    parser.add_argument("--inline-asset-size", type=int, default=256)
     parser.add_argument("--logo-width", type=int, default=120)
     parser.add_argument("--logo-max-dim", type=int, default=240)
     args = parser.parse_args()
@@ -205,7 +208,7 @@ def main() -> int:
     usage_path = pathlib.Path(args.usage)
 
     downsize_logo_asset(usage_path, args.logo_src, args.logo_max_dim)
-    normalize_inline_asset(readme_path, args.inline_src, args.inline_width)
+    normalize_inline_png(readme_path, args.inline_src, args.inline_asset_size)
 
     update_readme(
         readme_path,

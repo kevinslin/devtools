@@ -1,6 +1,6 @@
 # convo
 
-<div align="center"><img src="../assets/convo-logo.png" alt="Conversation search mascot" width="120" /></div>
+<div align="center"><img src="../../assets/convo-logo.png" alt="Conversation search mascot" width="120" /></div>
 
 `convo` is a CLI for managing Codex conversations.
 The first supported command is `search`, which does a fast regex search over local Codex session logs.

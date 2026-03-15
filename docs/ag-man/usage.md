@@ -1,6 +1,6 @@
 # ag-man
 
-<div align="center"><img src="../assets/ag-man-logo.png" alt="AG Man ledger mascot" width="120" /></div>
+<div align="center"><img src="../../assets/ag-man-logo.png" alt="AG Man ledger mascot" width="120" /></div>
 
 `ag-man` lists today's `ag-ledger` session starts and reports whether each session still has an active process.
 

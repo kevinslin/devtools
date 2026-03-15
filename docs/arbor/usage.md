@@ -1,6 +1,6 @@
 # arbor usage
 
-<div align="center"><img src="../assets/arbor-logo.png" alt="Arbor bonsai mascot" width="120" /></div>
+<div align="center"><img src="../../assets/arbor-logo.png" alt="Arbor bonsai mascot" width="120" /></div>
 
 `arbor` is a git hygiene helper for cleaning up, removing, re-homing, and creating linked worktrees.
 It can also force-push the current branch with lease.

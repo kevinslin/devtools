@@ -1,6 +1,6 @@
 # Tokemon Menu App
 
-<div align="center"><img src="../assets/tokemon-menuapp-logo.png" alt="Tokemon menu app mascot" width="120" /></div>
+<div align="center"><img src="../../assets/tokemon-menuapp-logo.png" alt="Tokemon menu app mascot" width="120" /></div>
 
 `tokemon-menuapp` builds a native macOS menu-bar app for Tokemon and, by default, opens it after the bundle is written.
 

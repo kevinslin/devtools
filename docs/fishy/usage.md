@@ -1,6 +1,6 @@
 # fishy
 
-<div align="center"><img src="../assets/fishy-logo.png" alt="Fishy emoji" width="120" /></div>
+<div align="center"><img src="../../assets/fishy-logo.png" alt="Fishy emoji" width="120" /></div>
 
 `fishy` serves a local Mermaid preview from stdin by default.
 
