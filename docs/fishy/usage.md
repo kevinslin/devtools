@@ -2,6 +2,8 @@
 
 `fishy` serves a local Mermaid preview from stdin by default.
 
+![Fishy logo](../assets/fishy-logo.png)
+
 ## Quickstart
 
 ```sh
