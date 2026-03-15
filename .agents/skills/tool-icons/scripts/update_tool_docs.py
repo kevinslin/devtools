@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import tempfile
 import os
 import pathlib
 import re
@@ -22,6 +23,64 @@ def downsize_logo_asset(usage_path: pathlib.Path, logo_src: str, max_dim: int) -
         return
 
     raise SystemExit("logo downsizing requires Pillow or macOS sips")
+
+
+def normalize_inline_asset(readme_path: pathlib.Path, inline_src: str, target_size: int) -> None:
+    inline_path = (readme_path.parent / inline_src).resolve()
+    if not inline_path.exists():
+        raise SystemExit(f"inline asset not found: {inline_path}")
+    if shutil.which("ffmpeg") is None:
+        raise SystemExit("ffmpeg is required to normalize inline icons")
+
+    crop_spec = _detect_crop_spec(inline_path)
+    filter_parts = []
+    if crop_spec:
+        filter_parts.append(f"crop={crop_spec}")
+    filter_parts.append(
+        f"scale={target_size}:{target_size}:force_original_aspect_ratio=decrease"
+    )
+    # Pad against the bottom edge so the visible icon sits on the text baseline.
+    filter_parts.append(
+        f"pad={target_size}:{target_size}:(ow-iw)/2:(oh-ih):color=black@0"
+    )
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = pathlib.Path(tmp.name)
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(inline_path),
+                "-vf",
+                ",".join(filter_parts),
+                "-frames:v",
+                "1",
+                str(tmp_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        tmp_path.replace(inline_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _detect_crop_spec(image_path: pathlib.Path) -> str | None:
+    probe = subprocess.run(
+        ["ffmpeg", "-i", str(image_path), "-vf", "bbox", "-f", "null", "-"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    matches = re.findall(r"crop=([0-9:]+)", probe.stderr)
+    if matches:
+        return matches[-1]
+    return None
 
 
 def _downsize_with_pillow(logo_path: pathlib.Path, max_dim: int) -> bool:
@@ -86,7 +145,7 @@ def update_readme(
     usage_link = f"[{tool}]({usage_link_path})"
     icon_html = (
         f'{usage_link} <img src="{inline_src}" alt="{alt}" width="{width}" height="{width}" '
-        f'style="vertical-align: text-bottom; width: {width}px; height: {width}px; object-fit: contain;" />: '
+        f'style="vertical-align: text-bottom;" />: '
     )
 
     for idx, line in enumerate(lines):
@@ -146,6 +205,7 @@ def main() -> int:
     usage_path = pathlib.Path(args.usage)
 
     downsize_logo_asset(usage_path, args.logo_src, args.logo_max_dim)
+    normalize_inline_asset(readme_path, args.inline_src, args.inline_width)
 
     update_readme(
         readme_path,
