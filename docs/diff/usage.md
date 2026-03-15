@@ -1,5 +1,7 @@
 # diff
 
+<div align="center"><img src="../../assets/diff-logo.png" alt="Diff patch mascot" width="120" /></div>
+
 `diff` shows the current working tree diff against the most recent commit at or before a relative cutoff. By default it uses the last 24 hours.
 
 ## Quickstart

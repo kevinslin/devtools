@@ -1,5 +1,7 @@
 # mdpreview
 
+<div align="center"><img src="../../assets/mdpreview-logo.png" alt="Markdown preview mascot" width="120" /></div>
+
 `mdpreview` renders Markdown from stdin or a file into a local browser preview served from `localhost`.
 
 ## Quickstart
