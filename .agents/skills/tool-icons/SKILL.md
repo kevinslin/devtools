@@ -27,7 +27,7 @@ Generate a tool icon with `icon-gen`, save the assets under `docs/assets/`, then
 4. Update docs with `scripts/update_tool_docs.py`:
    - downsize `docs/assets/<tool>-logo.png` to a maximum of `240px` on its longest side
    - rewrite the README bullet so the linked CLI name comes first, with no parenthesized path after the name
-   - place the inline icon immediately after the linked CLI name
+   - place the inline icon immediately after the linked CLI name in a fixed `24x24` box so bottoms stay aligned in the README
    - add the centered logo block immediately after the `#` title in `docs/<tool>/usage.md`
 5. Verify both files:
    - the logo asset should be at most `240px` on its longest side
@@ -45,6 +45,7 @@ Generate a tool icon with `icon-gen`, save the assets under `docs/assets/`, then
   - `docs/assets/<tool>-logo.png`
   - `docs/assets/<tool>-inline.png`
 - Keep `docs/assets/<tool>-logo.png` at a maximum of `240px` on its longest side.
+- Render README inline icons in a fixed `24x24` box with `object-fit: contain`.
 - Keep the usage-doc logo block directly under the H1.
 - Keep the README bullet single-line.
 - Link the CLI name to its usage doc, for example `[fishy](docs/fishy/usage.md)`.

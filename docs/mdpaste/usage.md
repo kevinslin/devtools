@@ -1,5 +1,7 @@
 # mdpaste
 
+<div align="center"><img src="../assets/mdpaste-logo.png" alt="Markdown clipboard mascot" width="120" /></div>
+
 `mdpaste` reads Markdown from the macOS clipboard, converts it into rich text, and writes plain text, HTML, and RTF back to the clipboard so pasting into Gmail or Google Docs preserves formatting.
 
 ## Quickstart

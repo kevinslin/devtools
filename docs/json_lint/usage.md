@@ -1,5 +1,7 @@
 # json_lint.py
 
+<div align="center"><img src="../assets/json_lint-logo.png" alt="JSON validator mascot" width="120" /></div>
+
 `json_lint.py` validates JSON content from a file path or stdin.
 
 ## Quickstart

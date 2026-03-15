@@ -1,5 +1,7 @@
 # `autocrop-video`
 
+<div align="center"><img src="../assets/autocrop-video-logo.png" alt="Autocrop video mascot" width="120" /></div>
+
 Detect the actual video frame inside a larger screen recording, then optionally crop the source file down to that rectangle.
 
 The detector is tuned for recordings where the real video is embedded inside a browser or app window and the surrounding UI is mostly static.

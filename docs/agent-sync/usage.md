@@ -1,5 +1,7 @@
 # `agent-sync` usage
 
+<div align="center"><img src="../assets/agent-sync-logo.png" alt="Agent Sync folders mascot" width="120" /></div>
+
 `agent-sync` is a small Python CLI for syncing a selected subset of files between:
 
 - a live agent config folder on a machine

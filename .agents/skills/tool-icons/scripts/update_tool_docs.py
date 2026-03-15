@@ -85,8 +85,8 @@ def update_readme(
     )
     usage_link = f"[{tool}]({usage_link_path})"
     icon_html = (
-        f'{usage_link} <img src="{inline_src}" alt="{alt}" width="{width}" '
-        'style="vertical-align: text-bottom;" />: '
+        f'{usage_link} <img src="{inline_src}" alt="{alt}" width="{width}" height="{width}" '
+        f'style="vertical-align: text-bottom; width: {width}px; height: {width}px; object-fit: contain;" />: '
     )
 
     for idx, line in enumerate(lines):

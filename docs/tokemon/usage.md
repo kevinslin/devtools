@@ -1,5 +1,7 @@
 # Tokemon
 
+<div align="center"><img src="../assets/tokemon-logo.png" alt="Tokemon token mascot" width="120" /></div>
+
 Tokemon is a local CLI for reporting token usage from Codex and Claude session logs. Its JSON output is also used as the data backend for the Tokemon macOS menu-bar app.
 Codex queries maintain a persistent on-disk index so repeated runs can reuse unchanged session data instead of replaying the same raw logs.
 
