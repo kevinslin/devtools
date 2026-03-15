@@ -2,8 +2,8 @@
 """Local JSON lint tool.
 
 Usage:
-  json_lint.py path/to/file.json
-  cat file.json | json_lint.py -
+  jsonlint path/to/file.json
+  cat file.json | jsonlint -
 """
 from __future__ import annotations
 

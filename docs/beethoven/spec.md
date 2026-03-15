@@ -7,7 +7,7 @@
 - Goal: Build a tool that transcribes audio with OpenAI APIs and supports question answering over the transcript.
 
 ## Problem and Context
-The repository currently contains a small utility script (`/Users/kevinlin/code/tools/bin/json_lint.py`) and no existing audio or OpenAI integration flow. We need a focused tool that:
+The repository currently contains a small utility script (`/Users/kevinlin/code/tools/bin/jsonlint`) and no existing audio or OpenAI integration flow. We need a focused tool that:
 1. Accepts an audio file.
 2. Produces a transcript.
 3. Persists transcript state so the user can ask follow-up questions later.
@@ -147,7 +147,7 @@ Boundary note: `ask` must fail fast if snapshot artifacts (`session.json`, `tran
 
 ## Evidence Used in Refinement
 1. Repository scan shows no existing audio/transcript subsystem, so design assumes greenfield implementation in this repo.
-2. Existing script at `/Users/kevinlin/code/tools/bin/json_lint.py` suggests lightweight CLI utility style is appropriate.
+2. Existing script at `/Users/kevinlin/code/tools/bin/jsonlint` suggests lightweight CLI utility style is appropriate.
 
 ## Stage Gate
 Planloop Stage 2 is complete. Stop here for user input before Stage 3 (`spec-{num}-{milestone}.md`) generation.

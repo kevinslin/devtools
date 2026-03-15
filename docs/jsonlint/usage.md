@@ -1,19 +1,19 @@
-# json_lint.py
+# jsonlint
 
-<div align="center"><img src="../../assets/json_lint-logo.png" alt="JSON validator mascot" width="120" /></div>
+<div align="center"><img src="../../assets/jsonlint-logo.png" alt="JSON validator mascot" width="120" /></div>
 
-`json_lint.py` validates JSON content from a file path or stdin.
+`jsonlint` validates JSON content from a file path or stdin.
 
 ## Quickstart
 
 ```sh
-json_lint.py path/to/file.json
+jsonlint path/to/file.json
 ```
 
 ## Command
 
 ```sh
-json_lint.py <path|-> [--quiet]
+jsonlint <path|-> [--quiet]
 ```
 
 ## Arguments
@@ -28,10 +28,10 @@ json_lint.py <path|-> [--quiet]
 
 ```sh
 # validate a file
-json_lint.py ./payload.json
+jsonlint ./payload.json
 
 # validate stdin
-cat ./payload.json | json_lint.py -
+cat ./payload.json | jsonlint -
 ```
 
 ## Exit codes
