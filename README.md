@@ -13,7 +13,7 @@ A bunch of usefull tools. Designed by human. Made by codex.
 - `mdpaste` (`bin/mdpaste`): Convert Markdown in the clipboard into rich text for paste targets like Gmail and Google Docs; detailed usage in [`docs/mdpaste/usage.md`](docs/mdpaste/usage.md).
 - `ag-man` (`bin/ag-man`): List today's `ag-ledger` session starts as JSONL with active/inactive process and tmux status, with optional `--filter key=value` and `--group-by workspace`.
 - `convo` (`bin/convo`): Search Codex conversation logs with fast regex matching and optional date-window filtering; detailed usage in [`docs/convo/usage.md`](docs/convo/usage.md).
-- `fishy` <img src="docs/assets/fishy-inline.png" alt="Fishy emoji" width="30" style="vertical-align: text-bottom;" />: Serve a local Mermaid preview from stdin or a file path; entry point `bin/fishy`; detailed usage in [`docs/fishy/usage.md`](docs/fishy/usage.md).
+- [fishy](docs/fishy/usage.md) <img src="docs/assets/fishy-inline.png" alt="Fishy emoji" width="24" style="vertical-align: text-bottom;" />: Serve a local Mermaid preview from stdin or a file path; entry point `bin/fishy`
 
 
 ## Docs layout
