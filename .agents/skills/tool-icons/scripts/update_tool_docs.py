@@ -6,7 +6,67 @@ import argparse
 import os
 import pathlib
 import re
+import shutil
+import subprocess
 import sys
+
+
+def downsize_logo_asset(usage_path: pathlib.Path, logo_src: str, max_dim: int) -> None:
+    logo_path = (usage_path.parent / logo_src).resolve()
+    if not logo_path.exists():
+        raise SystemExit(f"logo asset not found: {logo_path}")
+
+    if _downsize_with_pillow(logo_path, max_dim):
+        return
+    if _downsize_with_sips(logo_path, max_dim):
+        return
+
+    raise SystemExit("logo downsizing requires Pillow or macOS sips")
+
+
+def _downsize_with_pillow(logo_path: pathlib.Path, max_dim: int) -> bool:
+    try:
+        from PIL import Image
+    except Exception:
+        return False
+
+    with Image.open(logo_path) as image:
+        if max(image.size) <= max_dim:
+            return True
+
+        image.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+        image.save(logo_path)
+
+    return True
+
+
+def _downsize_with_sips(logo_path: pathlib.Path, max_dim: int) -> bool:
+    if shutil.which("sips") is None:
+        return False
+
+    inspect = subprocess.run(
+        ["sips", "-g", "pixelWidth", "-g", "pixelHeight", str(logo_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    width_match = re.search(r"pixelWidth:\s+(\d+)", inspect.stdout)
+    height_match = re.search(r"pixelHeight:\s+(\d+)", inspect.stdout)
+    if not width_match or not height_match:
+        raise SystemExit(f"could not determine image dimensions: {logo_path}")
+
+    width = int(width_match.group(1))
+    height = int(height_match.group(1))
+    if max(width, height) <= max_dim:
+        return True
+
+    subprocess.run(
+        ["sips", "-Z", str(max_dim), str(logo_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return True
 
 
 def update_readme(
@@ -79,10 +139,13 @@ def main() -> int:
     parser.add_argument("--alt", required=True)
     parser.add_argument("--inline-width", type=int, default=24)
     parser.add_argument("--logo-width", type=int, default=120)
+    parser.add_argument("--logo-max-dim", type=int, default=240)
     args = parser.parse_args()
 
     readme_path = pathlib.Path(args.readme)
     usage_path = pathlib.Path(args.usage)
+
+    downsize_logo_asset(usage_path, args.logo_src, args.logo_max_dim)
 
     update_readme(
         readme_path,
