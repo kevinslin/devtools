@@ -2,7 +2,7 @@
 
 <div align="center"><img src="../../assets/sshx-logo.png" alt="SSH sync terminal mascot" width="120" /></div>
 
-`sshx` syncs a conservative set of local dotfiles to a remote host with `rsync`, then opens `ssh`.
+`sshx` syncs a conservative set of local dotfiles and Codex CLI config files to a remote host with `rsync`, then opens `ssh`.
 
 ## Quickstart
 
@@ -21,6 +21,11 @@ sshx [-i PATH] [-o KEY=VALUE] [-p PORT] [--path RELATIVE_PATH ...] [--no-default
 By default, `sshx` syncs the dotfiles and config directories below if they exist under your local home directory:
 
 - `.bashrc`
+- `.codex/agents`
+- `.codex/config.toml`
+- `.codex/hooks.json`
+- `.codex/rules`
+- `.codex/skills`
 - `.profile`
 - `.zlogin`
 - `.zprofile`
@@ -37,7 +42,7 @@ By default, `sshx` syncs the dotfiles and config directories below if they exist
 - `.config/nvim`
 - `.config/uv`
 
-It intentionally skips secret-heavy paths like `.ssh` and auth-oriented config directories.
+It intentionally skips secret-heavy paths like `.ssh`, Codex auth state such as `auth.json`, and other auth-oriented config directories.
 
 ## Options
 

@@ -13,6 +13,11 @@ import sys
 
 DEFAULT_DOTFILE_PATHS = (
     ".bashrc",
+    ".codex/agents",
+    ".codex/config.toml",
+    ".codex/hooks.json",
+    ".codex/rules",
+    ".codex/skills",
     ".profile",
     ".zlogin",
     ".zprofile",
