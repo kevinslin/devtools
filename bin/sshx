@@ -9,6 +9,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
+import time
 
 
 DEFAULT_DOTFILE_PATHS = (
@@ -42,6 +43,8 @@ SYNC_PROFILES = {
 SSH_BIN_ENV = "SSHX_SSH_BIN"
 RSYNC_BIN_ENV = "SSHX_RSYNC_BIN"
 TAR_BIN_ENV = "SSHX_TAR_BIN"
+RSYNC_RETRY_EXIT_CODE = 255
+RSYNC_RETRY_DELAY_SECONDS = 1
 RSYNC_REMOTE_CHECK_COMMAND = "command -v rsync >/dev/null 2>&1"
 RSYNC_REMOTE_CHECK_TIMEOUT_SECONDS = 8
 TAR_REMOTE_EXTRACT_COMMAND = 'mkdir -p "$HOME" && tar -xzf - -C "$HOME"'
@@ -280,6 +283,24 @@ def _run_rsync_sync(*, rsync_command: list[str], home: Path) -> int | None:
     except OSError as exc:
         print(f"warning: failed to run rsync: {exc}", file=sys.stderr)
         return None
+    if rsync_result.returncode == RSYNC_RETRY_EXIT_CODE:
+        print(
+            (
+                "warning: rsync lost the SSH transport (exit code 255); "
+                "retrying once..."
+            ),
+            file=sys.stderr,
+        )
+        time.sleep(RSYNC_RETRY_DELAY_SECONDS)
+        try:
+            rsync_result = subprocess.run(
+                rsync_command,
+                cwd=home,
+                check=False,
+            )
+        except OSError as exc:
+            print(f"warning: failed to run rsync: {exc}", file=sys.stderr)
+            return None
     return rsync_result.returncode
 
 

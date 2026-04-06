@@ -39,11 +39,13 @@ By default, `sshx` syncs the dotfiles and config directories below if they exist
 - `.zprofile`
 - `.zshenv`
 - `.zshrc`
+- `.zshrc.dots`
 - `.gitconfig`
 - `.git.scmbrc`
 - `.scmbrc`
 - `.tmux.conf`
 - `.vimrc`
+- `.vimrc.plugins`
 - `.config/fish`
 - `.config/git`
 - `.config/iterm2`
@@ -62,6 +64,8 @@ It intentionally skips secret-heavy paths like `.ssh`, Codex auth state such as 
 - `--path RELATIVE_PATH`: add another home-relative file or directory to sync.
 - `--no-defaults`: sync only the paths you provide with `--path`.
 - `--dry-run`: print the sync and `ssh` commands without executing them.
+
+If the `rsync` transport drops with SSH exit code `255`, `sshx` retries the sync once before giving up.
 
 ## Examples
 

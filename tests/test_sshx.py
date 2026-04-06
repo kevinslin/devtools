@@ -36,6 +36,39 @@ def _write_fake_exec(path: Path, *, log_path: Path, exit_code: int = 0) -> None:
     path.chmod(0o755)
 
 
+def _write_retrying_fake_exec(
+    path: Path,
+    *,
+    log_path: Path,
+    state_path: Path,
+    initial_exit_code: int,
+    subsequent_exit_code: int = 0,
+) -> None:
+    path.write_text(
+        (
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "import sys\n"
+            f"log_path = Path({str(log_path)!r})\n"
+            f"state_path = Path({str(state_path)!r})\n"
+            "if state_path.exists():\n"
+            "    count = int(state_path.read_text(encoding='utf-8'))\n"
+            "else:\n"
+            "    count = 0\n"
+            "state_path.write_text(str(count + 1), encoding='utf-8')\n"
+            "log_path.write_text(\n"
+            "    json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd(), 'count': count + 1}),\n"
+            "    encoding='utf-8',\n"
+            ")\n"
+            f"raise SystemExit({initial_exit_code} if count == 0 else {subsequent_exit_code})\n"
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
 def _write_fake_tar(path: Path, *, log_path: Path, payload: bytes = b"archive") -> None:
     path.write_text(
         (
@@ -311,6 +344,38 @@ class SshxCliTest(unittest.TestCase):
             self.assertIn("rsync failed with exit code 23", result.stderr)
             self.assertTrue(rsync_log.exists())
             self.assertFalse(ssh_log.exists())
+
+    def test_rsync_transport_error_retries_once_before_connecting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home = tmp_path / "home"
+            home.mkdir()
+            _write_file(home / ".zshrc", "export PATH=/usr/local/bin:$PATH\n")
+
+            rsync_log = tmp_path / "rsync.json"
+            rsync_state = tmp_path / "rsync-count.txt"
+            ssh_log = tmp_path / "ssh.json"
+            rsync_bin = tmp_path / "fake-rsync"
+            ssh_bin = tmp_path / "fake-ssh"
+            _write_retrying_fake_exec(
+                rsync_bin,
+                log_path=rsync_log,
+                state_path=rsync_state,
+                initial_exit_code=255,
+            )
+            _write_fake_exec(ssh_bin, log_path=ssh_log)
+
+            result = self.run_cli(
+                ["--sync-method", "rsync", "devbox"],
+                home=home,
+                ssh_bin=ssh_bin,
+                rsync_bin=rsync_bin,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("retrying once", result.stderr)
+            self.assertEqual(rsync_state.read_text(encoding="utf-8"), "2")
+            self.assertTrue(ssh_log.exists())
 
     def test_auto_falls_back_to_tar_when_remote_rsync_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
