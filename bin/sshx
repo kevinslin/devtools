@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Sync local dotfiles to a remote host, then connect over SSH."""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+
+
+DEFAULT_DOTFILE_PATHS = (
+    ".bashrc",
+    ".profile",
+    ".zlogin",
+    ".zprofile",
+    ".zshenv",
+    ".zshrc",
+    ".gitconfig",
+    ".git.scmbrc",
+    ".scmbrc",
+    ".tmux.conf",
+    ".vimrc",
+    ".config/fish",
+    ".config/git",
+    ".config/iterm2",
+    ".config/nvim",
+    ".config/uv",
+)
+SSH_BIN_ENV = "SSHX_SSH_BIN"
+RSYNC_BIN_ENV = "SSHX_RSYNC_BIN"
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Rsync a conservative set of local dotfiles to a remote home directory "
+            "and then open an SSH session."
+        )
+    )
+    parser.add_argument(
+        "-i",
+        "--identity-file",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="pass an SSH identity file to both rsync and ssh",
+    )
+    parser.add_argument(
+        "-o",
+        "--option",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="pass an SSH -o option to both rsync and ssh",
+    )
+    parser.add_argument(
+        "-p",
+        "--port",
+        metavar="PORT",
+        help="pass a custom SSH port to both rsync and ssh",
+    )
+    parser.add_argument(
+        "--path",
+        action="append",
+        default=[],
+        metavar="RELATIVE_PATH",
+        help="sync an additional home-relative path before connecting",
+    )
+    parser.add_argument(
+        "--no-defaults",
+        action="store_true",
+        help="sync only the paths given via --path",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the rsync and ssh commands without running them",
+    )
+    parser.add_argument(
+        "host",
+        help="SSH destination, for example user@example.com",
+    )
+    parser.add_argument(
+        "remote_command",
+        nargs=argparse.REMAINDER,
+        help="optional remote command to run after syncing",
+    )
+    return parser
+
+
+def _normalize_relative_path(raw: str, *, home: Path) -> Path:
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute():
+        try:
+            relative = candidate.relative_to(home)
+        except ValueError as exc:
+            raise ValueError(
+                f"path must be inside {home}, got {candidate}"
+            ) from exc
+    else:
+        relative = Path(raw)
+
+    if relative == Path(".") or any(part == ".." for part in relative.parts):
+        raise ValueError(f"path must stay inside the home directory, got {raw!r}")
+
+    return relative
+
+
+def _resolve_sync_paths(
+    *,
+    home: Path,
+    include_defaults: bool,
+    extra_paths: list[str],
+) -> list[Path]:
+    selected: list[Path] = []
+    seen: set[str] = set()
+
+    def add(relative: Path) -> None:
+        key = relative.as_posix()
+        if key in seen:
+            return
+        seen.add(key)
+        selected.append(relative)
+
+    if include_defaults:
+        for raw in DEFAULT_DOTFILE_PATHS:
+            relative = Path(raw)
+            if (home / relative).exists():
+                add(relative)
+
+    for raw in extra_paths:
+        relative = _normalize_relative_path(raw, home=home)
+        candidate = home / relative
+        if not candidate.exists():
+            raise ValueError(f"missing local path: {candidate}")
+        add(relative)
+
+    if not selected:
+        raise ValueError(
+            "no dotfiles selected; add files under your home directory or pass --path"
+        )
+
+    return selected
+
+
+def _ssh_binary() -> str:
+    return os.environ.get(SSH_BIN_ENV, "ssh")
+
+
+def _rsync_binary() -> str:
+    return os.environ.get(RSYNC_BIN_ENV, "rsync")
+
+
+def _ssh_command(
+    *,
+    identity_files: list[str],
+    options: list[str],
+    port: str | None,
+) -> list[str]:
+    command = [_ssh_binary()]
+    for identity in identity_files:
+        command.extend(["-i", identity])
+    for option in options:
+        command.extend(["-o", option])
+    if port:
+        command.extend(["-p", port])
+    return command
+
+
+def _trim_remote_command(remote_command: list[str]) -> list[str]:
+    if remote_command and remote_command[0] == "--":
+        return remote_command[1:]
+    return remote_command
+
+
+def _format_relative_rsync_path(path: Path) -> str:
+    return f"./{path.as_posix()}"
+
+
+def _run(argv: list[str]) -> int:
+    args = _build_parser().parse_args(argv)
+    home = Path.home()
+
+    try:
+        sync_paths = _resolve_sync_paths(
+            home=home,
+            include_defaults=not args.no_defaults,
+            extra_paths=args.path,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    ssh_base = _ssh_command(
+        identity_files=args.identity_file,
+        options=args.option,
+        port=args.port,
+    )
+    remote_command = _trim_remote_command(args.remote_command)
+
+    rsync_command = [
+        _rsync_binary(),
+        "-az",
+        "--relative",
+        "-e",
+        shlex.join(ssh_base),
+        *[_format_relative_rsync_path(path) for path in sync_paths],
+        f"{args.host}:~/",
+    ]
+    ssh_command = [*ssh_base, args.host, *remote_command]
+
+    if args.dry_run:
+        print(shlex.join(rsync_command))
+        print(shlex.join(ssh_command))
+        return 0
+
+    try:
+        rsync_result = subprocess.run(
+            rsync_command,
+            cwd=home,
+            check=False,
+        )
+    except OSError as exc:
+        print(f"error: failed to run rsync: {exc}", file=sys.stderr)
+        return 1
+    if rsync_result.returncode != 0:
+        print(
+            f"error: rsync failed with exit code {rsync_result.returncode}",
+            file=sys.stderr,
+        )
+        return rsync_result.returncode
+
+    try:
+        ssh_result = subprocess.run(
+            ssh_command,
+            check=False,
+        )
+    except OSError as exc:
+        print(f"error: failed to run ssh: {exc}", file=sys.stderr)
+        return 1
+    return ssh_result.returncode
+
+
+def main() -> int:
+    return _run(sys.argv[1:])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
