@@ -67,6 +67,11 @@ class SshxCliTest(unittest.TestCase):
             tmp_path = Path(tmp)
             home = tmp_path / "home"
             home.mkdir()
+            _write_file(home / ".codex" / "agents" / "assistant.md", "# assistant\n")
+            _write_file(home / ".codex" / "config.toml", "model = \"gpt-5\"\n")
+            _write_file(home / ".codex" / "hooks.json", "{\n  \"hooks\": []\n}\n")
+            _write_file(home / ".codex" / "rules" / "default.md", "# rules\n")
+            _write_file(home / ".codex" / "skills" / "demo" / "SKILL.md", "# demo\n")
             _write_file(home / ".zshrc", "export PATH=/usr/local/bin:$PATH\n")
             _write_file(home / ".gitconfig", "[user]\nname = Test User\n")
             _write_file(home / ".config" / "nvim" / "init.lua", "vim.o.number = true\n")
@@ -94,6 +99,11 @@ class SshxCliTest(unittest.TestCase):
                 ["-az", "--relative", "-e", f"{ssh_bin} -i /tmp/custom-key"],
             )
             self.assertIn("./.zshrc", rsync_payload["argv"])
+            self.assertIn("./.codex/agents", rsync_payload["argv"])
+            self.assertIn("./.codex/config.toml", rsync_payload["argv"])
+            self.assertIn("./.codex/hooks.json", rsync_payload["argv"])
+            self.assertIn("./.codex/rules", rsync_payload["argv"])
+            self.assertIn("./.codex/skills", rsync_payload["argv"])
             self.assertIn("./.gitconfig", rsync_payload["argv"])
             self.assertIn("./.config/nvim", rsync_payload["argv"])
             self.assertEqual(rsync_payload["argv"][-1], "devbox:~/")
