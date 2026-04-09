@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Decode a JWT from stdin into pretty JSON.
+
+Usage:
+  pbpaste | jwtio
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import json
+import sys
+
+
+class JwtioError(Exception):
+    """Raised when stdin or JWT decoding fails."""
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Decode a JWT from stdin into pretty JSON."
+    )
+    parser.add_argument(
+        "path",
+        nargs="?",
+        choices=["-"],
+        help="Optional stdin marker. Omit it or pass '-' to read from stdin.",
+    )
+    return parser.parse_args()
+
+
+def _read_token() -> str:
+    if sys.stdin.isatty():
+        raise JwtioError("provide a JWT via stdin")
+
+    try:
+        raw_input = sys.stdin.read()
+    except OSError as exc:
+        raise JwtioError(f"failed to read JWT from stdin: {exc}") from exc
+
+    chunks = raw_input.strip().split()
+    if not chunks:
+        raise JwtioError("JWT input is empty")
+
+    if chunks[0].lower() == "bearer":
+        chunks = chunks[1:]
+
+    if len(chunks) != 1:
+        raise JwtioError("expected exactly one JWT in stdin")
+
+    return chunks[0]
+
+
+def _decode_base64url(segment: str, *, name: str) -> bytes:
+    if not segment:
+        raise JwtioError(f"{name} segment is empty")
+
+    padded = segment + ("=" * (-len(segment) % 4))
+    try:
+        return base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise JwtioError(f"{name} segment is not valid base64url: {exc}") from exc
+
+
+def _decode_segment_json(segment: str, *, name: str) -> object:
+    try:
+        decoded = _decode_base64url(segment, name=name).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise JwtioError(f"{name} segment is not valid UTF-8: {exc}") from exc
+
+    try:
+        return json.loads(decoded)
+    except json.JSONDecodeError as exc:
+        raise JwtioError(f"{name} segment is not valid JSON: {exc.msg}") from exc
+
+
+def _decode_jwt(token: str) -> dict[str, object]:
+    segments = token.split(".")
+    if len(segments) != 3:
+        raise JwtioError("expected a JWT with 3 dot-separated segments")
+
+    header_segment, payload_segment, signature_segment = segments
+    return {
+        "header": _decode_segment_json(header_segment, name="header"),
+        "payload": _decode_segment_json(payload_segment, name="payload"),
+        "signature": signature_segment,
+    }
+
+
+def main() -> int:
+    _parse_args()
+
+    try:
+        decoded = _decode_jwt(_read_token())
+    except JwtioError as exc:
+        print(f"jwtio: {exc}", file=sys.stderr)
+        return 1
+
+    print(json.dumps(decoded, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

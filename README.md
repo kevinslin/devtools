@@ -21,10 +21,9 @@ A bunch of useful tools. Designed by human. Made by codex.
 - 🪴 `sprout`: [tokemon-menuapp](docs/tokemon-menuapp/usage.md) <img src="assets/tokemon-menuapp-inline.png" alt="Tokemon menu app mascot" width="24" height="24" style="vertical-align: text-bottom;" />; entry point `bin/tokemon-menuapp`; build and launch the native Tokemon macOS menu-bar app
 - 🌱 `seed`: [agent-sync](docs/agent-sync/usage.md) <img src="assets/agent-sync-inline.png" alt="Agent Sync folders mascot" width="24" height="24" style="vertical-align: text-bottom;" />; entry point `bin/agent-sync`; bidirectionally sync selected agent-config files between a live folder and a git repo with file-level conflict detection and dry-run preview
 - 🌱 `seed`: [autocrop-video](docs/autocrop-video/usage.md) <img src="assets/autocrop-video-inline.png" alt="Autocrop video mascot" width="24" height="24" style="vertical-align: text-bottom;" />; entry point `bin/autocrop-video`; detect the embedded video frame inside a larger screen recording and optionally crop the file to that box
-- 🌱 `seed`: [ag-man](docs/ag-man/usage.md) <img src="assets/ag-man-inline.png" alt="AG Man ledger mascot" width="24" height="24" style="vertical-align: text-bottom;" />; entry point `bin/ag-man`; list today's `ag-ledger` session starts as JSONL with active/inactive process and tmux status, with optional `--filter key=value` and `--group-by workspace`
 - 🌱 `seed`: [convo](docs/convo/usage.md) <img src="assets/convo-inline.png" alt="Conversation search mascot" width="24" height="24" style="vertical-align: text-bottom;" />; entry point `bin/convo`; search Codex conversation logs with fast regex matching and optional date-window filtering
+- 🌱 `seed`: [jwtio](docs/jwtio/usage.md); entry point `bin/jwtio`; decode a JWT from stdin into pretty JSON showing the header, payload, and signature fields
 - 🌱 `seed`: [sshx](docs/sshx/usage.md) <img src="assets/sshx-inline.png" alt="SSH sync terminal mascot" width="24" height="24" style="vertical-align: text-bottom;" />; entry point `bin/sshx`; sync a conservative set of local dotfiles plus Codex CLI config, agents, hooks, rules, and skills to a remote host with rsync, then open ssh with optional identity and SSH options
-
 
 ## Docs layout
 

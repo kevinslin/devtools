@@ -15,7 +15,7 @@ import sqlite3
 import sys
 from calendar import monthrange
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, Optional, Sequence, Tuple
 
@@ -30,7 +30,7 @@ SUM_BY_PRESETS = ("daily", "weekly", "monthly")
 UNKNOWN_WORKSPACE = "(unknown)"
 CODEX_SESSION_SPILLOVER_DAYS = 1
 INDEX_CHUNK_SIZE = 400
-INDEX_SCHEMA_VERSION = 1
+INDEX_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -57,8 +57,19 @@ class IndexedFileState:
     mtime_ns: int
 
 
-def _local_tz():
-    return datetime.now().astimezone().tzinfo
+def _localize_datetime(value: datetime) -> datetime:
+    """Interpret or convert a datetime in the system local timezone.
+
+    For naive datetimes, ``astimezone()`` treats them as local wall-clock time and
+    applies the correct historical DST offset for that date. For aware datetimes,
+    it converts the instant into the local timezone.
+    """
+
+    return value.astimezone()
+
+
+def _local_midnight(day: date) -> datetime:
+    return _localize_datetime(datetime.combine(day, time.min))
 
 
 def _safe_int(value: object) -> int:
@@ -77,9 +88,7 @@ def _parse_timestamp(raw: object) -> Optional[datetime]:
         parsed = datetime.fromisoformat(text)
     except ValueError:
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=_local_tz())
-    return parsed.astimezone(_local_tz())
+    return _localize_datetime(parsed)
 
 
 def _normalize_codex_totals(raw: object) -> Optional[Dict[str, int]]:
@@ -601,21 +610,21 @@ def _iter_claude_usage(start: datetime, end: datetime) -> Iterator[UsageRecord]:
 
 def _start_of_week_sunday(when: datetime) -> datetime:
     days_since_sunday = (when.weekday() + 1) % 7
-    midnight = when.replace(hour=0, minute=0, second=0, microsecond=0)
-    return midnight - timedelta(days=days_since_sunday)
+    return _local_midnight(when.date() - timedelta(days=days_since_sunday))
 
 
 def _shift_months(when: datetime, months: int) -> datetime:
+    local_naive = when.replace(tzinfo=None)
     raw_month = when.month - 1 + months
     year = when.year + (raw_month // 12)
     month = (raw_month % 12) + 1
     day = min(when.day, monthrange(year, month)[1])
-    return when.replace(year=year, month=month, day=day)
+    shifted = local_naive.replace(year=year, month=month, day=day)
+    return _localize_datetime(shifted)
 
 
 def _resolve_range(range_args: list[str]) -> Tuple[datetime, datetime, str]:
     now = datetime.now().astimezone()
-    tzinfo = _local_tz()
 
     if not range_args:
         range_args = ["current_week"]
@@ -624,11 +633,11 @@ def _resolve_range(range_args: list[str]) -> Tuple[datetime, datetime, str]:
         preset = range_args[0]
         if preset == "current_week":
             start = _start_of_week_sunday(now)
-            end = start + timedelta(days=7)
+            end = _local_midnight(start.date() + timedelta(days=7))
             return start, end, preset
         if preset == "week":
             end = now
-            start = end - timedelta(days=7)
+            start = _localize_datetime(end.replace(tzinfo=None) - timedelta(days=7))
             return start, end, preset
         if preset == "month":
             end = now
@@ -650,9 +659,9 @@ def _resolve_range(range_args: list[str]) -> Tuple[datetime, datetime, str]:
             raise ValueError("invalid date range, expected YYYY-MM-DD YYYY-MM-DD") from exc
         if end_date < start_date:
             raise ValueError("end date must be >= start date")
-        start = datetime.combine(start_date, time.min, tzinfo=tzinfo)
+        start = _local_midnight(start_date)
         # End date is inclusive in user input, so convert to exclusive bound.
-        end = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=tzinfo)
+        end = _local_midnight(end_date + timedelta(days=1))
         return start, end, f"{start_date.isoformat()}..{end_date.isoformat()}"
 
     raise ValueError("range accepts either one preset or two dates")
@@ -679,14 +688,14 @@ def _bucket_start(ts: datetime, sum_by_mode: str, sum_by_minutes: Optional[int])
         bucket_seconds = sum_by_minutes * 60
         epoch = int(ts.timestamp())
         start_epoch = epoch - (epoch % bucket_seconds)
-        return datetime.fromtimestamp(start_epoch, tz=ts.tzinfo)
+        return datetime.fromtimestamp(start_epoch, tz=timezone.utc).astimezone()
 
     if sum_by_mode == "daily":
-        return ts.replace(hour=0, minute=0, second=0, microsecond=0)
+        return _local_midnight(ts.date())
     if sum_by_mode == "weekly":
         return _start_of_week_sunday(ts)
     if sum_by_mode == "monthly":
-        return ts.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return _local_midnight(date(ts.year, ts.month, 1))
 
     raise ValueError(f"unsupported sum_by mode: {sum_by_mode}")
 

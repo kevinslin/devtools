@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from calendar import monthrange
+from contextlib import contextmanager
 import csv
 from datetime import datetime, timedelta
 import importlib.machinery
@@ -11,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time as time_module
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -20,11 +22,12 @@ CLI = ROOT / "bin" / "tokemon"
 
 
 def _shift_months(when: datetime, months: int) -> datetime:
+    local_naive = when.replace(tzinfo=None)
     raw_month = when.month - 1 + months
     year = when.year + (raw_month // 12)
     month = (raw_month % 12) + 1
     day = min(when.day, monthrange(year, month)[1])
-    return when.replace(year=year, month=month, day=day)
+    return local_naive.replace(year=year, month=month, day=day).astimezone()
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -50,10 +53,28 @@ def _load_tokemon_module():
     return module
 
 
+@contextmanager
+def _temporary_timezone(name: str):
+    original = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = name
+        if hasattr(time_module, "tzset"):
+            time_module.tzset()
+        yield
+    finally:
+        if original is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = original
+        if hasattr(time_module, "tzset"):
+            time_module.tzset()
+
+
 class TokemonCliTest(unittest.TestCase):
     def run_cli(self, args: list[str], env_updates: dict[str, str]) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.update(env_updates)
+        env.setdefault("TZ", "America/Los_Angeles")
         return subprocess.run(
             [sys.executable, str(CLI), *args],
             cwd=ROOT,
@@ -896,6 +917,40 @@ class TokemonCliTest(unittest.TestCase):
                 ],
             )
 
+    def test_parse_timestamp_uses_historical_dst_offset(self) -> None:
+        with _temporary_timezone("America/Los_Angeles"):
+            tokemon = _load_tokemon_module()
+
+            winter = tokemon._parse_timestamp("2026-01-15T17:30:00Z")
+            summer = tokemon._parse_timestamp("2026-07-15T16:30:00Z")
+
+            self.assertIsNotNone(winter)
+            self.assertIsNotNone(summer)
+            assert winter is not None
+            assert summer is not None
+            self.assertEqual(winter.isoformat(), "2026-01-15T09:30:00-08:00")
+            self.assertEqual(summer.isoformat(), "2026-07-15T09:30:00-07:00")
+
+    def test_explicit_date_range_preserves_dst_transition_midnights(self) -> None:
+        with _temporary_timezone("America/Los_Angeles"):
+            tokemon = _load_tokemon_module()
+
+            start, end, label = tokemon._resolve_range(["2026-03-07", "2026-03-08"])
+
+            self.assertEqual(label, "2026-03-07..2026-03-08")
+            self.assertEqual(start.isoformat(), "2026-03-07T00:00:00-08:00")
+            self.assertEqual(end.isoformat(), "2026-03-09T00:00:00-07:00")
+
+    def test_weekly_bucket_start_uses_pre_transition_offset(self) -> None:
+        with _temporary_timezone("America/Los_Angeles"):
+            tokemon = _load_tokemon_module()
+            ts = tokemon._parse_timestamp("2026-03-10T18:00:00Z")
+
+            self.assertIsNotNone(ts)
+            assert ts is not None
+            bucket = tokemon._bucket_start(ts, "weekly", None)
+            self.assertEqual(bucket.isoformat(), "2026-03-08T00:00:00-08:00")
+
     def test_codex_cli_reuses_index_for_unchanged_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -1322,7 +1377,7 @@ class TokemonCliTest(unittest.TestCase):
                 user_version = conn.execute("PRAGMA user_version").fetchone()[0]
                 indexed_rows = conn.execute("SELECT total_tokens FROM usage_records ORDER BY total_tokens").fetchall()
 
-            self.assertEqual(user_version, 1)
+            self.assertEqual(user_version, 2)
             self.assertEqual(indexed_rows, [(80,)])
 
     def test_invalid_sum_by_exits_non_zero(self) -> None:
