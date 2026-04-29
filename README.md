@@ -22,8 +22,10 @@ A bunch of useful tools. Designed by human. Made by codex.
 - 🌱 `seed`: [agent-sync](docs/agent-sync/usage.md) <img src="assets/agent-sync-inline.png" alt="Agent Sync folders mascot" width="24" height="24" style="vertical-align: text-bottom;" />; entry point `bin/agent-sync`; bidirectionally sync selected agent-config files between a live folder and a git repo with file-level conflict detection and dry-run preview
 - 🌱 `seed`: [autocrop-video](docs/autocrop-video/usage.md) <img src="assets/autocrop-video-inline.png" alt="Autocrop video mascot" width="24" height="24" style="vertical-align: text-bottom;" />; entry point `bin/autocrop-video`; detect the embedded video frame inside a larger screen recording and optionally crop the file to that box
 - 🌱 `seed`: [convo](docs/convo/usage.md) <img src="assets/convo-inline.png" alt="Conversation search mascot" width="24" height="24" style="vertical-align: text-bottom;" />; entry point `bin/convo`; search Codex conversation logs with fast regex matching and optional date-window filtering
+- 🌱 `seed`: [epoch](docs/epoch/usage.md); entry point `bin/epoch`; convert an epoch timestamp into UTC, local, and relative time
 - 🌱 `seed`: [jwtio](docs/jwtio/usage.md); entry point `bin/jwtio`; decode a JWT from stdin into pretty JSON showing the header, payload, and signature fields
-- 🌱 `seed`: [sshx](docs/sshx/usage.md) <img src="assets/sshx-inline.png" alt="SSH sync terminal mascot" width="24" height="24" style="vertical-align: text-bottom;" />; entry point `bin/sshx`; sync a conservative set of local dotfiles plus Codex CLI config, agents, hooks, rules, and skills to a remote host with rsync, then open ssh with optional identity and SSH options
+- 🌱 `seed`: [slack-post](docs/slack-post/usage.md); entry point `bin/slack-post`; post a plain-text message to a Slack channel with a provided token
+- 🌱 `seed`: [sshx](docs/sshx/usage.md) <img src="assets/sshx-inline.png" alt="SSH sync terminal mascot" width="24" height="24" style="vertical-align: text-bottom;" />; entry point `bin/sshx`; sync profile-selected local dotfiles plus Codex CLI config, agents, hooks, rules, and skills to a remote host with rsync, then open ssh with optional identity and SSH options
 
 ## Docs layout
 
