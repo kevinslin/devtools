@@ -1,2 +1,3 @@
 *.pyc
 *.skill
+.DS_Store
