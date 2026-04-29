@@ -69,6 +69,7 @@ class SshxCliTest(unittest.TestCase):
             home.mkdir()
             _write_file(home / ".codex" / "agents" / "assistant.md", "# assistant\n")
             _write_file(home / ".codex" / "config.toml", "model = \"gpt-5\"\n")
+            _write_file(home / ".codex" / "hooks" / "gh_action_check.py", "#!/usr/bin/env python3\n")
             _write_file(home / ".codex" / "hooks.json", "{\n  \"hooks\": []\n}\n")
             _write_file(home / ".codex" / "rules" / "default.md", "# rules\n")
             _write_file(home / ".codex" / "skills" / "demo" / "SKILL.md", "# demo\n")
@@ -101,6 +102,7 @@ class SshxCliTest(unittest.TestCase):
             self.assertIn("./.zshrc", rsync_payload["argv"])
             self.assertIn("./.codex/agents", rsync_payload["argv"])
             self.assertIn("./.codex/config.toml", rsync_payload["argv"])
+            self.assertIn("./.codex/hooks", rsync_payload["argv"])
             self.assertIn("./.codex/hooks.json", rsync_payload["argv"])
             self.assertIn("./.codex/rules", rsync_payload["argv"])
             self.assertIn("./.codex/skills", rsync_payload["argv"])
@@ -166,6 +168,36 @@ class SshxCliTest(unittest.TestCase):
                 ssh_payload["argv"],
                 ["devbox", "uname", "-a"],
             )
+
+    def test_work_profile_excludes_zshrc_from_default_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home = tmp_path / "home"
+            home.mkdir()
+            _write_file(home / ".zshrc", "export PATH=/usr/local/bin:$PATH\n")
+            _write_file(home / ".gitconfig", "[user]\nname = Work User\n")
+            _write_file(home / ".codex" / "config.toml", "model = \"gpt-5\"\n")
+
+            rsync_log = tmp_path / "rsync.json"
+            ssh_log = tmp_path / "ssh.json"
+            rsync_bin = tmp_path / "fake-rsync"
+            ssh_bin = tmp_path / "fake-ssh"
+            _write_fake_exec(rsync_bin, log_path=rsync_log)
+            _write_fake_exec(ssh_bin, log_path=ssh_log)
+
+            result = self.run_cli(
+                ["--profile", "work", "devbox"],
+                home=home,
+                ssh_bin=ssh_bin,
+                rsync_bin=rsync_bin,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+            rsync_payload = _read_log(rsync_log)
+            self.assertNotIn("./.zshrc", rsync_payload["argv"])
+            self.assertIn("./.gitconfig", rsync_payload["argv"])
+            self.assertIn("./.codex/config.toml", rsync_payload["argv"])
 
     def test_missing_explicit_path_returns_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

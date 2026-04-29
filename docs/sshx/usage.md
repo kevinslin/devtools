@@ -13,8 +13,15 @@ sshx devbox
 ## Command
 
 ```sh
-sshx [-i PATH] [-o KEY=VALUE] [-p PORT] [--path RELATIVE_PATH ...] [--no-defaults] [--dry-run] host [remote-command...]
+sshx [--profile NAME] [-i PATH] [-o KEY=VALUE] [-p PORT] [--path RELATIVE_PATH ...] [--no-defaults] [--dry-run] host [remote-command...]
 ```
+
+## Profiles
+
+`sshx` uses the `default` profile unless you pass `--profile`.
+
+- `default`: syncs the default sync set below.
+- `work`: syncs the same default sync set except `.zshrc`.
 
 ## Default Sync Set
 
@@ -23,6 +30,7 @@ By default, `sshx` syncs the dotfiles and config directories below if they exist
 - `.bashrc`
 - `.codex/agents`
 - `.codex/config.toml`
+- `.codex/hooks`
 - `.codex/hooks.json`
 - `.codex/rules`
 - `.codex/skills`
@@ -49,6 +57,7 @@ It intentionally skips secret-heavy paths like `.ssh`, Codex auth state such as 
 - `-i, --identity-file PATH`: pass an SSH identity file to both `rsync` and `ssh`.
 - `-o, --option KEY=VALUE`: pass an SSH `-o` option to both `rsync` and `ssh`.
 - `-p, --port PORT`: pass a custom SSH port to both `rsync` and `ssh`.
+- `--profile NAME`: select a sync profile. Available profiles: `default`, `work`.
 - `--path RELATIVE_PATH`: add another home-relative file or directory to sync.
 - `--no-defaults`: sync only the paths you provide with `--path`.
 - `--dry-run`: print the `rsync` and `ssh` commands without executing them.
@@ -61,6 +70,9 @@ sshx devbox
 
 # use a custom SSH key for both rsync and ssh
 sshx -i ~/.ssh/work_ed25519 devbox
+
+# sync the work profile, which omits .zshrc
+sshx --profile work devbox
 
 # sync an extra config directory before opening the session
 sshx --path .config/ghostty devbox
