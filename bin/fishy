@@ -57,8 +57,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     }}
 
     main {{
-      width: min(1100px, calc(100vw - 2rem));
-      margin: 2rem auto;
+      width: 100%;
+      min-height: 100vh;
+      margin: 0;
+      padding: 1rem;
       display: grid;
       gap: 1rem;
     }}
@@ -72,6 +74,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     }}
 
     .hero {{
+      width: min(1100px, 100%);
+      margin: 0 auto;
       padding: 1.25rem 1.5rem;
     }}
 
@@ -99,6 +103,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     }}
 
     .diagram {{
+      width: 100%;
+      min-width: 0;
       padding: 0.75rem;
       display: grid;
       gap: 0.75rem;
@@ -149,8 +155,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     .diagram-viewport {{
       position: relative;
       overflow: auto;
-      min-height: min(72vh, 48rem);
-      max-height: min(72vh, 48rem);
+      height: min(78vh, 56rem);
+      min-height: 28rem;
       padding: 1rem;
       border-radius: 20px;
       background:
@@ -159,17 +165,33 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
         linear-gradient(rgba(16, 50, 74, 0.05) 1px, transparent 1px);
       background-size: auto, 24px 24px, 24px 24px;
       border: 1px solid rgba(16, 50, 74, 0.08);
+      cursor: grab;
+      overscroll-behavior: contain;
+      touch-action: none;
+      user-select: none;
+    }}
+
+    .diagram-viewport.is-panning {{
+      cursor: grabbing;
+    }}
+
+    .diagram-viewport.is-panning * {{
+      cursor: grabbing !important;
     }}
 
     .diagram-stage-wrap {{
       min-width: 100%;
       min-height: 100%;
       width: max-content;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
     }}
 
     .diagram-stage {{
       position: relative;
-      margin: 0 auto;
+      flex: 0 0 auto;
+      margin: 0;
     }}
 
     .diagram .mermaid {{
@@ -211,6 +233,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     }}
 
     details {{
+      width: min(1100px, 100%);
+      margin: 0 auto;
       overflow: hidden;
     }}
 
@@ -260,7 +284,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
           <strong class="diagram-zoom-label" id="diagram-zoom-label">100%</strong>
         </div>
         <div class="diagram-toolbar-group">
-          <button type="button" id="diagram-fit-button">Fit</button>
+          <button type="button" id="diagram-fit-button">Fit width</button>
           <button type="button" id="diagram-zoom-out-button">-</button>
           <button type="button" id="diagram-zoom-in-button">+</button>
         </div>
@@ -303,10 +327,13 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     const zoomInButton = document.getElementById("diagram-zoom-in-button");
     const mermaidRoot = document.getElementById("diagram-mermaid");
     const ZOOM_STEP = 0.15;
+    const DOUBLE_CLICK_ZOOM = 1.5;
+    const MIN_SCALE = 0.05;
     const MAX_SCALE = 3;
     let diagramMetrics = null;
     let fitScale = 1;
     let currentScale = 1;
+    let activePan = null;
 
     function getNoteLabel(noteTextNode) {{
       const tspans = Array.from(noteTextNode.querySelectorAll("tspan"))
@@ -402,17 +429,29 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       }};
     }}
 
+    function clampScale(scale) {{
+      return Math.max(MIN_SCALE, Math.min(scale, MAX_SCALE));
+    }}
+
+    function getViewportPadding() {{
+      const style = window.getComputedStyle(viewport);
+      return {{
+        x: (Number.parseFloat(style.paddingLeft) || 0) + (Number.parseFloat(style.paddingRight) || 0),
+        y: (Number.parseFloat(style.paddingTop) || 0) + (Number.parseFloat(style.paddingBottom) || 0),
+      }};
+    }}
+
     function applyScale(scale) {{
       const svg = mermaidRoot.querySelector("svg");
       if (!svg || !diagramMetrics) {{
         return;
       }}
 
-      currentScale = Math.max(0.1, Math.min(scale, MAX_SCALE));
-      svg.style.width = `${{diagramMetrics.width}}px`;
-      svg.style.height = `${{diagramMetrics.height}}px`;
+      currentScale = clampScale(scale);
+      svg.style.width = `${{diagramMetrics.width * currentScale}}px`;
+      svg.style.height = `${{diagramMetrics.height * currentScale}}px`;
       svg.style.maxWidth = "none";
-      svg.style.transform = `scale(${{currentScale}})`;
+      svg.style.transform = "none";
       stage.style.width = `${{diagramMetrics.width * currentScale}}px`;
       stage.style.height = `${{diagramMetrics.height * currentScale}}px`;
       stage.dataset.scale = currentScale.toFixed(4);
@@ -424,16 +463,97 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
         return;
       }}
 
-      const availableWidth = Math.max(1, viewport.clientWidth - 32);
-      const availableHeight = Math.max(1, viewport.clientHeight - 32);
-      fitScale = Math.min(1, availableWidth / diagramMetrics.width, availableHeight / diagramMetrics.height);
+      const padding = getViewportPadding();
+      const availableWidth = Math.max(1, viewport.clientWidth - padding.x);
+      fitScale = clampScale(availableWidth / diagramMetrics.width);
       applyScale(fitScale);
       viewport.scrollTop = 0;
       viewport.scrollLeft = 0;
     }}
 
+    function getViewportCenterPoint() {{
+      const rect = viewport.getBoundingClientRect();
+      return {{
+        x: rect.left + (rect.width / 2),
+        y: rect.top + (rect.height / 2),
+      }};
+    }}
+
+    function zoomAt(scale, clientX, clientY) {{
+      const svg = mermaidRoot.querySelector("svg");
+      if (!svg || !diagramMetrics) {{
+        return;
+      }}
+
+      const nextScale = clampScale(scale);
+      if (Math.abs(nextScale - currentScale) < 0.0001) {{
+        return;
+      }}
+
+      const beforeRect = stage.getBoundingClientRect();
+      const focusX = (clientX - beforeRect.left) / currentScale;
+      const focusY = (clientY - beforeRect.top) / currentScale;
+      applyScale(nextScale);
+      const afterRect = stage.getBoundingClientRect();
+      viewport.scrollLeft += (afterRect.left + (focusX * currentScale)) - clientX;
+      viewport.scrollTop += (afterRect.top + (focusY * currentScale)) - clientY;
+    }}
+
     function zoomBy(delta) {{
-      applyScale(currentScale + delta);
+      const point = getViewportCenterPoint();
+      zoomAt(currentScale + delta, point.x, point.y);
+    }}
+
+    function endPan(event) {{
+      if (!activePan || activePan.pointerId !== event.pointerId) {{
+        return;
+      }}
+
+      if (viewport.hasPointerCapture(event.pointerId)) {{
+        viewport.releasePointerCapture(event.pointerId);
+      }}
+      activePan = null;
+      viewport.classList.remove("is-panning");
+    }}
+
+    function installDiagramPointerControls() {{
+      viewport.addEventListener("pointerdown", (event) => {{
+        if (event.button !== 0) {{
+          return;
+        }}
+
+        activePan = {{
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          startY: event.clientY,
+          scrollLeft: viewport.scrollLeft,
+          scrollTop: viewport.scrollTop,
+        }};
+        viewport.classList.add("is-panning");
+        viewport.setPointerCapture(event.pointerId);
+      }});
+
+      viewport.addEventListener("pointermove", (event) => {{
+        if (!activePan || activePan.pointerId !== event.pointerId) {{
+          return;
+        }}
+
+        viewport.scrollLeft = activePan.scrollLeft - (event.clientX - activePan.startX);
+        viewport.scrollTop = activePan.scrollTop - (event.clientY - activePan.startY);
+        hideTooltip();
+        event.preventDefault();
+      }});
+
+      viewport.addEventListener("pointerup", endPan);
+      viewport.addEventListener("pointercancel", endPan);
+      viewport.addEventListener("lostpointercapture", endPan);
+      viewport.addEventListener("dblclick", (event) => {{
+        event.preventDefault();
+        const nextScale = (event.altKey || event.shiftKey)
+          ? currentScale / DOUBLE_CLICK_ZOOM
+          : currentScale * DOUBLE_CLICK_ZOOM;
+        zoomAt(nextScale, event.clientX, event.clientY);
+      }});
     }}
 
     await mermaid.run({{
@@ -446,6 +566,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       fitButton.addEventListener("click", fitDiagram);
       zoomOutButton.addEventListener("click", () => zoomBy(-ZOOM_STEP));
       zoomInButton.addEventListener("click", () => zoomBy(ZOOM_STEP));
+      installDiagramPointerControls();
       window.addEventListener("resize", fitDiagram);
     }}
     installNoteHoverTooltips();

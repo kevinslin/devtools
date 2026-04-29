@@ -33,6 +33,10 @@ class FishyCliTest(unittest.TestCase):
         self.assertIn("diagram-fit-button", body)
         self.assertIn("diagram-zoom-in-button", body)
         self.assertIn("diagram-viewport", body)
+        self.assertIn("Fit width", body)
+        self.assertIn("installDiagramPointerControls", body)
+        self.assertIn("pointerdown", body)
+        self.assertIn("dblclick", body)
 
         with urlopen(f"{url}/source.mmd", timeout=5) as response:
             source_body = response.read().decode("utf-8")

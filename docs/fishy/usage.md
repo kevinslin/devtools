@@ -32,7 +32,9 @@ fishy [path| -] [--host HOST] [--port PORT] [--title TITLE] [--no-open]
 
 - `fishy` reads Mermaid text first, then starts a local HTTP server and prints the preview URL.
 - If the input is a single fenced Markdown block such as ```` ```mermaid ... ``` ````, `fishy` strips the outer fence automatically.
-- The preview fits the full diagram into the viewport on first load and includes `Fit`, `-`, and `+` controls for adjusting zoom afterward.
+- The preview spans the page width and fits the diagram to that width on first load.
+- Drag inside the preview to pan. Double-click to zoom in at the pointer; `Shift`/`Option` double-click zooms out.
+- The toolbar includes `Fit width`, `-`, and `+` controls for adjusting zoom afterward.
 - Long Mermaid note text gets a hover tooltip in the preview so clipped sequence notes can still be read in full.
 - The rendered page is local, but the browser loads Mermaid itself from jsDelivr at runtime.
 - Press `Ctrl-C` to stop the server.
