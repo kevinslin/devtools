@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from urllib.request import urlopen
@@ -67,6 +68,62 @@ class FishyCliTest(unittest.TestCase):
             "sequenceDiagram\n    participant A as Alpha\n    participant B as Beta\n    A->>B: hello",
         )
 
+    def test_source_file_extracts_mermaid_blocks_with_section_titles_and_refresh_version(self) -> None:
+        markdown_source = (
+            "# System Overview\n"
+            "\n"
+            "```mermaid\n"
+            "graph TD\n"
+            "    A[Start] --> B[Done]\n"
+            "```\n"
+            "\n"
+            "```python\n"
+            "print('not mermaid')\n"
+            "```\n"
+            "\n"
+            "## Retry Flow\n"
+            "\n"
+            "```mermaid\n"
+            "sequenceDiagram\n"
+            "    participant C as Client\n"
+            "    participant S as Server\n"
+            "    C->>S: retry\n"
+            "```\n"
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_file = Path(temp_dir) / "design.md"
+            source_file.write_text(markdown_source, encoding="utf-8")
+            proc = self._start_cli_for_source_file(source_file)
+            self.addCleanup(self._stop_process, proc)
+
+            _, url = self._wait_for_url(proc)
+            with urlopen(url, timeout=5) as response:
+                body = response.read().decode("utf-8")
+            with urlopen(f"{url}/source.mmd", timeout=5) as response:
+                source_body = response.read().decode("utf-8")
+            with urlopen(f"{url}/version", timeout=5) as response:
+                first_version = response.read().decode("utf-8")
+
+            self.assertIn("Rendering 2 Mermaid blocks", body)
+            self.assertIn('data-diagram-index="1"', body)
+            self.assertIn('data-diagram-index="2"', body)
+            self.assertIn("System Overview", body)
+            self.assertIn("Retry Flow", body)
+            self.assertIn("graph TD", body)
+            self.assertIn("sequenceDiagram", body)
+            self.assertNotIn("print(&#x27;not mermaid&#x27;)", body)
+            self.assertIn("installSourceFileRefresh", body)
+            self.assertIn("/version?ts=", body)
+            self.assertEqual(source_body, markdown_source)
+
+            time.sleep(0.01)
+            source_file.write_text(markdown_source + "\n<!-- changed -->\n", encoding="utf-8")
+            with urlopen(f"{url}/version", timeout=5) as response:
+                second_version = response.read().decode("utf-8")
+
+            self.assertNotEqual(first_version, second_version)
+
     def test_rejects_empty_input(self) -> None:
         env = os.environ.copy()
         result = subprocess.run(
@@ -97,6 +154,26 @@ class FishyCliTest(unittest.TestCase):
         proc.stdin.write(diagram)
         proc.stdin.close()
         return proc
+
+    def _start_cli_for_source_file(self, source_file: Path) -> subprocess.Popen[str]:
+        env = os.environ.copy()
+        return subprocess.Popen(
+            [
+                sys.executable,
+                str(CLI),
+                "--source-file",
+                str(source_file),
+                "--no-open",
+                "--port",
+                "0",
+            ],
+            cwd=ROOT,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 
     def _wait_for_url(self, proc: subprocess.Popen[str]) -> tuple[str, str]:
         assert proc.stdout is not None

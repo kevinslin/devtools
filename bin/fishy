@@ -2,12 +2,13 @@
 """Serve Mermaid diagrams from stdin in a local browser.
 
 Usage:
-  fishy [path] [--host HOST] [--port PORT] [--title TITLE] [--no-open]
+  fishy [path] [--source-file FILE] [--host HOST] [--port PORT] [--title TITLE] [--no-open]
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from functools import partial
 import html
 from http import HTTPStatus
@@ -22,7 +23,53 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 0
 DEFAULT_TITLE = "Fishy Mermaid Preview"
 MERMAID_MODULE_URL = "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs"
-FENCED_BLOCK_RE = re.compile(r"^(?P<fence>`{3,}|~{3,})(?P<info>[^\n`]*)$")
+FENCED_BLOCK_RE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]+|$)(?P<title>.*)$")
+
+
+@dataclass(frozen=True)
+class MermaidDiagram:
+    title: str
+    source: str
+
+
+@dataclass(frozen=True)
+class PreviewPayload:
+    diagrams: list[MermaidDiagram]
+    source: str
+    source_version: str
+    caption: str
+
+
+DIAGRAM_SECTION_TEMPLATE = """      <section class="panel diagram" data-diagram-index="{index}">
+        <div class="diagram-heading">
+          <p class="eyebrow">diagram {index}</p>
+          <h2>{title}</h2>
+        </div>
+        <div class="diagram-toolbar">
+          <div class="diagram-toolbar-group">
+            <span>View</span>
+            <strong class="diagram-zoom-label">100%</strong>
+          </div>
+          <div class="diagram-toolbar-group">
+            <button type="button" class="diagram-fit-button">Fit width</button>
+            <button type="button" class="diagram-zoom-out-button">-</button>
+            <button type="button" class="diagram-zoom-in-button">+</button>
+          </div>
+        </div>
+        <div class="diagram-viewport">
+          <div class="diagram-stage-wrap">
+            <div class="diagram-stage">
+              <pre class="mermaid">{diagram}</pre>
+            </div>
+          </div>
+        </div>
+        <details class="source-details">
+          <summary>Source</summary>
+          <pre class="source">{diagram}</pre>
+        </details>
+      </section>"""
+
 
 PAGE_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -102,12 +149,29 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       max-width: 52rem;
     }}
 
+    .diagram-list {{
+      display: grid;
+      gap: 1rem;
+    }}
+
     .diagram {{
       width: 100%;
       min-width: 0;
       padding: 0.75rem;
       display: grid;
       gap: 0.75rem;
+    }}
+
+    .diagram-heading {{
+      display: grid;
+      gap: 0.25rem;
+      padding: 0.25rem 0.35rem 0;
+    }}
+
+    .diagram-heading h2 {{
+      margin: 0;
+      font-size: 1.35rem;
+      line-height: 1.2;
     }}
 
     .diagram-toolbar {{
@@ -232,26 +296,27 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       transform: translateY(0);
     }}
 
-    details {{
-      width: min(1100px, 100%);
-      margin: 0 auto;
+    .source-details {{
+      width: 100%;
+      margin: 0;
       overflow: hidden;
+      border-top: 1px solid var(--line);
     }}
 
-    summary {{
+    .source-details summary {{
       cursor: pointer;
       list-style: none;
-      padding: 1rem 1.25rem;
+      padding: 0.85rem 0.35rem 0.15rem;
       font-weight: 600;
     }}
 
-    summary::-webkit-details-marker {{
+    .source-details summary::-webkit-details-marker {{
       display: none;
     }}
 
     .source {{
       margin: 0;
-      padding: 0 1.25rem 1.25rem;
+      padding: 0.75rem 0.35rem 0.35rem;
       white-space: pre-wrap;
       word-break: break-word;
       color: var(--muted);
@@ -274,33 +339,12 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     <section class="panel hero">
       <p class="eyebrow">fishy</p>
       <h1>{title}</h1>
-      <p class="caption">Rendering Mermaid from stdin on a local server. Mermaid runtime loads in the browser, so the preview stays local while diagram parsing happens client-side.</p>
+      <p class="caption">{caption}</p>
       <p class="caption"><a href="/source.mmd">download source</a></p>
     </section>
-    <section class="panel diagram">
-      <div class="diagram-toolbar">
-        <div class="diagram-toolbar-group">
-          <span>View</span>
-          <strong class="diagram-zoom-label" id="diagram-zoom-label">100%</strong>
-        </div>
-        <div class="diagram-toolbar-group">
-          <button type="button" id="diagram-fit-button">Fit width</button>
-          <button type="button" id="diagram-zoom-out-button">-</button>
-          <button type="button" id="diagram-zoom-in-button">+</button>
-        </div>
-      </div>
-      <div class="diagram-viewport" id="diagram-viewport">
-        <div class="diagram-stage-wrap">
-          <div class="diagram-stage" id="diagram-stage">
-            <pre class="mermaid" id="diagram-mermaid">{diagram}</pre>
-          </div>
-        </div>
-      </div>
-    </section>
-    <details class="panel">
-      <summary>Source</summary>
-      <pre class="source">{diagram}</pre>
-    </details>
+    <div class="diagram-list">
+{diagrams}
+    </div>
   </main>
   <div class="note-hover-tooltip" id="note-hover-tooltip" hidden></div>
   <script type="module">
@@ -319,21 +363,11 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     }});
 
     const tooltip = document.getElementById("note-hover-tooltip");
-    const viewport = document.getElementById("diagram-viewport");
-    const stage = document.getElementById("diagram-stage");
-    const zoomLabel = document.getElementById("diagram-zoom-label");
-    const fitButton = document.getElementById("diagram-fit-button");
-    const zoomOutButton = document.getElementById("diagram-zoom-out-button");
-    const zoomInButton = document.getElementById("diagram-zoom-in-button");
-    const mermaidRoot = document.getElementById("diagram-mermaid");
     const ZOOM_STEP = 0.15;
     const DOUBLE_CLICK_ZOOM = 1.5;
     const MIN_SCALE = 0.05;
     const MAX_SCALE = 3;
-    let diagramMetrics = null;
-    let fitScale = 1;
-    let currentScale = 1;
-    let activePan = null;
+    const SOURCE_VERSION = "{source_version}";
 
     function getNoteLabel(noteTextNode) {{
       const tspans = Array.from(noteTextNode.querySelectorAll("tspan"))
@@ -403,14 +437,14 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       }}
     }}
 
-    function installNoteHoverTooltips() {{
-      for (const textNode of document.querySelectorAll("svg .noteText")) {{
+    function installNoteHoverTooltips(root = document) {{
+      for (const textNode of root.querySelectorAll("svg .noteText")) {{
         attachNoteHover(textNode);
       }}
     }}
 
-    function setZoomLabel(scale) {{
-      zoomLabel.textContent = `${{Math.round(scale * 100)}}%`;
+    function setZoomLabel(context, scale) {{
+      context.zoomLabel.textContent = `${{Math.round(scale * 100)}}%`;
     }}
 
     function readDiagramMetrics(svg) {{
@@ -433,7 +467,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       return Math.max(MIN_SCALE, Math.min(scale, MAX_SCALE));
     }}
 
-    function getViewportPadding() {{
+    function getViewportPadding(viewport) {{
       const style = window.getComputedStyle(viewport);
       return {{
         x: (Number.parseFloat(style.paddingLeft) || 0) + (Number.parseFloat(style.paddingRight) || 0),
@@ -441,37 +475,37 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       }};
     }}
 
-    function applyScale(scale) {{
-      const svg = mermaidRoot.querySelector("svg");
-      if (!svg || !diagramMetrics) {{
+    function applyScale(context, scale) {{
+      const svg = context.mermaidRoot.querySelector("svg");
+      if (!svg || !context.diagramMetrics) {{
         return;
       }}
 
-      currentScale = clampScale(scale);
-      svg.style.width = `${{diagramMetrics.width * currentScale}}px`;
-      svg.style.height = `${{diagramMetrics.height * currentScale}}px`;
+      context.currentScale = clampScale(scale);
+      svg.style.width = `${{context.diagramMetrics.width * context.currentScale}}px`;
+      svg.style.height = `${{context.diagramMetrics.height * context.currentScale}}px`;
       svg.style.maxWidth = "none";
       svg.style.transform = "none";
-      stage.style.width = `${{diagramMetrics.width * currentScale}}px`;
-      stage.style.height = `${{diagramMetrics.height * currentScale}}px`;
-      stage.dataset.scale = currentScale.toFixed(4);
-      setZoomLabel(currentScale);
+      context.stage.style.width = `${{context.diagramMetrics.width * context.currentScale}}px`;
+      context.stage.style.height = `${{context.diagramMetrics.height * context.currentScale}}px`;
+      context.stage.dataset.scale = context.currentScale.toFixed(4);
+      setZoomLabel(context, context.currentScale);
     }}
 
-    function fitDiagram() {{
-      if (!diagramMetrics) {{
+    function fitDiagram(context) {{
+      if (!context.diagramMetrics) {{
         return;
       }}
 
-      const padding = getViewportPadding();
-      const availableWidth = Math.max(1, viewport.clientWidth - padding.x);
-      fitScale = clampScale(availableWidth / diagramMetrics.width);
-      applyScale(fitScale);
-      viewport.scrollTop = 0;
-      viewport.scrollLeft = 0;
+      const padding = getViewportPadding(context.viewport);
+      const availableWidth = Math.max(1, context.viewport.clientWidth - padding.x);
+      context.fitScale = clampScale(availableWidth / context.diagramMetrics.width);
+      applyScale(context, context.fitScale);
+      context.viewport.scrollTop = 0;
+      context.viewport.scrollLeft = 0;
     }}
 
-    function getViewportCenterPoint() {{
+    function getViewportCenterPoint(viewport) {{
       const rect = viewport.getBoundingClientRect();
       return {{
         x: rect.left + (rect.width / 2),
@@ -479,97 +513,147 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       }};
     }}
 
-    function zoomAt(scale, clientX, clientY) {{
-      const svg = mermaidRoot.querySelector("svg");
-      if (!svg || !diagramMetrics) {{
+    function zoomAt(context, scale, clientX, clientY) {{
+      const svg = context.mermaidRoot.querySelector("svg");
+      if (!svg || !context.diagramMetrics) {{
         return;
       }}
 
       const nextScale = clampScale(scale);
-      if (Math.abs(nextScale - currentScale) < 0.0001) {{
+      if (Math.abs(nextScale - context.currentScale) < 0.0001) {{
         return;
       }}
 
-      const beforeRect = stage.getBoundingClientRect();
-      const focusX = (clientX - beforeRect.left) / currentScale;
-      const focusY = (clientY - beforeRect.top) / currentScale;
-      applyScale(nextScale);
-      const afterRect = stage.getBoundingClientRect();
-      viewport.scrollLeft += (afterRect.left + (focusX * currentScale)) - clientX;
-      viewport.scrollTop += (afterRect.top + (focusY * currentScale)) - clientY;
+      const beforeRect = context.stage.getBoundingClientRect();
+      const focusX = (clientX - beforeRect.left) / context.currentScale;
+      const focusY = (clientY - beforeRect.top) / context.currentScale;
+      applyScale(context, nextScale);
+      const afterRect = context.stage.getBoundingClientRect();
+      context.viewport.scrollLeft += (afterRect.left + (focusX * context.currentScale)) - clientX;
+      context.viewport.scrollTop += (afterRect.top + (focusY * context.currentScale)) - clientY;
     }}
 
-    function zoomBy(delta) {{
-      const point = getViewportCenterPoint();
-      zoomAt(currentScale + delta, point.x, point.y);
+    function zoomBy(context, delta) {{
+      const point = getViewportCenterPoint(context.viewport);
+      zoomAt(context, context.currentScale + delta, point.x, point.y);
     }}
 
-    function endPan(event) {{
-      if (!activePan || activePan.pointerId !== event.pointerId) {{
+    function endPan(context, event) {{
+      if (!context.activePan || context.activePan.pointerId !== event.pointerId) {{
         return;
       }}
 
-      if (viewport.hasPointerCapture(event.pointerId)) {{
-        viewport.releasePointerCapture(event.pointerId);
+      if (context.viewport.hasPointerCapture(event.pointerId)) {{
+        context.viewport.releasePointerCapture(event.pointerId);
       }}
-      activePan = null;
-      viewport.classList.remove("is-panning");
+      context.activePan = null;
+      context.viewport.classList.remove("is-panning");
     }}
 
-    function installDiagramPointerControls() {{
-      viewport.addEventListener("pointerdown", (event) => {{
+    function installDiagramPointerControls(context) {{
+      context.viewport.addEventListener("pointerdown", (event) => {{
         if (event.button !== 0) {{
           return;
         }}
 
-        activePan = {{
+        context.activePan = {{
           pointerId: event.pointerId,
           startX: event.clientX,
           startY: event.clientY,
-          scrollLeft: viewport.scrollLeft,
-          scrollTop: viewport.scrollTop,
+          scrollLeft: context.viewport.scrollLeft,
+          scrollTop: context.viewport.scrollTop,
         }};
-        viewport.classList.add("is-panning");
-        viewport.setPointerCapture(event.pointerId);
+        context.viewport.classList.add("is-panning");
+        context.viewport.setPointerCapture(event.pointerId);
       }});
 
-      viewport.addEventListener("pointermove", (event) => {{
-        if (!activePan || activePan.pointerId !== event.pointerId) {{
+      context.viewport.addEventListener("pointermove", (event) => {{
+        if (!context.activePan || context.activePan.pointerId !== event.pointerId) {{
           return;
         }}
 
-        viewport.scrollLeft = activePan.scrollLeft - (event.clientX - activePan.startX);
-        viewport.scrollTop = activePan.scrollTop - (event.clientY - activePan.startY);
+        context.viewport.scrollLeft = context.activePan.scrollLeft - (event.clientX - context.activePan.startX);
+        context.viewport.scrollTop = context.activePan.scrollTop - (event.clientY - context.activePan.startY);
         hideTooltip();
         event.preventDefault();
       }});
 
-      viewport.addEventListener("pointerup", endPan);
-      viewport.addEventListener("pointercancel", endPan);
-      viewport.addEventListener("lostpointercapture", endPan);
-      viewport.addEventListener("dblclick", (event) => {{
+      context.viewport.addEventListener("pointerup", (event) => endPan(context, event));
+      context.viewport.addEventListener("pointercancel", (event) => endPan(context, event));
+      context.viewport.addEventListener("lostpointercapture", (event) => endPan(context, event));
+      context.viewport.addEventListener("dblclick", (event) => {{
         event.preventDefault();
         const nextScale = (event.altKey || event.shiftKey)
-          ? currentScale / DOUBLE_CLICK_ZOOM
-          : currentScale * DOUBLE_CLICK_ZOOM;
-        zoomAt(nextScale, event.clientX, event.clientY);
+          ? context.currentScale / DOUBLE_CLICK_ZOOM
+          : context.currentScale * DOUBLE_CLICK_ZOOM;
+        zoomAt(context, nextScale, event.clientX, event.clientY);
       }});
+    }}
+
+    function installDiagramControls(diagram) {{
+      const context = {{
+        viewport: diagram.querySelector(".diagram-viewport"),
+        stage: diagram.querySelector(".diagram-stage"),
+        zoomLabel: diagram.querySelector(".diagram-zoom-label"),
+        fitButton: diagram.querySelector(".diagram-fit-button"),
+        zoomOutButton: diagram.querySelector(".diagram-zoom-out-button"),
+        zoomInButton: diagram.querySelector(".diagram-zoom-in-button"),
+        mermaidRoot: diagram.querySelector(".mermaid"),
+        diagramMetrics: null,
+        fitScale: 1,
+        currentScale: 1,
+        activePan: null,
+      }};
+
+      if (!context.viewport || !context.stage || !context.zoomLabel || !context.mermaidRoot) {{
+        return;
+      }}
+
+      const svg = context.mermaidRoot.querySelector("svg");
+      if (!svg) {{
+        return;
+      }}
+
+      context.diagramMetrics = readDiagramMetrics(svg);
+      fitDiagram(context);
+      context.fitButton.addEventListener("click", () => fitDiagram(context));
+      context.zoomOutButton.addEventListener("click", () => zoomBy(context, -ZOOM_STEP));
+      context.zoomInButton.addEventListener("click", () => zoomBy(context, ZOOM_STEP));
+      installDiagramPointerControls(context);
+      window.addEventListener("resize", () => fitDiagram(context));
+    }}
+
+    function installSourceFileRefresh() {{
+      let latestVersion = SOURCE_VERSION;
+      const checkForChanges = async () => {{
+        try {{
+          const response = await fetch(`/version?ts=${{Date.now()}}`, {{ cache: "no-store" }});
+          if (!response.ok) {{
+            return;
+          }}
+          const nextVersion = (await response.text()).trim();
+          if (nextVersion && nextVersion !== latestVersion) {{
+            latestVersion = nextVersion;
+            window.location.reload();
+          }}
+        }} catch (_error) {{
+          // Keep the current preview if a transient poll fails.
+        }}
+      }};
+
+      window.setInterval(checkForChanges, 1000);
     }}
 
     await mermaid.run({{
       querySelector: ".mermaid",
     }});
-    const svg = mermaidRoot.querySelector("svg");
-    if (svg) {{
-      diagramMetrics = readDiagramMetrics(svg);
-      fitDiagram();
-      fitButton.addEventListener("click", fitDiagram);
-      zoomOutButton.addEventListener("click", () => zoomBy(-ZOOM_STEP));
-      zoomInButton.addEventListener("click", () => zoomBy(ZOOM_STEP));
-      installDiagramPointerControls();
-      window.addEventListener("resize", fitDiagram);
+    for (const diagram of document.querySelectorAll(".diagram")) {{
+      installDiagramControls(diagram);
     }}
-    installNoteHoverTooltips();
+    installNoteHoverTooltips(document);
+    if (SOURCE_VERSION) {{
+      installSourceFileRefresh();
+    }}
     window.addEventListener("scroll", hideTooltip, true);
     window.addEventListener("resize", hideTooltip);
   </script>
@@ -582,18 +666,79 @@ class FishyError(RuntimeError):
     """Raised when fishy cannot continue."""
 
 
+class StaticPreviewSource:
+    def __init__(self, mermaid_source: str, diagram_title: str):
+        self._payload = PreviewPayload(
+            diagrams=[MermaidDiagram(title=diagram_title, source=mermaid_source)],
+            source=mermaid_source,
+            source_version="",
+            caption=(
+                "Rendering Mermaid from stdin or a Mermaid file on a local server. "
+                "Mermaid runtime loads in the browser, so the preview stays local while "
+                "diagram parsing happens client-side."
+            ),
+        )
+
+    def read_payload(self) -> PreviewPayload:
+        return self._payload
+
+    def read_version(self) -> str:
+        return ""
+
+
+class MarkdownFilePreviewSource:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def read_payload(self) -> PreviewPayload:
+        try:
+            source = self.path.read_text(encoding="utf-8")
+            version = self.read_version()
+        except OSError as exc:
+            raise FishyError(f"failed to read Markdown source file {self.path}: {exc}") from exc
+
+        diagrams = _extract_mermaid_blocks(source, self.path)
+        return PreviewPayload(
+            diagrams=diagrams,
+            source=source,
+            source_version=version,
+            caption=(
+                f"Rendering {len(diagrams)} Mermaid block"
+                f"{'' if len(diagrams) == 1 else 's'} from {self.path}. "
+                "This preview refreshes when the source file changes."
+            ),
+        )
+
+    def read_version(self) -> str:
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return "missing"
+        return f"{stat.st_mtime_ns}:{stat.st_size}"
+
+
 class FishyHandler(BaseHTTPRequestHandler):
-    def __init__(self, *args, html_page: bytes, mermaid_source: bytes, **kwargs):
-        self._html_page = html_page
-        self._mermaid_source = mermaid_source
+    def __init__(self, *args, preview_source: StaticPreviewSource | MarkdownFilePreviewSource, title: str, **kwargs):
+        self._preview_source = preview_source
+        self._title = title
         super().__init__(*args, **kwargs)
 
     def do_GET(self) -> None:
         if self.path in {"/", "/index.html"}:
-            self._send_bytes(self._html_page, "text/html; charset=utf-8")
+            payload = self._read_payload_or_error()
+            if payload is None:
+                return
+            html_page = _build_html_page(self._title, payload).encode("utf-8")
+            self._send_bytes(html_page, "text/html; charset=utf-8")
             return
         if self.path == "/source.mmd":
-            self._send_bytes(self._mermaid_source, "text/plain; charset=utf-8")
+            payload = self._read_payload_or_error()
+            if payload is None:
+                return
+            self._send_bytes(payload.source.encode("utf-8"), "text/plain; charset=utf-8")
+            return
+        if self.path.startswith("/version"):
+            self._send_bytes(self._preview_source.read_version().encode("utf-8"), "text/plain; charset=utf-8")
             return
         if self.path == "/favicon.ico":
             self.send_response(HTTPStatus.NO_CONTENT)
@@ -605,6 +750,13 @@ class FishyHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args) -> None:
         return
 
+    def _read_payload_or_error(self) -> PreviewPayload | None:
+        try:
+            return self._preview_source.read_payload()
+        except FishyError as exc:
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+            return None
+
     def _send_bytes(self, payload: bytes, content_type: str) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
@@ -614,11 +766,15 @@ class FishyHandler(BaseHTTPRequestHandler):
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Serve a Mermaid diagram locally from stdin or a file.")
+    parser = argparse.ArgumentParser(description="Serve Mermaid diagrams locally from stdin, a file, or Markdown source.")
     parser.add_argument(
         "path",
         nargs="?",
         help="Mermaid file path. Omit or use '-' to read from stdin.",
+    )
+    parser.add_argument(
+        "--source-file",
+        help="Markdown source file to extract Mermaid code blocks from, with browser refresh on changes.",
     )
     parser.add_argument(
         "--host",
@@ -675,16 +831,103 @@ def _normalize_mermaid_source(source: str) -> str:
         opening = lines[0].strip()
         closing = lines[-1].strip()
         match = FENCED_BLOCK_RE.fullmatch(opening)
-        if match and closing == match.group("fence"):
+        if match and _is_closing_fence(closing, match.group("fence")):
             return "\n".join(lines[1:-1]).strip("\n")
 
     return source
 
 
-def _build_html_page(title: str, mermaid_source: str) -> str:
+def _is_closing_fence(line: str, opening_fence: str) -> bool:
+    stripped = line.strip()
+    fence_char = opening_fence[0]
+    return (
+        bool(stripped)
+        and set(stripped) == {fence_char}
+        and len(stripped) >= len(opening_fence)
+    )
+
+
+def _clean_heading_title(raw_title: str) -> str:
+    return re.sub(r"[ \t]+#+[ \t]*$", "", raw_title).strip()
+
+
+def _is_mermaid_info_string(info: str) -> bool:
+    normalized = info.strip().lower()
+    if not normalized:
+        return False
+    token = re.split(r"[\s,}]+", normalized.lstrip("{"), maxsplit=1)[0]
+    return token.lstrip(".") == "mermaid"
+
+
+def _extract_mermaid_blocks(markdown_source: str, source_path: Path) -> list[MermaidDiagram]:
+    diagrams: list[MermaidDiagram] = []
+    current_heading = ""
+    active_fence = ""
+    active_title = ""
+    active_is_mermaid = False
+    active_lines: list[str] = []
+
+    for line in markdown_source.splitlines():
+        if active_fence:
+            if _is_closing_fence(line, active_fence):
+                if active_is_mermaid:
+                    diagram_source = "\n".join(active_lines).strip("\n")
+                    if diagram_source.strip():
+                        diagrams.append(
+                            MermaidDiagram(
+                                title=active_title or f"Mermaid block {len(diagrams) + 1}",
+                                source=diagram_source,
+                            )
+                        )
+                active_fence = ""
+                active_title = ""
+                active_is_mermaid = False
+                active_lines = []
+                continue
+
+            if active_is_mermaid:
+                active_lines.append(line)
+            continue
+
+        fence_match = FENCED_BLOCK_RE.fullmatch(line)
+        if fence_match:
+            active_fence = fence_match.group("fence")
+            active_title = current_heading
+            active_is_mermaid = _is_mermaid_info_string(fence_match.group("info"))
+            active_lines = []
+            continue
+
+        heading_match = ATX_HEADING_RE.fullmatch(line)
+        if heading_match:
+            heading_title = _clean_heading_title(heading_match.group("title"))
+            if heading_title:
+                current_heading = heading_title
+
+    if not diagrams:
+        raise FishyError(f"no Mermaid code blocks found in {source_path}")
+
+    return diagrams
+
+
+def _render_diagram_sections(diagrams: list[MermaidDiagram]) -> str:
+    sections = []
+    for index, diagram in enumerate(diagrams, start=1):
+        sections.append(
+            DIAGRAM_SECTION_TEMPLATE.format(
+                index=index,
+                title=html.escape(diagram.title),
+                diagram=html.escape(diagram.source),
+            )
+        )
+    return "\n".join(sections)
+
+
+def _build_html_page(title: str, payload: PreviewPayload) -> str:
     return PAGE_TEMPLATE.format(
         title=html.escape(title),
-        diagram=html.escape(mermaid_source),
+        caption=html.escape(payload.caption),
+        diagrams=_render_diagram_sections(payload.diagrams),
+        source_version=html.escape(payload.source_version, quote=True),
         mermaid_url=html.escape(MERMAID_MODULE_URL, quote=True),
     )
 
@@ -700,18 +943,24 @@ def main() -> int:
     if args.port < 0 or args.port > 65535:
         print("fishy: --port must be between 0 and 65535", file=sys.stderr)
         return 1
+    if args.source_file and args.path:
+        print("fishy: pass either --source-file or a Mermaid path/stdin, not both", file=sys.stderr)
+        return 1
 
     try:
-        mermaid_source = _read_mermaid_source(args.path)
+        if args.source_file:
+            preview_source = MarkdownFilePreviewSource(Path(args.source_file).expanduser())
+        else:
+            preview_source = StaticPreviewSource(_read_mermaid_source(args.path), args.title)
+        preview_source.read_payload()
     except FishyError as exc:
         print(f"fishy: {exc}", file=sys.stderr)
         return 1
 
-    html_page = _build_html_page(args.title, mermaid_source).encode("utf-8")
     handler = partial(
         FishyHandler,
-        html_page=html_page,
-        mermaid_source=mermaid_source.encode("utf-8"),
+        preview_source=preview_source,
+        title=args.title,
     )
 
     try:
