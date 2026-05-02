@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "ctrl-tab-chrome",
+  "description": "Make Ctrl+Tab switch to the last used tab on normal web pages.",
+  "version": "0.1.0",
+  "permissions": [
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content-script.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ]
+}

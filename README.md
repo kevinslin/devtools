@@ -28,6 +28,10 @@ A bunch of useful tools. Designed by human. Made by codex.
 - 🌱 `seed`: [slack-post](docs/slack-post/usage.md); entry point `bin/slack-post`; post a plain-text message to a Slack channel with a provided token
 - 🌱 `seed`: [sshx](docs/sshx/usage.md) <img src="assets/sshx-inline.png" alt="SSH sync terminal mascot" width="24" height="24" style="vertical-align: text-bottom;" />; entry point `bin/sshx`; sync profile-selected local dotfiles plus Codex CLI config, agents, hooks, rules, and skills to a remote host with rsync or tar-over-ssh fallback, then open ssh with optional identity and SSH options
 
+## Local apps and extensions
+
+- 🌱 `seed`: [ctrl-tab-chrome](docs/ctrl-tab-chrome/usage.md); app path `apps/ctrl-tab-chrome`; local Chrome extension that makes `Ctrl+Tab` switch to the last used tab on normal web pages
+
 ## Docs layout
 
 - `docs/[tool-name]/usage.md`: CLI usage docs
