@@ -36,8 +36,67 @@ def _write_fake_exec(path: Path, *, log_path: Path, exit_code: int = 0) -> None:
     path.chmod(0o755)
 
 
+def _write_fake_tar(path: Path, *, log_path: Path, payload: bytes = b"archive") -> None:
+    path.write_text(
+        (
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "import sys\n"
+            f"Path({str(log_path)!r}).write_text("
+            "json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd()}),"
+            " encoding='utf-8')\n"
+            f"sys.stdout.buffer.write({payload!r})\n"
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _write_fake_ssh_append(
+    path: Path,
+    *,
+    log_path: Path,
+    rsync_available: bool = True,
+) -> None:
+    path.write_text(
+        (
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "import sys\n"
+            "argv = sys.argv[1:]\n"
+            "stdin_len = 0\n"
+            "if argv and 'tar -xzf' in argv[-1]:\n"
+            "    stdin_len = len(sys.stdin.buffer.read())\n"
+            "payload = {'argv': argv, 'cwd': os.getcwd(), 'stdin_len': stdin_len}\n"
+            f"log_path = Path({str(log_path)!r})\n"
+            "calls = json.loads(log_path.read_text(encoding='utf-8')) if log_path.exists() else []\n"
+            "calls.append(payload)\n"
+            "log_path.write_text(json.dumps(calls), encoding='utf-8')\n"
+            "if argv and argv[-1] == 'command -v rsync >/dev/null 2>&1':\n"
+            f"    raise SystemExit({0 if rsync_available else 1})\n"
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
 def _read_log(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_calls(path: Path) -> list[dict[str, object]]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _expected_tar_args(*paths: str) -> list[str]:
+    metadata_flags = (
+        ["--no-xattrs", "--no-mac-metadata"] if sys.platform == "darwin" else []
+    )
+    return ["-czf", "-", *metadata_flags, "--", *paths]
 
 
 class SshxCliTest(unittest.TestCase):
@@ -48,11 +107,14 @@ class SshxCliTest(unittest.TestCase):
         home: Path,
         ssh_bin: Path,
         rsync_bin: Path,
+        tar_bin: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["HOME"] = str(home)
         env["SSHX_SSH_BIN"] = str(ssh_bin)
         env["SSHX_RSYNC_BIN"] = str(rsync_bin)
+        if tar_bin is not None:
+            env["SSHX_TAR_BIN"] = str(tar_bin)
         return subprocess.run(
             [sys.executable, str(CLI), *args],
             cwd=ROOT,
@@ -239,7 +301,7 @@ class SshxCliTest(unittest.TestCase):
             _write_fake_exec(ssh_bin, log_path=ssh_log)
 
             result = self.run_cli(
-                ["devbox"],
+                ["--sync-method", "rsync", "devbox"],
                 home=home,
                 ssh_bin=ssh_bin,
                 rsync_bin=rsync_bin,
@@ -249,6 +311,110 @@ class SshxCliTest(unittest.TestCase):
             self.assertIn("rsync failed with exit code 23", result.stderr)
             self.assertTrue(rsync_log.exists())
             self.assertFalse(ssh_log.exists())
+
+    def test_auto_falls_back_to_tar_when_remote_rsync_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home = tmp_path / "home"
+            home.mkdir()
+            _write_file(home / ".zshrc", "export PATH=/usr/local/bin:$PATH\n")
+
+            rsync_log = tmp_path / "rsync.json"
+            tar_log = tmp_path / "tar.json"
+            ssh_log = tmp_path / "ssh.json"
+            rsync_bin = tmp_path / "fake-rsync"
+            tar_bin = tmp_path / "fake-tar"
+            ssh_bin = tmp_path / "fake-ssh"
+            _write_fake_exec(rsync_bin, log_path=rsync_log, exit_code=127)
+            _write_fake_tar(tar_bin, log_path=tar_log, payload=b"tar-data")
+            _write_fake_ssh_append(
+                ssh_bin,
+                log_path=ssh_log,
+                rsync_available=False,
+            )
+
+            result = self.run_cli(
+                ["devbox"],
+                home=home,
+                ssh_bin=ssh_bin,
+                rsync_bin=rsync_bin,
+                tar_bin=tar_bin,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("falling back to tar-over-ssh sync", result.stderr)
+            self.assertFalse(rsync_log.exists())
+
+            tar_payload = _read_log(tar_log)
+            self.assertEqual(Path(str(tar_payload["cwd"])).resolve(), home.resolve())
+            self.assertEqual(
+                tar_payload["argv"],
+                _expected_tar_args(".zshrc"),
+            )
+
+            ssh_calls = _read_calls(ssh_log)
+            self.assertEqual(
+                ssh_calls,
+                [
+                    {
+                        "argv": [
+                            "-n",
+                            "devbox",
+                            "command -v rsync >/dev/null 2>&1",
+                        ],
+                        "cwd": str(ROOT),
+                        "stdin_len": 0,
+                    },
+                    {
+                        "argv": [
+                            "devbox",
+                            'mkdir -p "$HOME" && tar -xzf - -C "$HOME"',
+                        ],
+                        "cwd": str(ROOT),
+                        "stdin_len": len(b"tar-data"),
+                    },
+                    {
+                        "argv": ["devbox"],
+                        "cwd": str(ROOT),
+                        "stdin_len": 0,
+                    },
+                ],
+            )
+
+    def test_tar_sync_method_skips_rsync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home = tmp_path / "home"
+            home.mkdir()
+            _write_file(home / ".gitconfig", "[user]\nname = Test User\n")
+
+            rsync_log = tmp_path / "rsync.json"
+            tar_log = tmp_path / "tar.json"
+            ssh_log = tmp_path / "ssh.json"
+            rsync_bin = tmp_path / "fake-rsync"
+            tar_bin = tmp_path / "fake-tar"
+            ssh_bin = tmp_path / "fake-ssh"
+            _write_fake_exec(rsync_bin, log_path=rsync_log, exit_code=23)
+            _write_fake_tar(tar_bin, log_path=tar_log)
+            _write_fake_ssh_append(ssh_bin, log_path=ssh_log)
+
+            result = self.run_cli(
+                ["--sync-method", "tar", "devbox", "uname", "-a"],
+                home=home,
+                ssh_bin=ssh_bin,
+                rsync_bin=rsync_bin,
+                tar_bin=tar_bin,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertFalse(rsync_log.exists())
+            tar_payload = _read_log(tar_log)
+            self.assertEqual(tar_payload["argv"], _expected_tar_args(".gitconfig"))
+            ssh_calls = _read_calls(ssh_log)
+            self.assertEqual(
+                ssh_calls[-1]["argv"],
+                ["devbox", "uname", "-a"],
+            )
 
 
 if __name__ == "__main__":

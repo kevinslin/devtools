@@ -41,13 +41,17 @@ SYNC_PROFILES = {
 }
 SSH_BIN_ENV = "SSHX_SSH_BIN"
 RSYNC_BIN_ENV = "SSHX_RSYNC_BIN"
+TAR_BIN_ENV = "SSHX_TAR_BIN"
+RSYNC_REMOTE_CHECK_COMMAND = "command -v rsync >/dev/null 2>&1"
+RSYNC_REMOTE_CHECK_TIMEOUT_SECONDS = 8
+TAR_REMOTE_EXTRACT_COMMAND = 'mkdir -p "$HOME" && tar -xzf - -C "$HOME"'
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Rsync a conservative set of local dotfiles to a remote home directory "
-            "and then open an SSH session."
+            "Sync a conservative set of local dotfiles to a remote home directory "
+            "with rsync or tar-over-ssh, then open an SSH session."
         )
     )
     parser.add_argument(
@@ -93,7 +97,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="print the rsync and ssh commands without running them",
+        help="print the sync and ssh commands without running them",
+    )
+    parser.add_argument(
+        "--sync-method",
+        choices=("auto", "rsync", "tar"),
+        default="auto",
+        help=(
+            "sync with rsync, tar-over-ssh, or auto fallback from rsync to tar "
+            "when remote rsync is unavailable"
+        ),
     )
     parser.add_argument(
         "host",
@@ -171,6 +184,10 @@ def _rsync_binary() -> str:
     return os.environ.get(RSYNC_BIN_ENV, "rsync")
 
 
+def _tar_binary() -> str:
+    return os.environ.get(TAR_BIN_ENV, "tar")
+
+
 def _ssh_command(
     *,
     identity_files: list[str],
@@ -187,6 +204,10 @@ def _ssh_command(
     return command
 
 
+def _ssh_no_stdin_command(ssh_base: list[str]) -> list[str]:
+    return [ssh_base[0], "-n", *ssh_base[1:]]
+
+
 def _trim_remote_command(remote_command: list[str]) -> list[str]:
     if remote_command and remote_command[0] == "--":
         return remote_command[1:]
@@ -195,6 +216,156 @@ def _trim_remote_command(remote_command: list[str]) -> list[str]:
 
 def _format_relative_rsync_path(path: Path) -> str:
     return f"./{path.as_posix()}"
+
+
+def _format_relative_tar_path(path: Path) -> str:
+    return path.as_posix()
+
+
+def _build_rsync_command(
+    *,
+    ssh_base: list[str],
+    sync_paths: list[Path],
+    host: str,
+) -> list[str]:
+    return [
+        _rsync_binary(),
+        "-az",
+        "--relative",
+        "-e",
+        shlex.join(ssh_base),
+        *[_format_relative_rsync_path(path) for path in sync_paths],
+        f"{host}:~/",
+    ]
+
+
+def _build_tar_create_command(*, sync_paths: list[Path]) -> list[str]:
+    return [
+        _tar_binary(),
+        "-czf",
+        "-",
+        *_tar_metadata_flags(),
+        "--",
+        *[_format_relative_tar_path(path) for path in sync_paths],
+    ]
+
+
+def _build_tar_extract_command(*, ssh_base: list[str], host: str) -> list[str]:
+    return [
+        *ssh_base,
+        host,
+        TAR_REMOTE_EXTRACT_COMMAND,
+    ]
+
+
+def _tar_metadata_flags() -> list[str]:
+    if sys.platform == "darwin":
+        return ["--no-xattrs", "--no-mac-metadata"]
+    return []
+
+
+def _tar_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    env["COPYFILE_DISABLE"] = "1"
+    return env
+
+
+def _run_rsync_sync(*, rsync_command: list[str], home: Path) -> int | None:
+    try:
+        rsync_result = subprocess.run(
+            rsync_command,
+            cwd=home,
+            check=False,
+        )
+    except OSError as exc:
+        print(f"warning: failed to run rsync: {exc}", file=sys.stderr)
+        return None
+    return rsync_result.returncode
+
+
+def _remote_rsync_available(*, ssh_base: list[str], host: str) -> bool | None:
+    try:
+        result = subprocess.run(
+            [*_ssh_no_stdin_command(ssh_base), host, RSYNC_REMOTE_CHECK_COMMAND],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=RSYNC_REMOTE_CHECK_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            "warning: remote rsync check timed out; falling back to tar-over-ssh sync",
+            file=sys.stderr,
+        )
+        return False
+    except OSError as exc:
+        print(f"warning: failed to check remote rsync: {exc}", file=sys.stderr)
+        return None
+
+    if result.returncode == 0:
+        return True
+    if result.returncode in (1, 127):
+        print(
+            "warning: remote rsync unavailable; falling back to tar-over-ssh sync",
+            file=sys.stderr,
+        )
+        return False
+    return None
+
+
+def _run_tar_sync(
+    *,
+    tar_create_command: list[str],
+    tar_extract_command: list[str],
+    home: Path,
+) -> int:
+    try:
+        tar_process = subprocess.Popen(
+            tar_create_command,
+            cwd=home,
+            env=_tar_environment(),
+            stdout=subprocess.PIPE,
+        )
+    except OSError as exc:
+        print(f"error: failed to run tar: {exc}", file=sys.stderr)
+        return 1
+
+    assert tar_process.stdout is not None
+    try:
+        ssh_result = subprocess.run(
+            tar_extract_command,
+            stdin=tar_process.stdout,
+            check=False,
+        )
+    except OSError as exc:
+        tar_process.stdout.close()
+        tar_process.wait()
+        print(f"error: failed to run ssh for tar sync: {exc}", file=sys.stderr)
+        return 1
+
+    tar_process.stdout.close()
+    tar_returncode = tar_process.wait()
+    if ssh_result.returncode != 0:
+        print(
+            f"error: tar-over-ssh extract failed with exit code {ssh_result.returncode}",
+            file=sys.stderr,
+        )
+        return ssh_result.returncode
+    if tar_returncode != 0:
+        print(
+            f"error: tar archive creation failed with exit code {tar_returncode}",
+            file=sys.stderr,
+        )
+        return tar_returncode
+    return 0
+
+
+def _format_tar_pipeline(
+    *,
+    tar_create_command: list[str],
+    tar_extract_command: list[str],
+) -> str:
+    return f"{shlex.join(tar_create_command)} | {shlex.join(tar_extract_command)}"
 
 
 def _run(argv: list[str]) -> int:
@@ -219,37 +390,69 @@ def _run(argv: list[str]) -> int:
     )
     remote_command = _trim_remote_command(args.remote_command)
 
-    rsync_command = [
-        _rsync_binary(),
-        "-az",
-        "--relative",
-        "-e",
-        shlex.join(ssh_base),
-        *[_format_relative_rsync_path(path) for path in sync_paths],
-        f"{args.host}:~/",
-    ]
+    rsync_command = _build_rsync_command(
+        ssh_base=ssh_base,
+        sync_paths=sync_paths,
+        host=args.host,
+    )
+    tar_create_command = _build_tar_create_command(sync_paths=sync_paths)
+    tar_extract_command = _build_tar_extract_command(
+        ssh_base=ssh_base,
+        host=args.host,
+    )
     ssh_command = [*ssh_base, args.host, *remote_command]
 
     if args.dry_run:
-        print(shlex.join(rsync_command))
+        if args.sync_method in ("auto", "rsync"):
+            print(shlex.join(rsync_command))
+        if args.sync_method in ("auto", "tar"):
+            print(
+                _format_tar_pipeline(
+                    tar_create_command=tar_create_command,
+                    tar_extract_command=tar_extract_command,
+                )
+            )
         print(shlex.join(ssh_command))
         return 0
 
-    try:
-        rsync_result = subprocess.run(
-            rsync_command,
-            cwd=home,
-            check=False,
+    synced = False
+    if args.sync_method in ("auto", "rsync"):
+        remote_rsync_available = True
+        if args.sync_method == "auto":
+            remote_rsync_available = _remote_rsync_available(
+                ssh_base=ssh_base,
+                host=args.host,
+            )
+
+        if remote_rsync_available is not False:
+            rsync_returncode = _run_rsync_sync(
+                rsync_command=rsync_command,
+                home=home,
+            )
+            if rsync_returncode == 0:
+                synced = True
+            elif args.sync_method == "auto" and rsync_returncode in (None, 127):
+                print(
+                    "warning: rsync unavailable; falling back to tar-over-ssh sync",
+                    file=sys.stderr,
+                )
+            else:
+                if rsync_returncode is None:
+                    return 1
+                print(
+                    f"error: rsync failed with exit code {rsync_returncode}",
+                    file=sys.stderr,
+                )
+                return rsync_returncode
+
+    if not synced:
+        tar_returncode = _run_tar_sync(
+            tar_create_command=tar_create_command,
+            tar_extract_command=tar_extract_command,
+            home=home,
         )
-    except OSError as exc:
-        print(f"error: failed to run rsync: {exc}", file=sys.stderr)
-        return 1
-    if rsync_result.returncode != 0:
-        print(
-            f"error: rsync failed with exit code {rsync_result.returncode}",
-            file=sys.stderr,
-        )
-        return rsync_result.returncode
+        if tar_returncode != 0:
+            return tar_returncode
 
     try:
         ssh_result = subprocess.run(

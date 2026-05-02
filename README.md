@@ -25,7 +25,7 @@ A bunch of useful tools. Designed by human. Made by codex.
 - 🌱 `seed`: [epoch](docs/epoch/usage.md); entry point `bin/epoch`; convert an epoch timestamp into UTC, local, and relative time
 - 🌱 `seed`: [jwtio](docs/jwtio/usage.md); entry point `bin/jwtio`; decode a JWT from stdin into pretty JSON showing the header, payload, and signature fields
 - 🌱 `seed`: [slack-post](docs/slack-post/usage.md); entry point `bin/slack-post`; post a plain-text message to a Slack channel with a provided token
-- 🌱 `seed`: [sshx](docs/sshx/usage.md) <img src="assets/sshx-inline.png" alt="SSH sync terminal mascot" width="24" height="24" style="vertical-align: text-bottom;" />; entry point `bin/sshx`; sync profile-selected local dotfiles plus Codex CLI config, agents, hooks, rules, and skills to a remote host with rsync, then open ssh with optional identity and SSH options
+- 🌱 `seed`: [sshx](docs/sshx/usage.md) <img src="assets/sshx-inline.png" alt="SSH sync terminal mascot" width="24" height="24" style="vertical-align: text-bottom;" />; entry point `bin/sshx`; sync profile-selected local dotfiles plus Codex CLI config, agents, hooks, rules, and skills to a remote host with rsync or tar-over-ssh fallback, then open ssh with optional identity and SSH options
 
 ## Docs layout
 
