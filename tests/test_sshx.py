@@ -141,6 +141,7 @@ class SshxCliTest(unittest.TestCase):
         ssh_bin: Path,
         rsync_bin: Path,
         tar_bin: Path | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["HOME"] = str(home)
@@ -148,6 +149,8 @@ class SshxCliTest(unittest.TestCase):
         env["SSHX_RSYNC_BIN"] = str(rsync_bin)
         if tar_bin is not None:
             env["SSHX_TAR_BIN"] = str(tar_bin)
+        if extra_env is not None:
+            env.update(extra_env)
         return subprocess.run(
             [sys.executable, str(CLI), *args],
             cwd=ROOT,
@@ -293,6 +296,59 @@ class SshxCliTest(unittest.TestCase):
             self.assertNotIn("./.zshrc", rsync_payload["argv"])
             self.assertIn("./.gitconfig", rsync_payload["argv"])
             self.assertIn("./.codex/config.toml", rsync_payload["argv"])
+
+    def test_profile_paths_can_be_loaded_from_yaml_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home = tmp_path / "home"
+            home.mkdir()
+            _write_file(home / ".custom-default", "default\n")
+            _write_file(home / ".custom-work", "work\n")
+            config_path = tmp_path / "config.yaml"
+            _write_file(
+                config_path,
+                (
+                    "profiles:\n"
+                    "  default:\n"
+                    "    - .custom-default\n"
+                    "  work:\n"
+                    "    - .custom-work\n"
+                ),
+            )
+
+            rsync_bin = tmp_path / "fake-rsync"
+            ssh_bin = tmp_path / "fake-ssh"
+
+            default_result = self.run_cli(
+                ["--dry-run", "--sync-method", "rsync", "devbox"],
+                home=home,
+                ssh_bin=ssh_bin,
+                rsync_bin=rsync_bin,
+                extra_env={"SSHX_CONFIG_PATH": str(config_path)},
+            )
+
+            self.assertEqual(default_result.returncode, 0, msg=default_result.stderr)
+            self.assertIn("./.custom-default", default_result.stdout)
+            self.assertNotIn("./.custom-work", default_result.stdout)
+
+            work_result = self.run_cli(
+                [
+                    "--dry-run",
+                    "--sync-method",
+                    "rsync",
+                    "--profile",
+                    "work",
+                    "devbox",
+                ],
+                home=home,
+                ssh_bin=ssh_bin,
+                rsync_bin=rsync_bin,
+                extra_env={"SSHX_CONFIG_PATH": str(config_path)},
+            )
+
+            self.assertEqual(work_result.returncode, 0, msg=work_result.stderr)
+            self.assertIn("./.custom-work", work_result.stdout)
+            self.assertNotIn("./.custom-default", work_result.stdout)
 
     def test_missing_explicit_path_returns_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

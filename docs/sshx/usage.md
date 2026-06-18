@@ -18,14 +18,16 @@ sshx [--profile NAME] [--sync-method auto|rsync|tar] [-i PATH] [-o KEY=VALUE] [-
 
 ## Profiles
 
-`sshx` uses the `default` profile unless you pass `--profile`.
+`sshx` reads profile path lists from `config/sshx/config.yaml` and uses the `default` profile unless you pass `--profile`.
 
-- `default`: syncs the default sync set below.
-- `work`: syncs the same default sync set except `.zshrc`.
+- `default`: syncs the paths listed under `profiles.default`.
+- `work`: syncs the paths listed under `profiles.work`; currently this is the default profile minus `.zshrc`.
 
-## Default Sync Set
+For tests or local experiments, set `SSHX_CONFIG_PATH=/path/to/config.yaml` to load a different config file.
 
-By default, `sshx` syncs the dotfiles and config directories below if they exist under your local home directory:
+## Default Profile
+
+The `default` profile syncs the dotfiles and config directories below if they exist under your local home directory:
 
 - `.bashrc`
 - `.codex/agents`
@@ -39,13 +41,37 @@ By default, `sshx` syncs the dotfiles and config directories below if they exist
 - `.zprofile`
 - `.zshenv`
 - `.zshrc`
-- `.zshrc.dots`
 - `.gitconfig`
 - `.git.scmbrc`
 - `.scmbrc`
 - `.tmux.conf`
 - `.vimrc`
-- `.vimrc.plugins`
+- `.config/fish`
+- `.config/git`
+- `.config/iterm2`
+- `.config/nvim`
+- `.config/uv`
+
+## Work Profile
+
+The `work` profile syncs the dotfiles and config directories below if they exist under your local home directory:
+
+- `.bashrc`
+- `.codex/agents`
+- `.codex/config.toml`
+- `.codex/hooks`
+- `.codex/hooks.json`
+- `.codex/rules`
+- `.codex/skills`
+- `.profile`
+- `.zlogin`
+- `.zprofile`
+- `.zshenv`
+- `.gitconfig`
+- `.git.scmbrc`
+- `.scmbrc`
+- `.tmux.conf`
+- `.vimrc`
 - `.config/fish`
 - `.config/git`
 - `.config/iterm2`
@@ -59,7 +85,7 @@ It intentionally skips secret-heavy paths like `.ssh`, Codex auth state such as 
 - `-i, --identity-file PATH`: pass an SSH identity file to both `rsync` and `ssh`.
 - `-o, --option KEY=VALUE`: pass an SSH `-o` option to both `rsync` and `ssh`.
 - `-p, --port PORT`: pass a custom SSH port to both `rsync` and `ssh`.
-- `--profile NAME`: select a sync profile. Available profiles: `default`, `work`.
+- `--profile NAME`: select a sync profile from `config/sshx/config.yaml`. Available bundled profiles: `default`, `work`.
 - `--sync-method auto|rsync|tar`: choose the sync transport. `auto` checks whether the remote has `rsync`, uses it when available, and falls back to `tar` over SSH when it is missing.
 - `--path RELATIVE_PATH`: add another home-relative file or directory to sync.
 - `--no-defaults`: sync only the paths you provide with `--path`.
