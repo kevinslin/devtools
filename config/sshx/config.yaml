@@ -12,7 +12,6 @@ profiles:
     - .zprofile
     - .zshenv
     - .zshrc
-    - .gitconfig
     - .git.scmbrc
     - .scmbrc
     - .tmux.conf
@@ -34,7 +33,6 @@ profiles:
     - .zlogin
     - .zprofile
     - .zshenv
-    - .gitconfig
     - .git.scmbrc
     - .scmbrc
     - .tmux.conf

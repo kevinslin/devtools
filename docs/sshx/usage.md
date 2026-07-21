@@ -23,6 +23,8 @@ sshx [--profile NAME] [--sync-method auto|rsync|tar] [-i PATH] [-o KEY=VALUE] [-
 - `default`: syncs the paths listed under `profiles.default`.
 - `work`: syncs the paths listed under `profiles.work`; currently this is the default profile minus `.zshrc`.
 
+Neither bundled profile syncs the home-level `.gitconfig`. Put portable Git configuration under `.config/git`, which both profiles continue to sync.
+
 For tests or local experiments, set `SSHX_CONFIG_PATH=/path/to/config.yaml` to load a different config file.
 
 ## Default Profile
@@ -41,7 +43,6 @@ The `default` profile syncs the dotfiles and config directories below if they ex
 - `.zprofile`
 - `.zshenv`
 - `.zshrc`
-- `.gitconfig`
 - `.git.scmbrc`
 - `.scmbrc`
 - `.tmux.conf`
@@ -67,7 +68,6 @@ The `work` profile syncs the dotfiles and config directories below if they exist
 - `.zlogin`
 - `.zprofile`
 - `.zshenv`
-- `.gitconfig`
 - `.git.scmbrc`
 - `.scmbrc`
 - `.tmux.conf`

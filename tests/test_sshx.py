@@ -173,6 +173,10 @@ class SshxCliTest(unittest.TestCase):
             _write_file(home / ".codex" / "skills" / "demo" / "SKILL.md", "# demo\n")
             _write_file(home / ".zshrc", "export PATH=/usr/local/bin:$PATH\n")
             _write_file(home / ".gitconfig", "[user]\nname = Test User\n")
+            _write_file(
+                home / ".config" / "git" / "config",
+                "[init]\ndefaultBranch = main\n",
+            )
             _write_file(home / ".config" / "nvim" / "init.lua", "vim.o.number = true\n")
 
             rsync_log = tmp_path / "rsync.json"
@@ -204,7 +208,8 @@ class SshxCliTest(unittest.TestCase):
             self.assertIn("./.codex/hooks.json", rsync_payload["argv"])
             self.assertIn("./.codex/rules", rsync_payload["argv"])
             self.assertIn("./.codex/skills", rsync_payload["argv"])
-            self.assertIn("./.gitconfig", rsync_payload["argv"])
+            self.assertNotIn("./.gitconfig", rsync_payload["argv"])
+            self.assertIn("./.config/git", rsync_payload["argv"])
             self.assertIn("./.config/nvim", rsync_payload["argv"])
             self.assertEqual(rsync_payload["argv"][-1], "devbox:~/")
 
@@ -274,6 +279,10 @@ class SshxCliTest(unittest.TestCase):
             home.mkdir()
             _write_file(home / ".zshrc", "export PATH=/usr/local/bin:$PATH\n")
             _write_file(home / ".gitconfig", "[user]\nname = Work User\n")
+            _write_file(
+                home / ".config" / "git" / "config",
+                "[init]\ndefaultBranch = main\n",
+            )
             _write_file(home / ".codex" / "config.toml", "model = \"gpt-5\"\n")
 
             rsync_log = tmp_path / "rsync.json"
@@ -294,7 +303,8 @@ class SshxCliTest(unittest.TestCase):
 
             rsync_payload = _read_log(rsync_log)
             self.assertNotIn("./.zshrc", rsync_payload["argv"])
-            self.assertIn("./.gitconfig", rsync_payload["argv"])
+            self.assertNotIn("./.gitconfig", rsync_payload["argv"])
+            self.assertIn("./.config/git", rsync_payload["argv"])
             self.assertIn("./.codex/config.toml", rsync_payload["argv"])
 
     def test_profile_paths_can_be_loaded_from_yaml_config(self) -> None:
@@ -507,7 +517,10 @@ class SshxCliTest(unittest.TestCase):
             tmp_path = Path(tmp)
             home = tmp_path / "home"
             home.mkdir()
-            _write_file(home / ".gitconfig", "[user]\nname = Test User\n")
+            _write_file(
+                home / ".config" / "git" / "config",
+                "[init]\ndefaultBranch = main\n",
+            )
 
             rsync_log = tmp_path / "rsync.json"
             tar_log = tmp_path / "tar.json"
@@ -530,7 +543,7 @@ class SshxCliTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertFalse(rsync_log.exists())
             tar_payload = _read_log(tar_log)
-            self.assertEqual(tar_payload["argv"], _expected_tar_args(".gitconfig"))
+            self.assertEqual(tar_payload["argv"], _expected_tar_args(".config/git"))
             ssh_calls = _read_calls(ssh_log)
             self.assertEqual(
                 ssh_calls[-1]["argv"],
