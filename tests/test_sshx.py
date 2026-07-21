@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -102,7 +104,7 @@ def _write_fake_ssh_append(
             "import sys\n"
             "argv = sys.argv[1:]\n"
             "stdin_len = 0\n"
-            "if argv and 'tar -xzf' in argv[-1]:\n"
+            "if argv and ('tar -xzf' in argv[-1] or '.zshrc.local.sshx.' in argv[-1]):\n"
             "    stdin_len = len(sys.stdin.buffer.read())\n"
             "payload = {'argv': argv, 'cwd': os.getcwd(), 'stdin_len': stdin_len}\n"
             f"log_path = Path({str(log_path)!r})\n"
@@ -117,6 +119,36 @@ def _write_fake_ssh_append(
     path.chmod(0o755)
 
 
+def _write_fake_ssh_remote(path: Path, *, remote_home: Path) -> None:
+    path.write_text(
+        (
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "import subprocess\n"
+            "import sys\n"
+            f"remote_home = Path({str(remote_home)!r})\n"
+            "argv = sys.argv[1:]\n"
+            "if not argv or len(argv) == 1:\n"
+            "    raise SystemExit(0)\n"
+            "command = argv[-1]\n"
+            "if command == 'command -v rsync >/dev/null 2>&1':\n"
+            "    raise SystemExit(1)\n"
+            "env = os.environ.copy()\n"
+            "env['HOME'] = str(remote_home)\n"
+            "result = subprocess.run(\n"
+            "    ['zsh', '-c', command],\n"
+            "    stdin=sys.stdin.buffer,\n"
+            "    env=env,\n"
+            "    check=False,\n"
+            ")\n"
+            "raise SystemExit(result.returncode)\n"
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
 def _read_log(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -125,11 +157,20 @@ def _read_calls(path: Path) -> list[dict[str, object]]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _expected_tar_args(*paths: str) -> list[str]:
+def _expected_tar_args(*paths: str, excludes: tuple[str, ...] = ()) -> list[str]:
     metadata_flags = (
         ["--no-xattrs", "--no-mac-metadata"] if sys.platform == "darwin" else []
     )
-    return ["-czf", "-", *metadata_flags, "--", *paths]
+    return [
+        "-czhf",
+        "-",
+        *metadata_flags,
+        "--exclude=*.sock",
+        "--exclude=*.socket",
+        *[f"--exclude={path}" for path in excludes],
+        "--",
+        *paths,
+    ]
 
 
 class SshxCliTest(unittest.TestCase):
@@ -184,7 +225,7 @@ class SshxCliTest(unittest.TestCase):
             rsync_bin = tmp_path / "fake-rsync"
             ssh_bin = tmp_path / "fake-ssh"
             _write_fake_exec(rsync_bin, log_path=rsync_log)
-            _write_fake_exec(ssh_bin, log_path=ssh_log)
+            _write_fake_ssh_append(ssh_bin, log_path=ssh_log)
 
             result = self.run_cli(
                 ["-i", "/tmp/custom-key", "devbox"],
@@ -201,7 +242,7 @@ class SshxCliTest(unittest.TestCase):
                 rsync_payload["argv"][:4],
                 ["-az", "--relative", "-e", f"{ssh_bin} -i /tmp/custom-key"],
             )
-            self.assertIn("./.zshrc", rsync_payload["argv"])
+            self.assertNotIn("./.zshrc", rsync_payload["argv"])
             self.assertIn("./.codex/agents", rsync_payload["argv"])
             self.assertIn("./.codex/config.toml", rsync_payload["argv"])
             self.assertIn("./.codex/hooks", rsync_payload["argv"])
@@ -213,9 +254,24 @@ class SshxCliTest(unittest.TestCase):
             self.assertIn("./.config/nvim", rsync_payload["argv"])
             self.assertEqual(rsync_payload["argv"][-1], "devbox:~/")
 
-            ssh_payload = _read_log(ssh_log)
+            ssh_calls = _read_calls(ssh_log)
             self.assertEqual(
-                ssh_payload["argv"],
+                ssh_calls[0]["argv"],
+                [
+                    "-n",
+                    "-i",
+                    "/tmp/custom-key",
+                    "devbox",
+                    "command -v rsync >/dev/null 2>&1",
+                ],
+            )
+            self.assertIn(".zshrc.local.sshx.", ssh_calls[1]["argv"][-1])
+            self.assertEqual(
+                ssh_calls[1]["stdin_len"],
+                len((ROOT / "config" / "sshx" / "zshrc.remote.local").read_bytes()),
+            )
+            self.assertEqual(
+                ssh_calls[2]["argv"],
                 ["-i", "/tmp/custom-key", "devbox"],
             )
 
@@ -272,7 +328,7 @@ class SshxCliTest(unittest.TestCase):
                 ["devbox", "uname", "-a"],
             )
 
-    def test_work_profile_excludes_zshrc_from_default_paths(self) -> None:
+    def test_work_profile_uses_safe_overlay_instead_of_local_zshrc(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             home = tmp_path / "home"
@@ -290,7 +346,7 @@ class SshxCliTest(unittest.TestCase):
             rsync_bin = tmp_path / "fake-rsync"
             ssh_bin = tmp_path / "fake-ssh"
             _write_fake_exec(rsync_bin, log_path=rsync_log)
-            _write_fake_exec(ssh_bin, log_path=ssh_log)
+            _write_fake_ssh_append(ssh_bin, log_path=ssh_log)
 
             result = self.run_cli(
                 ["--profile", "work", "devbox"],
@@ -306,6 +362,9 @@ class SshxCliTest(unittest.TestCase):
             self.assertNotIn("./.gitconfig", rsync_payload["argv"])
             self.assertIn("./.config/git", rsync_payload["argv"])
             self.assertIn("./.codex/config.toml", rsync_payload["argv"])
+            ssh_calls = _read_calls(ssh_log)
+            self.assertIn(".zshrc.local.sshx.", ssh_calls[-2]["argv"][-1])
+            self.assertGreater(ssh_calls[-2]["stdin_len"], 0)
 
     def test_profile_paths_can_be_loaded_from_yaml_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -385,12 +444,261 @@ class SshxCliTest(unittest.TestCase):
             self.assertFalse(rsync_log.exists())
             self.assertFalse(ssh_log.exists())
 
+    def test_direct_zshrc_sync_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home = tmp_path / "home"
+            home.mkdir()
+            _write_file(home / ".zshrc", "alias unsafe='true'\n")
+
+            result = self.run_cli(
+                ["--no-defaults", "--path", ".zshrc", "devbox"],
+                home=home,
+                ssh_bin=tmp_path / "fake-ssh",
+                rsync_bin=tmp_path / "fake-rsync",
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("direct .zshrc sync is disabled", result.stderr)
+
+    def test_zsh_overlay_validation_rejects_unsafe_content(self) -> None:
+        unsafe_lines = (
+            'export OPENAI_API_KEY="not-a-real-key"',
+            'typeset -g OPENAI_API_KEY="not-a-real-key"',
+            'export openai_api_key="not-a-real-key"',
+            'export SSH_AUTH_SOCK="$HOME/local-agent.sock"',
+            'source "/Users/test/.zshrc.local"',
+        )
+        for unsafe_line in unsafe_lines:
+            with self.subTest(unsafe_line=unsafe_line), tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                home = tmp_path / "home"
+                home.mkdir()
+                config_path = tmp_path / "config.yaml"
+                overlay_path = tmp_path / "zshrc.remote.local"
+                _write_file(
+                    config_path,
+                    "profiles:\n  default:\n    - '@zsh-overlay'\n",
+                )
+                _write_file(
+                    overlay_path,
+                    f"typeset -g SSHX_ZSHRC_LOCAL_LOADED=1\n{unsafe_line}\n",
+                )
+
+                result = self.run_cli(
+                    ["devbox"],
+                    home=home,
+                    ssh_bin=tmp_path / "fake-ssh",
+                    rsync_bin=tmp_path / "fake-rsync",
+                    extra_env={
+                        "SSHX_CONFIG_PATH": str(config_path),
+                        "SSHX_ZSH_OVERLAY_PATH": str(overlay_path),
+                    },
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid zsh overlay", result.stderr)
+
+    def test_zsh_overlay_requires_uncommented_sentinel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home = tmp_path / "home"
+            home.mkdir()
+            config_path = tmp_path / "config.yaml"
+            overlay_path = tmp_path / "zshrc.remote.local"
+            _write_file(
+                config_path,
+                "profiles:\n  default:\n    - '@zsh-overlay'\n",
+            )
+            _write_file(overlay_path, "# typeset -g SSHX_ZSHRC_LOCAL_LOADED=1\n")
+
+            result = self.run_cli(
+                ["devbox"],
+                home=home,
+                ssh_bin=tmp_path / "fake-ssh",
+                rsync_bin=tmp_path / "fake-rsync",
+                extra_env={
+                    "SSHX_CONFIG_PATH": str(config_path),
+                    "SSHX_ZSH_OVERLAY_PATH": str(overlay_path),
+                },
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "missing 'typeset -g SSHX_ZSHRC_LOCAL_LOADED=1'",
+                result.stderr,
+            )
+
+    def test_zsh_overlay_merges_files_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home = tmp_path / "home"
+            remote_home = tmp_path / "remote-home"
+            home.mkdir()
+            remote_home.mkdir()
+            base_zshrc = (
+                "alias before='true'\n"
+                '[[ -r "$HOME/.zshrc.local" ]] && source "$HOME/.zshrc.local"\n'
+                "alias after='true'\n"
+            )
+            remote_local = "typeset -g REMOTE_ONLY=1\n"
+            _write_file(remote_home / ".zshrc", base_zshrc)
+            _write_file(remote_home / ".zshrc.local", remote_local)
+            config_path = tmp_path / "config.yaml"
+            overlay_path = tmp_path / "zshrc.remote.local"
+            _write_file(
+                config_path,
+                "profiles:\n  default:\n    - '@zsh-overlay'\n",
+            )
+            _write_file(
+                overlay_path,
+                (
+                    "typeset -g SSHX_ZSHRC_LOCAL_LOADED=1\n"
+                    "[[ -o interactive ]] || return 0\n"
+                    "alias dex='codex --profile gen'\n"
+                ),
+            )
+
+            ssh_bin = tmp_path / "fake-ssh"
+            _write_fake_ssh_remote(ssh_bin, remote_home=remote_home)
+            environment = {
+                "SSHX_CONFIG_PATH": str(config_path),
+                "SSHX_ZSH_OVERLAY_PATH": str(overlay_path),
+            }
+
+            first_result: tuple[bytes, bytes] | None = None
+            for attempt in range(2):
+                result = self.run_cli(
+                    ["--sync-method", "tar", "devbox", "true"],
+                    home=home,
+                    ssh_bin=ssh_bin,
+                    rsync_bin=tmp_path / "fake-rsync",
+                    extra_env=environment,
+                )
+                self.assertEqual(result.returncode, 0, msg=result.stderr)
+                current_result = (
+                    (remote_home / ".zshrc").read_bytes(),
+                    (remote_home / ".zshrc.local").read_bytes(),
+                )
+                if attempt == 0:
+                    first_result = current_result
+                else:
+                    self.assertEqual(current_result, first_result)
+
+            remote_zshrc = (remote_home / ".zshrc").read_text(encoding="utf-8")
+            self.assertIn("alias before", remote_zshrc)
+            self.assertIn("alias after", remote_zshrc)
+            self.assertEqual(remote_zshrc.count("# >>> sshx zshrc.local >>>"), 1)
+            self.assertEqual(remote_zshrc.count("source \"$HOME/.zshrc.local\""), 1)
+            self.assertTrue(
+                remote_zshrc.rstrip().endswith("# <<< sshx zshrc.local <<<")
+            )
+            merged_overlay = (remote_home / ".zshrc.local").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("typeset -g REMOTE_ONLY=1", merged_overlay)
+            self.assertIn("# >>> sshx managed overlay >>>", merged_overlay)
+            self.assertIn("alias dex='codex --profile gen'", merged_overlay)
+            self.assertEqual(
+                (remote_home / ".zshrc.sshx-base").read_text(encoding="utf-8"),
+                base_zshrc,
+            )
+            self.assertEqual(
+                (remote_home / ".zshrc.local.sshx-base").read_text(
+                    encoding="utf-8"
+                ),
+                remote_local,
+            )
+            self.assertEqual(
+                stat.S_IMODE((remote_home / ".zshrc.local").stat().st_mode),
+                0o600,
+            )
+            self.assertEqual(
+                stat.S_IMODE((remote_home / ".zshrc.sshx-base").stat().st_mode),
+                0o600,
+            )
+            self.assertFalse((remote_home / ".zshrc.sshx-replaced").exists())
+
+            shell_env = os.environ.copy()
+            shell_env["HOME"] = str(remote_home)
+            sourced = subprocess.run(
+                [
+                    "zsh",
+                    "-fc",
+                    'source "$HOME/.zshrc"; [[ "$SSHX_ZSHRC_LOCAL_LOADED" == 1 ]]',
+                ],
+                env=shell_env,
+                check=False,
+            )
+            self.assertEqual(sourced.returncode, 0)
+
+    def test_zsh_overlay_rejects_reversed_markers_and_symlinks(self) -> None:
+        scenarios = ("reversed-markers", "symlink")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                home = tmp_path / "home"
+                remote_home = tmp_path / "remote-home"
+                home.mkdir()
+                remote_home.mkdir()
+                _write_file(remote_home / ".zshrc", "alias base='true'\n")
+                config_path = tmp_path / "config.yaml"
+                overlay_path = tmp_path / "zshrc.remote.local"
+                _write_file(
+                    config_path,
+                    "profiles:\n  default:\n    - '@zsh-overlay'\n",
+                )
+                _write_file(
+                    overlay_path,
+                    "typeset -g SSHX_ZSHRC_LOCAL_LOADED=1\n",
+                )
+
+                if scenario == "reversed-markers":
+                    original = (
+                        "typeset -g REMOTE_ONLY=1\n"
+                        "# <<< sshx managed overlay <<<\n"
+                        "keep=this\n"
+                        "# >>> sshx managed overlay >>>\n"
+                    )
+                    _write_file(remote_home / ".zshrc.local", original)
+                else:
+                    target = remote_home / "managed-elsewhere.zsh"
+                    _write_file(target, "typeset -g REMOTE_ONLY=1\n")
+                    (remote_home / ".zshrc.local").symlink_to(target.name)
+
+                ssh_bin = tmp_path / "fake-ssh"
+                _write_fake_ssh_remote(ssh_bin, remote_home=remote_home)
+                result = self.run_cli(
+                    ["--sync-method", "tar", "devbox", "true"],
+                    home=home,
+                    ssh_bin=ssh_bin,
+                    rsync_bin=tmp_path / "fake-rsync",
+                    extra_env={
+                        "SSHX_CONFIG_PATH": str(config_path),
+                        "SSHX_ZSH_OVERLAY_PATH": str(overlay_path),
+                    },
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                if scenario == "reversed-markers":
+                    self.assertIn("malformed sshx managed block", result.stderr)
+                    self.assertEqual(
+                        (remote_home / ".zshrc.local").read_text(encoding="utf-8"),
+                        original,
+                    )
+                else:
+                    self.assertIn("refusing to replace a symlinked", result.stderr)
+                    self.assertTrue((remote_home / ".zshrc.local").is_symlink())
+
     def test_rsync_failure_stops_before_ssh(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             home = tmp_path / "home"
             home.mkdir()
-            _write_file(home / ".zshrc", "export PATH=/usr/local/bin:$PATH\n")
+            _write_file(
+                home / ".config" / "git" / "config",
+                "[init]\ndefaultBranch = main\n",
+            )
 
             rsync_log = tmp_path / "rsync.json"
             ssh_log = tmp_path / "ssh.json"
@@ -416,7 +724,10 @@ class SshxCliTest(unittest.TestCase):
             tmp_path = Path(tmp)
             home = tmp_path / "home"
             home.mkdir()
-            _write_file(home / ".zshrc", "export PATH=/usr/local/bin:$PATH\n")
+            _write_file(
+                home / ".config" / "git" / "config",
+                "[init]\ndefaultBranch = main\n",
+            )
 
             rsync_log = tmp_path / "rsync.json"
             rsync_state = tmp_path / "rsync-count.txt"
@@ -429,7 +740,7 @@ class SshxCliTest(unittest.TestCase):
                 state_path=rsync_state,
                 initial_exit_code=255,
             )
-            _write_fake_exec(ssh_bin, log_path=ssh_log)
+            _write_fake_ssh_append(ssh_bin, log_path=ssh_log)
 
             result = self.run_cli(
                 ["--sync-method", "rsync", "devbox"],
@@ -448,7 +759,10 @@ class SshxCliTest(unittest.TestCase):
             tmp_path = Path(tmp)
             home = tmp_path / "home"
             home.mkdir()
-            _write_file(home / ".zshrc", "export PATH=/usr/local/bin:$PATH\n")
+            _write_file(
+                home / ".config" / "git" / "config",
+                "[init]\ndefaultBranch = main\n",
+            )
 
             rsync_log = tmp_path / "rsync.json"
             tar_log = tmp_path / "tar.json"
@@ -480,37 +794,25 @@ class SshxCliTest(unittest.TestCase):
             self.assertEqual(Path(str(tar_payload["cwd"])).resolve(), home.resolve())
             self.assertEqual(
                 tar_payload["argv"],
-                _expected_tar_args(".zshrc"),
+                _expected_tar_args(".config/git"),
             )
 
             ssh_calls = _read_calls(ssh_log)
+            self.assertEqual(len(ssh_calls), 4)
             self.assertEqual(
-                ssh_calls,
-                [
-                    {
-                        "argv": [
-                            "-n",
-                            "devbox",
-                            "command -v rsync >/dev/null 2>&1",
-                        ],
-                        "cwd": str(ROOT),
-                        "stdin_len": 0,
-                    },
-                    {
-                        "argv": [
-                            "devbox",
-                            'mkdir -p "$HOME" && tar -xzf - -C "$HOME"',
-                        ],
-                        "cwd": str(ROOT),
-                        "stdin_len": len(b"tar-data"),
-                    },
-                    {
-                        "argv": ["devbox"],
-                        "cwd": str(ROOT),
-                        "stdin_len": 0,
-                    },
-                ],
+                ssh_calls[0]["argv"],
+                ["-n", "devbox", "command -v rsync >/dev/null 2>&1"],
             )
+            self.assertEqual(
+                ssh_calls[1]["argv"],
+                ["devbox", 'mkdir -p "$HOME" && tar -xzf - -C "$HOME"'],
+            )
+            self.assertIn(".zshrc.local.sshx.", ssh_calls[2]["argv"][-1])
+            self.assertEqual(
+                ssh_calls[2]["stdin_len"],
+                len((ROOT / "config" / "sshx" / "zshrc.remote.local").read_bytes()),
+            )
+            self.assertEqual(ssh_calls[3]["argv"], ["devbox"])
 
     def test_tar_sync_method_skips_rsync(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -548,6 +850,50 @@ class SshxCliTest(unittest.TestCase):
             self.assertEqual(
                 ssh_calls[-1]["argv"],
                 ["devbox", "uname", "-a"],
+            )
+
+    def test_tar_sync_dereferences_symlinks_and_excludes_sockets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home = tmp_path / "home"
+            home.mkdir()
+            _write_file(home / ".config" / "tool" / "settings.json", "{}\n")
+            socket_path = home / ".config" / "tool" / "runtime.sock"
+
+            rsync_bin = tmp_path / "fake-rsync"
+            tar_log = tmp_path / "tar.json"
+            tar_bin = tmp_path / "fake-tar"
+            ssh_log = tmp_path / "ssh.json"
+            ssh_bin = tmp_path / "fake-ssh"
+            _write_fake_exec(rsync_bin, log_path=tmp_path / "rsync.json")
+            _write_fake_tar(tar_bin, log_path=tar_log)
+            _write_fake_ssh_append(ssh_bin, log_path=ssh_log)
+
+            with socket.socket(socket.AF_UNIX) as unix_socket:
+                unix_socket.bind(str(socket_path))
+                result = self.run_cli(
+                    [
+                        "--sync-method",
+                        "tar",
+                        "--no-defaults",
+                        "--path",
+                        ".config/tool",
+                        "devbox",
+                    ],
+                    home=home,
+                    ssh_bin=ssh_bin,
+                    rsync_bin=rsync_bin,
+                    tar_bin=tar_bin,
+                )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            tar_payload = _read_log(tar_log)
+            self.assertEqual(
+                tar_payload["argv"],
+                _expected_tar_args(
+                    ".config/tool",
+                    excludes=(".config/tool/runtime.sock",),
+                ),
             )
 
 

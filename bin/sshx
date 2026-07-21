@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 from pathlib import Path
+import re
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -15,10 +18,35 @@ import time
 DEFAULT_CONFIG_PATH = (
     Path(__file__).resolve().parents[1] / "config" / "sshx" / "config.yaml"
 )
+DEFAULT_ZSH_OVERLAY_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "config"
+    / "sshx"
+    / "zshrc.remote.local"
+)
 SSHX_CONFIG_ENV = "SSHX_CONFIG_PATH"
+SSHX_ZSH_OVERLAY_ENV = "SSHX_ZSH_OVERLAY_PATH"
 SSH_BIN_ENV = "SSHX_SSH_BIN"
 RSYNC_BIN_ENV = "SSHX_RSYNC_BIN"
 TAR_BIN_ENV = "SSHX_TAR_BIN"
+TAR_SOCKET_NAME_EXCLUDES = ("*.sock", "*.socket")
+ZSH_OVERLAY_ENTRY = "@zsh-overlay"
+ZSH_OVERLAY_SENTINEL = "typeset -g SSHX_ZSHRC_LOCAL_LOADED=1"
+ZSH_HOOK_START = "# >>> sshx zshrc.local >>>"
+ZSH_HOOK_SOURCE = '[[ -r "$HOME/.zshrc.local" ]] && source "$HOME/.zshrc.local"'
+ZSH_HOOK_END = "# <<< sshx zshrc.local <<<"
+ZSH_OVERLAY_START = "# >>> sshx managed overlay >>>"
+ZSH_OVERLAY_END = "# <<< sshx managed overlay <<<"
+SENSITIVE_SHELL_VARIABLE_RE = re.compile(
+    r"(?:API_KEY|CREDENTIAL|PASSWORD|PRIVATE_KEY|SECRET|TOKEN)",
+    re.IGNORECASE,
+)
+SHELL_ASSIGNMENT_RE = re.compile(
+    r"^\s*(?:(?:export|typeset)(?:\s+-[A-Za-z]+)*\s+)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*="
+)
+PROTECTED_REMOTE_VARIABLES = {"HOME", "PNPM_HOME", "SSH_AUTH_SOCK"}
+MACHINE_LOCAL_ZSH_PATHS = ("/Users/", "/opt/homebrew/", "/Library/")
 RSYNC_RETRY_EXIT_CODE = 255
 RSYNC_RETRY_DELAY_SECONDS = 1
 RSYNC_REMOTE_CHECK_COMMAND = "command -v rsync >/dev/null 2>&1"
@@ -104,6 +132,13 @@ def _profile_config_path() -> Path:
     if raw:
         return Path(raw).expanduser().resolve()
     return DEFAULT_CONFIG_PATH
+
+
+def _zsh_overlay_path() -> Path:
+    raw = os.environ.get(SSHX_ZSH_OVERLAY_ENV)
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return DEFAULT_ZSH_OVERLAY_PATH
 
 
 def _strip_yaml_comment(line: str) -> str:
@@ -226,12 +261,23 @@ def _resolve_sync_paths(
 
     if include_defaults:
         for raw in default_paths:
+            if raw == ZSH_OVERLAY_ENTRY:
+                add(Path(ZSH_OVERLAY_ENTRY))
+                continue
             relative = _normalize_relative_path(raw, home=home)
+            if relative == Path(".zshrc"):
+                raise ValueError(
+                    "direct .zshrc sync is disabled; use @zsh-overlay instead"
+                )
             if (home / relative).exists():
                 add(relative)
 
     for raw in extra_paths:
         relative = _normalize_relative_path(raw, home=home)
+        if relative == Path(".zshrc"):
+            raise ValueError(
+                "direct .zshrc sync is disabled; use a profile with @zsh-overlay"
+            )
         candidate = home / relative
         if not candidate.exists():
             raise ValueError(f"missing local path: {candidate}")
@@ -243,6 +289,45 @@ def _resolve_sync_paths(
         )
 
     return selected
+
+
+def _load_zsh_overlay(path: Path) -> bytes:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"failed to read zsh overlay {path}: {exc}") from exc
+
+    if not any(line.strip() == ZSH_OVERLAY_SENTINEL for line in text.splitlines()):
+        raise ValueError(
+            f"invalid zsh overlay {path}: missing {ZSH_OVERLAY_SENTINEL!r}"
+        )
+
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if line.strip() in (ZSH_OVERLAY_START, ZSH_OVERLAY_END):
+            raise ValueError(
+                f"invalid zsh overlay {path}: line {line_number} uses a "
+                "reserved sshx marker"
+            )
+        assignment = SHELL_ASSIGNMENT_RE.match(line)
+        if assignment:
+            variable = assignment.group(1)
+            if variable.upper() in PROTECTED_REMOTE_VARIABLES:
+                raise ValueError(
+                    f"invalid zsh overlay {path}: line {line_number} overrides "
+                    f"protected remote variable {variable}"
+                )
+            if SENSITIVE_SHELL_VARIABLE_RE.search(variable):
+                raise ValueError(
+                    f"invalid zsh overlay {path}: line {line_number} assigns "
+                    f"sensitive variable {variable}"
+                )
+        if any(prefix in line for prefix in MACHINE_LOCAL_ZSH_PATHS):
+            raise ValueError(
+                f"invalid zsh overlay {path}: line {line_number} contains a "
+                "machine-local path"
+            )
+
+    return text.encode("utf-8")
 
 
 def _ssh_binary() -> str:
@@ -308,12 +393,52 @@ def _build_rsync_command(
     ]
 
 
-def _build_tar_create_command(*, sync_paths: list[Path]) -> list[str]:
+def _find_socket_paths(*, home: Path, sync_paths: list[Path]) -> list[Path]:
+    sockets: list[Path] = []
+
+    for relative in sync_paths:
+        candidate = home / relative
+        try:
+            if stat.S_ISSOCK(candidate.lstat().st_mode):
+                sockets.append(relative)
+                continue
+        except OSError:
+            continue
+
+        if not candidate.is_dir() or candidate.is_symlink():
+            continue
+
+        for directory, directory_names, file_names in os.walk(
+            candidate,
+            followlinks=False,
+        ):
+            directory_path = Path(directory)
+            for name in [*directory_names, *file_names]:
+                nested = directory_path / name
+                try:
+                    if stat.S_ISSOCK(nested.lstat().st_mode):
+                        sockets.append(nested.relative_to(home))
+                except OSError:
+                    continue
+
+    return sockets
+
+
+def _build_tar_create_command(*, home: Path, sync_paths: list[Path]) -> list[str]:
+    socket_excludes = [
+        f"--exclude={path.as_posix()}"
+        for path in _find_socket_paths(home=home, sync_paths=sync_paths)
+    ]
+    socket_name_excludes = [
+        f"--exclude={pattern}" for pattern in TAR_SOCKET_NAME_EXCLUDES
+    ]
     return [
         _tar_binary(),
-        "-czf",
+        "-czhf",
         "-",
         *_tar_metadata_flags(),
+        *socket_name_excludes,
+        *socket_excludes,
         "--",
         *[_format_relative_tar_path(path) for path in sync_paths],
     ]
@@ -325,6 +450,119 @@ def _build_tar_extract_command(*, ssh_base: list[str], host: str) -> list[str]:
         host,
         TAR_REMOTE_EXTRACT_COMMAND,
     ]
+
+
+def _build_zsh_overlay_install_command(
+    *,
+    ssh_base: list[str],
+    host: str,
+    overlay_digest: str,
+) -> list[str]:
+    remote_command = f'''set -eu
+umask 077
+rc="$HOME/.zshrc"
+overlay="$HOME/.zshrc.local"
+fragment_tmp="$(mktemp "$HOME/.zshrc.local.sshx.fragment.XXXXXX")"
+merged_tmp="$(mktemp "$HOME/.zshrc.local.sshx.merged.XXXXXX")"
+rc_tmp="$(mktemp "$HOME/.zshrc.sshx.XXXXXX")"
+trap 'rm -f "$fragment_tmp" "$merged_tmp" "$rc_tmp"' 0 1 2 15
+if [ -L "$rc" ] || [ -L "$overlay" ]; then
+  echo "error: refusing to replace a symlinked .zshrc or .zshrc.local" >&2
+  exit 1
+fi
+cat > "$fragment_tmp"
+chmod 600 "$fragment_tmp"
+
+digest_file() {{
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{{print $1}}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{{print $1}}'
+  fi
+}}
+
+if [ "$(digest_file "$fragment_tmp")" != "{overlay_digest}" ]; then
+  echo "error: zsh overlay checksum mismatch" >&2
+  exit 1
+fi
+
+overlay_start='{ZSH_OVERLAY_START}'
+overlay_end='{ZSH_OVERLAY_END}'
+if [ -e "$overlay" ]; then
+  marker_state="$(awk -v start="$overlay_start" -v end="$overlay_end" '
+    $0 == start {{
+      if (seen_start || seen_end) invalid=1
+      seen_start=1
+    }}
+    $0 == end {{
+      if (!seen_start || seen_end) invalid=1
+      seen_end=1
+    }}
+    END {{
+      if (invalid || seen_start != seen_end) print "invalid"
+      else if (seen_start) print "managed"
+      else print "none"
+    }}
+  ' "$overlay")"
+  if [ "$marker_state" = "invalid" ]; then
+    echo "error: malformed sshx managed block in $overlay" >&2
+    exit 1
+  fi
+  if [ ! -e "$HOME/.zshrc.local.sshx-base" ]; then
+    cp -p "$overlay" "$HOME/.zshrc.local.sshx-base"
+    chmod 600 "$HOME/.zshrc.local.sshx-base"
+  fi
+  awk -v start="$overlay_start" -v end="$overlay_end" '
+    $0 == start {{ managed=1; next }}
+    $0 == end {{ managed=0; next }}
+    !managed {{ print }}
+  ' "$overlay" | awk '
+    NF {{ last=NR }}
+    {{ lines[NR]=$0 }}
+    END {{ for (line=1; line<=last; line++) print lines[line] }}
+  ' > "$merged_tmp"
+fi
+printf '\n%s\n' "$overlay_start" >> "$merged_tmp"
+cat "$fragment_tmp" >> "$merged_tmp"
+printf '\n%s\n' "$overlay_end" >> "$merged_tmp"
+chmod 600 "$merged_tmp"
+if [ ! -e "$overlay" ] || [ "$(digest_file "$overlay")" != "$(digest_file "$merged_tmp")" ]; then
+  mv "$merged_tmp" "$overlay"
+else
+  chmod 600 "$overlay"
+fi
+
+if [ ! -e "$rc" ]; then
+  : > "$rc"
+  chmod 600 "$rc"
+fi
+hook_start='{ZSH_HOOK_START}'
+hook_source='{ZSH_HOOK_SOURCE}'
+hook_end='{ZSH_HOOK_END}'
+expected_tail="$(printf '%s\n%s\n%s' "$hook_start" "$hook_source" "$hook_end")"
+current_tail="$(tail -n 3 "$rc" 2>/dev/null || true)"
+if [ "$current_tail" != "$expected_tail" ]; then
+  if [ ! -e "$HOME/.zshrc.sshx-base" ]; then
+    cp -p "$rc" "$HOME/.zshrc.sshx-base"
+    chmod 600 "$HOME/.zshrc.sshx-base"
+  fi
+  awk \
+    -v hook_start="$hook_start" \
+    -v hook_source="$hook_source" \
+    -v hook_end="$hook_end" \
+    '$0 != hook_start && $0 != hook_source && $0 != hook_end {{ print }}' \
+    "$rc" > "$rc_tmp"
+  printf '\n%s\n%s\n%s\n' \
+    "$hook_start" \
+    "$hook_source" \
+    "$hook_end" >> "$rc_tmp"
+  chmod 600 "$rc_tmp"
+  mv "$rc_tmp" "$rc"
+fi
+
+trap - 0 1 2 15
+'''
+    return [*ssh_base, host, remote_command]
 
 
 def _tar_metadata_flags() -> list[str]:
@@ -447,6 +685,28 @@ def _run_tar_sync(
     return 0
 
 
+def _run_zsh_overlay_install(
+    *,
+    install_command: list[str],
+    overlay: bytes,
+) -> int:
+    try:
+        result = subprocess.run(
+            install_command,
+            input=overlay,
+            check=False,
+        )
+    except OSError as exc:
+        print(f"error: failed to install zsh overlay: {exc}", file=sys.stderr)
+        return 1
+    if result.returncode != 0:
+        print(
+            f"error: zsh overlay install failed with exit code {result.returncode}",
+            file=sys.stderr,
+        )
+    return result.returncode
+
+
 def _format_tar_pipeline(
     *,
     tar_create_command: list[str],
@@ -476,6 +736,19 @@ def _run(argv: list[str]) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    use_zsh_overlay = Path(ZSH_OVERLAY_ENTRY) in sync_paths
+    sync_paths = [path for path in sync_paths if path != Path(ZSH_OVERLAY_ENTRY)]
+
+    zsh_overlay: bytes | None = None
+    zsh_overlay_path: Path | None = None
+    if use_zsh_overlay:
+        zsh_overlay_path = _zsh_overlay_path()
+        try:
+            zsh_overlay = _load_zsh_overlay(zsh_overlay_path)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
     ssh_base = _ssh_command(
         identity_files=args.identity_file,
         options=args.option,
@@ -483,33 +756,57 @@ def _run(argv: list[str]) -> int:
     )
     remote_command = _trim_remote_command(args.remote_command)
 
-    rsync_command = _build_rsync_command(
-        ssh_base=ssh_base,
-        sync_paths=sync_paths,
-        host=args.host,
-    )
-    tar_create_command = _build_tar_create_command(sync_paths=sync_paths)
-    tar_extract_command = _build_tar_extract_command(
-        ssh_base=ssh_base,
-        host=args.host,
-    )
+    rsync_command = None
+    tar_create_command = None
+    tar_extract_command = None
+    if sync_paths:
+        rsync_command = _build_rsync_command(
+            ssh_base=ssh_base,
+            sync_paths=sync_paths,
+            host=args.host,
+        )
+        tar_create_command = _build_tar_create_command(
+            home=home,
+            sync_paths=sync_paths,
+        )
+        tar_extract_command = _build_tar_extract_command(
+            ssh_base=ssh_base,
+            host=args.host,
+        )
+
+    zsh_overlay_install_command = None
+    if zsh_overlay is not None:
+        zsh_overlay_install_command = _build_zsh_overlay_install_command(
+            ssh_base=ssh_base,
+            host=args.host,
+            overlay_digest=hashlib.sha256(zsh_overlay).hexdigest(),
+        )
     ssh_command = [*ssh_base, args.host, *remote_command]
 
     if args.dry_run:
-        if args.sync_method in ("auto", "rsync"):
+        if rsync_command is not None and args.sync_method in ("auto", "rsync"):
             print(shlex.join(rsync_command))
-        if args.sync_method in ("auto", "tar"):
+        if (
+            tar_create_command is not None
+            and tar_extract_command is not None
+            and args.sync_method in ("auto", "tar")
+        ):
             print(
                 _format_tar_pipeline(
                     tar_create_command=tar_create_command,
                     tar_extract_command=tar_extract_command,
                 )
             )
+        if zsh_overlay_install_command is not None and zsh_overlay_path is not None:
+            print(
+                f"{shlex.join(zsh_overlay_install_command)} "
+                f"< {shlex.quote(str(zsh_overlay_path))}"
+            )
         print(shlex.join(ssh_command))
         return 0
 
-    synced = False
-    if args.sync_method in ("auto", "rsync"):
+    synced = not sync_paths
+    if sync_paths and args.sync_method in ("auto", "rsync"):
         remote_rsync_available = True
         if args.sync_method == "auto":
             remote_rsync_available = _remote_rsync_available(
@@ -539,6 +836,8 @@ def _run(argv: list[str]) -> int:
                 return rsync_returncode
 
     if not synced:
+        assert tar_create_command is not None
+        assert tar_extract_command is not None
         tar_returncode = _run_tar_sync(
             tar_create_command=tar_create_command,
             tar_extract_command=tar_extract_command,
@@ -546,6 +845,14 @@ def _run(argv: list[str]) -> int:
         )
         if tar_returncode != 0:
             return tar_returncode
+
+    if zsh_overlay_install_command is not None and zsh_overlay is not None:
+        overlay_returncode = _run_zsh_overlay_install(
+            install_command=zsh_overlay_install_command,
+            overlay=zsh_overlay,
+        )
+        if overlay_returncode != 0:
+            return overlay_returncode
 
     try:
         ssh_result = subprocess.run(

@@ -1,5 +1,6 @@
 profiles:
   default:
+    - '@zsh-overlay'
     - .bashrc
     - .codex/agents
     - .codex/config.toml
@@ -11,7 +12,6 @@ profiles:
     - .zlogin
     - .zprofile
     - .zshenv
-    - .zshrc
     - .git.scmbrc
     - .scmbrc
     - .tmux.conf
@@ -22,6 +22,7 @@ profiles:
     - .config/nvim
     - .config/uv
   work:
+    - '@zsh-overlay'
     - .bashrc
     - .codex/agents
     - .codex/config.toml
