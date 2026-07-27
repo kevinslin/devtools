@@ -1,7 +1,9 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"cozy/internal/admin"
 	"cozy/internal/config"
 )
 
@@ -109,6 +112,30 @@ func siteResponse(t *testing.T, m *Manager, host string) (int, string) {
 		t.Fatalf("read routed site %s: %v", host, err)
 	}
 	return resp.StatusCode, string(body)
+}
+
+func adminResponse(t *testing.T, m *Manager, method, path, body, host, origin string) (int, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(method, "http://"+m.State().Addr+path, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("construct admin request: %v", err)
+	}
+	req.Host = host
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request embedded admin %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read embedded admin response: %v", err)
+	}
+	return resp.StatusCode, data
 }
 
 func sleepingSite(name string) config.Site {
@@ -777,5 +804,269 @@ func TestConcurrentControlRequestsPreserveRoutesAndState(t *testing.T) {
 	case err := <-failures:
 		t.Fatalf("concurrent route or state failure: %v", err)
 	default:
+	}
+}
+
+func TestAdminHostServesDashboardAndCuratedSites(t *testing.T) {
+	dir := shortTempDir(t)
+	m := startTestManager(t, config.Config{Version: 1, Sites: []config.Site{
+		sleepingSite("fishy.localhost"),
+	}}, dir)
+	status, body := adminResponse(t, m, http.MethodGet, "/", "",
+		"cozy.localhost:8080", "")
+	if status != http.StatusOK || !strings.Contains(strings.ToLower(string(body)), "<!doctype html") {
+		t.Fatalf("embedded admin dashboard = status %d, body %q", status, body)
+	}
+	status, body = adminResponse(t, m, http.MethodGet, "/api/sites", "",
+		"cozy.localhost:8080", "")
+	if status != http.StatusOK {
+		t.Fatalf("embedded site API = status %d, body %q", status, body)
+	}
+	var response struct {
+		Sites []admin.Site `json:"sites"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatalf("decode embedded site API: %v", err)
+	}
+	if len(response.Sites) != 1 || response.Sites[0].Name != "fishy.localhost" ||
+		response.Sites[0].PID != stateSite(t, m.State(), "fishy.localhost").PID {
+		t.Fatalf("embedded site API returned unexpected sites: %+v", response.Sites)
+	}
+	for _, secret := range []string{m.State().Token, "control_path", "control.sock"} {
+		if strings.Contains(string(body), secret) {
+			t.Fatalf("embedded admin site API exposed private supervisor data %q", secret)
+		}
+	}
+	if status, body := siteResponse(t, m, "fishy.localhost"); status != http.StatusOK ||
+		!strings.Contains(body, "fishy.localhost") {
+		t.Fatalf("admin host interrupted existing site: status %d, body %q", status, body)
+	}
+}
+
+func TestAdminAPIRestartsOnlyRequestedSite(t *testing.T) {
+	dir := shortTempDir(t)
+	m := startTestManager(t, config.Config{Version: 1, Sites: []config.Site{
+		sleepingSite("fishy.localhost"), sleepingSite("pond.localhost"),
+	}}, dir)
+	before := m.State()
+	status, body := adminResponse(t, m, http.MethodPost,
+		"/api/sites/pond.localhost/restart", "{}",
+		"cozy.localhost", "http://cozy.localhost")
+	if status != http.StatusOK || !strings.Contains(string(body), "pond.localhost") {
+		t.Fatalf("admin targeted restart = status %d, body %q", status, body)
+	}
+	after := m.State()
+	if after.PID != before.PID || after.Addr != before.Addr {
+		t.Fatalf("admin restart interrupted the proxy supervisor: before %+v; after %+v", before, after)
+	}
+	if got, want := stateSite(t, after, "fishy.localhost").PID,
+		stateSite(t, before, "fishy.localhost").PID; got != want {
+		t.Fatalf("admin restart interrupted Fishy: PID %d, want %d", got, want)
+	}
+	if stateSite(t, after, "pond.localhost").PID == stateSite(t, before, "pond.localhost").PID {
+		t.Fatal("admin restart did not replace the requested site")
+	}
+	for _, name := range []string{"fishy.localhost", "pond.localhost"} {
+		if status, body := siteResponse(t, m, name); status != http.StatusOK ||
+			!strings.Contains(body, name) {
+			t.Fatalf("admin restart disrupted %s: status %d, body %q", name, status, body)
+		}
+	}
+}
+
+func TestAdminAPIAddSitePersistsConfigurationAndStartsBackend(t *testing.T) {
+	dir := shortTempDir(t)
+	path := filepath.Join(dir, "cozy.yaml")
+	initial := []config.Site{sleepingSite("fishy.localhost")}
+	writeSiteConfig(t, path, initial)
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original = append([]byte("# Preserve this user comment.\n"), original...)
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := startConfiguredTestManager(t, config.Config{Version: 1, Sites: initial}, dir, path)
+	before := m.State()
+	payload, err := json.Marshal(admin.Site{
+		Name: "garden.localhost", Run: testHTTPCommand("garden.localhost"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, body := adminResponse(t, m, http.MethodPost, "/api/sites",
+		string(payload), "cozy.localhost", "http://cozy.localhost")
+	if status != http.StatusCreated {
+		t.Fatalf("admin add site = status %d, body %q", status, body)
+	}
+	after := m.State()
+	if stateSite(t, after, "fishy.localhost").PID != stateSite(t, before, "fishy.localhost").PID {
+		t.Fatal("adding a site interrupted Fishy")
+	}
+	garden := stateSite(t, after, "garden.localhost")
+	if garden.URL != "http://garden.localhost" || garden.PID <= 0 {
+		t.Fatalf("new site did not receive runtime metadata: %+v", garden)
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read persisted site configuration: %v", err)
+	}
+	if !bytes.HasPrefix(updated, original) {
+		t.Fatalf("adding a site did not preserve original configuration and comments: %q", updated)
+	}
+	loaded, err := config.Load(path)
+	if err != nil || len(loaded.Sites) != 2 || loaded.Sites[1].Name != "garden.localhost" {
+		t.Fatalf("new site was not persisted as valid YAML: %+v, error %v", loaded, err)
+	}
+	if status, body := siteResponse(t, m, "garden.localhost"); status != http.StatusOK ||
+		!strings.Contains(body, "garden.localhost") {
+		t.Fatalf("new site did not boot: status %d, body %q", status, body)
+	}
+}
+
+func TestAdminAPIAddFailureRollsBackConfigurationAndSites(t *testing.T) {
+	dir := shortTempDir(t)
+	path := filepath.Join(dir, "cozy.yaml")
+	initial := []config.Site{sleepingSite("fishy.localhost")}
+	writeSiteConfig(t, path, initial)
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := startConfiguredTestManager(t, config.Config{Version: 1, Sites: initial}, dir, path)
+	before := m.State()
+	payload, err := json.Marshal(admin.Site{
+		Name: "broken.localhost", Run: "printf 'backend failed\\n' >&2; exit 42",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, body := adminResponse(t, m, http.MethodPost, "/api/sites",
+		string(payload), "cozy.localhost", "http://cozy.localhost")
+	if status != http.StatusInternalServerError || !strings.Contains(string(body), "broken.localhost") {
+		t.Fatalf("expected actionable site startup failure: status %d, body %q", status, body)
+	}
+	restored, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(restored, original) {
+		t.Fatalf("failed site add did not restore original configuration: %q, error %v", restored, err)
+	}
+	after := m.State()
+	if len(after.Sites) != 1 ||
+		stateSite(t, after, "fishy.localhost").PID != stateSite(t, before, "fishy.localhost").PID {
+		t.Fatalf("failed site add disrupted original site state: before %+v; after %+v", before, after)
+	}
+	if status, _ := siteResponse(t, m, "broken.localhost"); status != http.StatusNotFound {
+		t.Fatalf("failed site add published a broken route: status %d", status)
+	}
+	if status, body := siteResponse(t, m, "fishy.localhost"); status != http.StatusOK ||
+		!strings.Contains(body, "fishy.localhost") {
+		t.Fatalf("failed site add disrupted Fishy: status %d, body %q", status, body)
+	}
+}
+
+func TestAdminAPIRejectsCrossOriginAndReservedSites(t *testing.T) {
+	dir := shortTempDir(t)
+	path := filepath.Join(dir, "cozy.yaml")
+	initial := []config.Site{sleepingSite("fishy.localhost")}
+	writeSiteConfig(t, path, initial)
+	m := startConfiguredTestManager(t, config.Config{Version: 1, Sites: initial}, dir, path)
+	before := m.State()
+	payload, err := json.Marshal(admin.Site{
+		Name: "garden.localhost", Run: testHTTPCommand("garden.localhost"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, body := adminResponse(t, m, http.MethodPost, "/api/sites",
+		string(payload), "cozy.localhost", "http://untrusted.localhost")
+	if status != http.StatusForbidden {
+		t.Fatalf("admin accepted cross-origin mutation: status %d, body %q", status, body)
+	}
+	reserved, err := json.Marshal(admin.Site{
+		Name: "cozy.localhost", Run: testHTTPCommand("cozy.localhost"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, body = adminResponse(t, m, http.MethodPost, "/api/sites",
+		string(reserved), "cozy.localhost", "http://cozy.localhost")
+	if status != http.StatusBadRequest || !strings.Contains(string(body), "reserved") {
+		t.Fatalf("admin accepted its reserved hostname: status %d, body %q", status, body)
+	}
+	if got := stateSite(t, m.State(), "fishy.localhost").PID; got != stateSite(t, before, "fishy.localhost").PID {
+		t.Fatalf("rejected admin mutation interrupted Fishy: PID %d", got)
+	}
+	if len(m.State().Sites) != 1 {
+		t.Fatalf("rejected admin mutation changed configured sites: %+v", m.State().Sites)
+	}
+}
+
+func TestManagerAddSiteRespectsCancellationAndReservedHostname(t *testing.T) {
+	dir := shortTempDir(t)
+	m := startTestManager(t, config.Config{Version: 1, Sites: []config.Site{
+		sleepingSite("fishy.localhost"),
+	}}, dir)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := m.AddSite(ctx, admin.Site{
+		Name: "garden.localhost", Run: testHTTPCommand("garden.localhost"),
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("site add did not respect cancellation: %v", err)
+	}
+	if err := m.AddSite(context.Background(), admin.Site{
+		Name: "cozy.localhost", Run: testHTTPCommand("cozy.localhost"),
+	}); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("site add accepted reserved admin host: %v", err)
+	}
+	if err := m.RestartSite(ctx, "fishy.localhost"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("site restart did not respect cancellation: %v", err)
+	}
+}
+
+func TestStartRejectsReservedAdminHostname(t *testing.T) {
+	dir := shortTempDir(t)
+	_, err := Start(config.Config{Version: 1, Sites: []config.Site{{
+		Name: "cozy.localhost", URL: "http://cozy.localhost",
+		Run: testHTTPCommand("cozy.localhost"),
+	}}}, Options{Addr: "127.0.0.1:0", StateDir: dir})
+	if err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("manager accepted reserved admin hostname: %v", err)
+	}
+	if _, err := LoadState(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reserved admin hostname created runtime state: %v", err)
+	}
+}
+
+func TestDefaultProxyAddressUsesUnprivilegedPort8080(t *testing.T) {
+	if defaultProxyAddress != "127.0.0.1:8080" {
+		t.Fatalf("default proxy address = %q, want 127.0.0.1:8080", defaultProxyAddress)
+	}
+	probe, err := net.Listen("tcp", defaultProxyAddress)
+	if err != nil {
+		t.Skipf("the default listener is already in use: %v", err)
+	}
+	if err := probe.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dir := shortTempDir(t)
+	m, err := Start(config.Config{Version: 1, Sites: []config.Site{
+		sleepingSite("fishy.localhost"),
+	}}, Options{StateDir: dir})
+	if err != nil {
+		if errors.Is(err, syscall.EADDRINUSE) {
+			t.Skipf("another service acquired the default listener: %v", err)
+		}
+		t.Fatalf("start default unprivileged proxy: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	defer func() {
+		if err := m.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown default unprivileged proxy: %v", err)
+		}
+	}()
+	if got := m.State().Addr; got != defaultProxyAddress {
+		t.Fatalf("default proxy listener = %q, want %q", got, defaultProxyAddress)
 	}
 }

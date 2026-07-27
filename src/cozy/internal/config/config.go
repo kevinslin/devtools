@@ -5,7 +5,9 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -34,6 +36,76 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("parse configuration %q: %w", path, err)
 	}
 	return config, nil
+}
+
+// AppendSite validates and atomically appends a site without changing existing YAML.
+func AppendSite(path string, site Site) error {
+	original, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read configuration %q: %w", path, err)
+	}
+	current, err := Parse(original)
+	if err != nil {
+		return fmt.Errorf("parse configuration %q: %w", path, err)
+	}
+	candidate := Config{
+		Version: current.Version,
+		Sites:   append(append([]Site(nil), current.Sites...), site),
+	}
+	if err := candidate.Validate(); err != nil {
+		return fmt.Errorf("cannot add site to configuration %q: %w", path, err)
+	}
+
+	updated := append([]byte(nil), original...)
+	if len(updated) > 0 && updated[len(updated)-1] != '\n' {
+		updated = append(updated, '\n')
+	}
+	updated = fmt.Appendf(updated, "  - name: %s\n    url: %s\n    run: %s\n",
+		site.Name, site.URL, strconv.Quote(site.Run))
+	if _, err := Parse(updated); err != nil {
+		return fmt.Errorf("validate updated configuration %q: %w", path, err)
+	}
+	return WriteAtomic(path, updated)
+}
+
+// WriteAtomic replaces a file with synced data while preserving existing permissions.
+func WriteAtomic(path string, data []byte) error {
+	mode := os.FileMode(0o600)
+	info, err := os.Stat(path)
+	if err == nil {
+		mode = info.Mode().Perm()
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect configuration %q: %w", path, err)
+	}
+
+	temporary, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary configuration for %q: %w", path, err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	defer temporary.Close()
+
+	if err := temporary.Chmod(mode); err != nil {
+		return fmt.Errorf("set configuration permissions for %q: %w", path, err)
+	}
+	written, err := temporary.Write(data)
+	if err != nil {
+		return fmt.Errorf("write temporary configuration for %q: %w", path, err)
+	}
+	if written != len(data) {
+		return fmt.Errorf("write temporary configuration for %q: %w", path, io.ErrShortWrite)
+	}
+	if err := temporary.Sync(); err != nil {
+		return fmt.Errorf("sync temporary configuration for %q: %w", path, err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close temporary configuration for %q: %w", path, err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("replace configuration %q: %w", path, err)
+	}
+	return nil
 }
 
 // Parse reads and validates the supported version 1 YAML format.
@@ -149,6 +221,9 @@ func (c Config) Validate() error {
 	for i, site := range c.Sites {
 		if !validName(site.Name) {
 			return fmt.Errorf("site %d: name must be a valid *.localhost hostname", i+1)
+		}
+		if site.Name == "cozy.localhost" {
+			return fmt.Errorf("site %d: cozy.localhost is reserved for the Cozy admin; choose another *.localhost site name", i+1)
 		}
 		if _, exists := seen[site.Name]; exists {
 			return fmt.Errorf("site %d: duplicate site name %q", i+1, site.Name)

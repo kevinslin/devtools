@@ -23,8 +23,65 @@ func TestRunHelp(t *testing.T) {
 	if !strings.Contains(stdout.String(), "cozy refresh") || !strings.Contains(stdout.String(), "cozy restart [site]") {
 		t.Fatalf("help does not describe authenticated live operations: %q", stdout.String())
 	}
+	if !strings.Contains(stdout.String(), "--listen 127.0.0.1:8080") {
+		t.Fatalf("help does not describe the default loopback listener: %q", stdout.String())
+	}
 	if strings.Contains(stdout.String(), "__agtask_dashboard") {
 		t.Fatalf("help exposes the internal dashboard launcher: %q", stdout.String())
+	}
+}
+
+func TestParseOptionsDefaultsToPort8080(t *testing.T) {
+	var stderr bytes.Buffer
+	opts, err := parseOptions("check", []string{"--state-dir", t.TempDir()}, &stderr)
+	if err != nil {
+		t.Fatalf("parse default proxy listener: %v", err)
+	}
+	if opts.listen != "127.0.0.1:8080" {
+		t.Fatalf("default listener = %q, want 127.0.0.1:8080", opts.listen)
+	}
+}
+
+func TestAdminURLUsesActualListenerPort(t *testing.T) {
+	tests := []struct {
+		name    string
+		address string
+		want    string
+	}{
+		{name: "default port", address: "127.0.0.1:8080", want: "http://cozy.localhost:8080/"},
+		{name: "actual allocated port", address: "127.0.0.1:41723", want: "http://cozy.localhost:41723/"},
+		{name: "conventional HTTP port", address: "127.0.0.1:80", want: "http://cozy.localhost/"},
+		{name: "IPv6 loopback", address: "[::1]:8080", want: "http://cozy.localhost:8080/"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := adminURL(test.address)
+			if err != nil {
+				t.Fatalf("format admin URL: %v", err)
+			}
+			if got != test.want {
+				t.Fatalf("admin URL = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestAdminURLRejectsInvalidListener(t *testing.T) {
+	tests := []struct {
+		name    string
+		address string
+	}{
+		{name: "missing port", address: "127.0.0.1"},
+		{name: "non-loopback listener", address: "0.0.0.0:8080"},
+		{name: "unallocated port", address: "127.0.0.1:0"},
+		{name: "out-of-range port", address: "127.0.0.1:65536"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got, err := adminURL(test.address); err == nil {
+				t.Fatalf("admin URL = %q; want invalid-listener error", got)
+			}
+		})
 	}
 }
 

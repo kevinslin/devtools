@@ -1,6 +1,7 @@
 package cozy_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -130,6 +131,42 @@ func requireReachableSite(t *testing.T, address, siteName string) {
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
+}
+
+func adminRequest(t *testing.T, address, method, route string, payload []byte, origin string) (int, []byte) {
+	t.Helper()
+	var body io.Reader
+	if payload != nil {
+		body = bytes.NewReader(payload)
+	}
+	request, err := http.NewRequest(method, "http://"+address+route, body)
+	if err != nil {
+		t.Fatalf("create admin request %s %s: %v", method, route, err)
+	}
+	_, port, err := net.SplitHostPort(address)
+	if err != nil {
+		t.Fatalf("resolve admin listener port: %v", err)
+	}
+	request.Host = "cozy.localhost:" + port
+	if payload != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	if origin != "" {
+		if origin == "same-origin" {
+			origin = "http://" + request.Host
+		}
+		request.Header.Set("Origin", origin)
+	}
+	response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
+	if err != nil {
+		t.Fatalf("perform admin request %s %s: %v", method, route, err)
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read admin response %s %s: %v", method, route, err)
+	}
+	return response.StatusCode, data
 }
 
 func TestCLILifecycle(t *testing.T) {
@@ -309,5 +346,132 @@ func TestCLIReportsListenerConflict(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(output), "address") && !strings.Contains(strings.ToLower(output), "listener") && !strings.Contains(strings.ToLower(output), "use") {
 		t.Fatalf("listener conflict did not produce an actionable diagnostic: %s", output)
+	}
+}
+
+func TestCLIAdminDashboard(t *testing.T) {
+	directory := integrationDirectory(t)
+	cozy := filepath.Join(directory, "cozy")
+	backend := filepath.Join(directory, "backend")
+	buildBinary(t, cozy, "./cmd/cozy")
+	buildBinary(t, backend, "./testdata/backend")
+
+	stateDirectory := filepath.Join(directory, "runtime")
+	configuration := writeConfiguration(t, directory, backend)
+	address := availableAddress(t)
+	if output, err := runBinary(t, cozy, "up", "--config", configuration, "--listen", address, "--state-dir", stateDirectory); err != nil {
+		t.Fatalf("start admin integration supervisor: %v\n%s", err, output)
+	}
+	t.Cleanup(func() {
+		if output, err := runBinary(t, cozy, "down", "--state-dir", stateDirectory); err != nil {
+			t.Errorf("stop admin integration supervisor: %v\n%s", err, output)
+		}
+	})
+
+	for _, route := range []string{"/", "/styles.css", "/app.js", "/logo.svg"} {
+		status, body := adminRequest(t, address, http.MethodGet, route, nil, "")
+		if status != http.StatusOK || len(body) == 0 {
+			t.Fatalf("admin asset %s returned status %d and %d bytes", route, status, len(body))
+		}
+		if route == "/" && !bytes.Contains(bytes.ToLower(body), []byte("cozy")) {
+			t.Fatal("admin dashboard does not identify Cozy")
+		}
+	}
+
+	status, body := adminRequest(t, address, http.MethodGet, "/api/sites", nil, "")
+	if status != http.StatusOK {
+		t.Fatalf("admin site listing returned status %d: %s", status, body)
+	}
+	var listing struct {
+		Sites []runtimeSiteInfo `json:"sites"`
+	}
+	if err := json.Unmarshal(body, &listing); err != nil {
+		t.Fatalf("decode admin site listing: %v", err)
+	}
+	if len(listing.Sites) != 2 {
+		t.Fatalf("admin lists %d sites, want 2", len(listing.Sites))
+	}
+	if bytes.Contains(body, []byte("\"token\"")) || bytes.Contains(body, []byte("\"control_path\"")) {
+		t.Fatal("admin site listing exposed supervisor credentials")
+	}
+
+	before := readRuntimeSnapshot(t, stateDirectory)
+	oldFishy, ok := before.site("fishy.localhost")
+	if !ok {
+		t.Fatal("runtime state is missing Fishy")
+	}
+	oldAGTask, ok := before.site("agtask.localhost")
+	if !ok {
+		t.Fatal("runtime state is missing AGTask")
+	}
+
+	status, _ = adminRequest(t, address, http.MethodPost, "/api/sites/agtask.localhost/restart", []byte("{}"), "")
+	if status != http.StatusForbidden {
+		t.Fatalf("restart without same-origin proof returned status %d, want 403", status)
+	}
+	status, _ = adminRequest(t, address, http.MethodPost, "/api/sites/agtask.localhost/restart", []byte("{}"), "http://missing.localhost")
+	if status != http.StatusForbidden {
+		t.Fatalf("cross-origin restart returned status %d, want 403", status)
+	}
+	status, body = adminRequest(t, address, http.MethodPost, "/api/sites/agtask.localhost/restart", []byte("{}"), "same-origin")
+	if status != http.StatusOK {
+		t.Fatalf("admin restart returned status %d: %s", status, body)
+	}
+	after := readRuntimeSnapshot(t, stateDirectory)
+	newFishy, ok := after.site("fishy.localhost")
+	if !ok || newFishy.PID != oldFishy.PID {
+		t.Fatalf("admin restart interrupted Fishy: old PID %d, new PID %d", oldFishy.PID, newFishy.PID)
+	}
+	newAGTask, ok := after.site("agtask.localhost")
+	if !ok || newAGTask.PID == oldAGTask.PID {
+		t.Fatalf("admin restart did not replace AGTask: old PID %d, new PID %d", oldAGTask.PID, newAGTask.PID)
+	}
+	if after.PID != before.PID {
+		t.Fatal("admin restart replaced the shared supervisor")
+	}
+	requireReachableSite(t, address, "fishy.localhost")
+	requireReachableSite(t, address, "agtask.localhost")
+
+	newSite, err := json.Marshal(struct {
+		Name string `json:"name"`
+		Run  string `json:"run"`
+	}{
+		Name: "garden.localhost",
+		Run:  fmt.Sprintf("%s --host 127.0.0.1 --port \"$PORT\" --no-open", backend),
+	})
+	if err != nil {
+		t.Fatalf("encode admin add-site request: %v", err)
+	}
+	status, body = adminRequest(t, address, http.MethodPost, "/api/sites", newSite, "same-origin")
+	if status != http.StatusCreated {
+		t.Fatalf("admin add-site returned status %d: %s", status, body)
+	}
+	requireReachableSite(t, address, "garden.localhost")
+	updated := readRuntimeSnapshot(t, stateDirectory)
+	if site, ok := updated.site("fishy.localhost"); !ok || site.PID != oldFishy.PID {
+		t.Fatal("adding a dashboard site interrupted Fishy")
+	}
+	data, err := os.ReadFile(configuration)
+	if err != nil {
+		t.Fatalf("read updated site configuration: %v", err)
+	}
+	if !bytes.Contains(data, []byte("garden.localhost")) {
+		t.Fatal("admin-created site was not persisted to the configuration")
+	}
+
+	status, _ = adminRequest(t, address, http.MethodPost, "/api/sites", newSite, "same-origin")
+	if status != http.StatusConflict {
+		t.Fatalf("duplicate site returned status %d, want 409", status)
+	}
+	reserved, err := json.Marshal(struct {
+		Name string `json:"name"`
+		Run  string `json:"run"`
+	}{Name: "cozy.localhost", Run: "cozy"})
+	if err != nil {
+		t.Fatalf("encode reserved-host request: %v", err)
+	}
+	status, _ = adminRequest(t, address, http.MethodPost, "/api/sites", reserved, "same-origin")
+	if status != http.StatusBadRequest {
+		t.Fatalf("reserved admin hostname returned status %d, want 400", status)
 	}
 }

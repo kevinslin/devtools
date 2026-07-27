@@ -24,7 +24,7 @@ import (
 
 const (
 	defaultConfig    = "cozy.yaml"
-	defaultListen    = "127.0.0.1:80"
+	defaultListen    = "127.0.0.1:8080"
 	startTimeout     = 10 * time.Second
 	stopTimeout      = 10 * time.Second
 	agtaskExecutable = "/Users/kevinlin/code/skills-public/active/agtask/skills/agtask/scripts/agtask"
@@ -135,7 +135,7 @@ func runAgtaskDashboard(args []string, stdout, stderr io.Writer) int {
 func usage(output io.Writer) {
 	fmt.Fprintln(output, "Usage: cozy <up|down|status|logs|open|check|refresh|restart> [flags] [site]")
 	fmt.Fprintln(output, "Live operations: cozy refresh; cozy restart [site]")
-	fmt.Fprintln(output, "Flags: --config cozy.yaml --listen 127.0.0.1:80 --state-dir <directory>")
+	fmt.Fprintln(output, "Flags: --config cozy.yaml --listen 127.0.0.1:8080 --state-dir <directory>")
 }
 
 func parseOptions(command string, args []string, stderr io.Writer) (commandOptions, error) {
@@ -244,7 +244,13 @@ func up(opts commandOptions, output io.Writer) error {
 	for {
 		state, stateErr := service.LoadState(stateDir)
 		if stateErr == nil && state.PID == child.Process.Pid && service.OwnsState(state) {
+			admin, err := adminURL(state.Addr)
+			if err != nil {
+				_ = child.Process.Signal(syscall.SIGTERM)
+				return fmt.Errorf("format admin URL from proxy listener: %w", err)
+			}
 			fmt.Fprintf(output, "Cozy is running on %s\n", state.Addr)
+			fmt.Fprintf(output, "Admin: %s\n", admin)
 			for _, site := range state.Sites {
 				fmt.Fprintln(output, site.URL)
 			}
@@ -458,11 +464,35 @@ func status(opts commandOptions, output io.Writer) error {
 		fmt.Fprintln(output, "Cozy is not running; the recorded supervisor state could not be verified.")
 		return nil
 	}
+	admin, err := adminURL(state.Addr)
+	if err != nil {
+		return fmt.Errorf("format admin URL from proxy listener: %w", err)
+	}
 	fmt.Fprintf(output, "Cozy is running on %s (PID %d)\n", state.Addr, state.PID)
+	fmt.Fprintf(output, "Admin: %s\n", admin)
 	for _, site := range state.Sites {
 		fmt.Fprintf(output, "%s\tPID %d\t%s\n", site.URL, site.PID, site.LogPath)
 	}
 	return nil
+}
+
+func adminURL(address string) (string, error) {
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", fmt.Errorf("parse loopback proxy listener %q: %w", address, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return "", fmt.Errorf("proxy listener %q must use a loopback IP", address)
+	}
+	port, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil || port == 0 {
+		return "", fmt.Errorf("proxy listener %q must use a port from 1 through 65535", address)
+	}
+	if port == 80 {
+		return "http://cozy.localhost/", nil
+	}
+	return fmt.Sprintf("http://cozy.localhost:%d/", port), nil
 }
 
 func logs(opts commandOptions, output io.Writer) error {

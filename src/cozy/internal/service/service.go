@@ -24,8 +24,16 @@ import (
 	"syscall"
 	"time"
 
+	"cozy/internal/admin"
 	"cozy/internal/config"
 )
+
+const (
+	defaultProxyAddress = "127.0.0.1:8080"
+	adminHostname       = "cozy.localhost"
+)
+
+var _ admin.Backend = (*Manager)(nil)
 
 // Options configures the local proxy and runtime metadata.
 type Options struct {
@@ -217,10 +225,118 @@ func (m *Manager) State() State {
 	return state
 }
 
+// Sites returns only the public, non-sensitive metadata for managed sites.
+func (m *Manager) Sites() []admin.Site {
+	state := m.State()
+	sites := make([]admin.Site, 0, len(state.Sites))
+	for _, site := range state.Sites {
+		sites = append(sites, admin.Site{
+			Name: site.Name, URL: site.URL, Run: site.Run,
+			PID: site.PID, Port: site.Port, LogPath: site.LogPath,
+		})
+	}
+	return sites
+}
+
+func (m *Manager) lockMutation(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("wait for Cozy site operation: %w", err)
+	}
+	for !m.mutationMu.TryLock() {
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return fmt.Errorf("wait for Cozy site operation: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		m.mutationMu.Unlock()
+		return fmt.Errorf("start Cozy site operation: %w", err)
+	}
+	return nil
+}
+
+// RestartSite replaces one ready site without interrupting the proxy or peers.
+func (m *Manager) RestartSite(ctx context.Context, name string) error {
+	if name == "" {
+		return fmt.Errorf("restart requires a configured site hostname")
+	}
+	if err := m.lockMutation(ctx); err != nil {
+		return err
+	}
+	defer m.mutationMu.Unlock()
+	if _, err := m.controlActionLocked("restart", name); err != nil {
+		return fmt.Errorf("restart site %s: %w", name, err)
+	}
+	return nil
+}
+
+// AddSite persists and starts a validated new site as one rollback-safe change.
+func (m *Manager) AddSite(ctx context.Context, input admin.Site) error {
+	if input.PID != 0 || input.Port != 0 || input.LogPath != "" {
+		return fmt.Errorf("runtime metadata cannot be specified when adding a site")
+	}
+	site := config.Site{Name: input.Name, URL: input.URL, Run: input.Run}
+	if site.URL == "" {
+		site.URL = "http://" + site.Name
+	}
+	if site.Name == adminHostname {
+		return fmt.Errorf("site %q is reserved for the Cozy admin", adminHostname)
+	}
+	if err := (config.Config{Version: 1, Sites: []config.Site{site}}).Validate(); err != nil {
+		return fmt.Errorf("validate new site: %w", err)
+	}
+	if err := m.lockMutation(ctx); err != nil {
+		return err
+	}
+	defer m.mutationMu.Unlock()
+	m.mu.RLock()
+	path := m.configPath
+	stopping := m.stopping
+	m.mu.RUnlock()
+	if stopping {
+		return fmt.Errorf("Cozy is shutting down")
+	}
+	if path == "" {
+		return fmt.Errorf("configuration path is unavailable; start Cozy with a configuration file before adding a site")
+	}
+	original, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read configuration before adding %s: %w", site.Name, err)
+	}
+	if err := config.AppendSite(path, site); err != nil {
+		return fmt.Errorf("persist new site %s: %w", site.Name, err)
+	}
+	rollback := func(reason error) error {
+		if err := config.WriteAtomic(path, original); err != nil {
+			return fmt.Errorf("add site %s failed: %v; restore original configuration: %w", site.Name, reason, err)
+		}
+		return fmt.Errorf("add site %s and restore original configuration: %w", site.Name, reason)
+	}
+	if err := ctx.Err(); err != nil {
+		return rollback(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return rollback(fmt.Errorf("reload updated configuration: %w", err))
+	}
+	if _, err := m.reconcile(cfg, nil, true); err != nil {
+		return rollback(err)
+	}
+	return nil
+}
+
 // Start binds the proxy and transactionally starts all configured services.
 func Start(cfg config.Config, opts Options) (_ *Manager, resultErr error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validate Cozy configuration: %w", err)
+	}
 	if opts.Addr == "" {
-		opts.Addr = "127.0.0.1:80"
+		opts.Addr = defaultProxyAddress
 	}
 	tcpAddr, err := net.ResolveTCPAddr("tcp", opts.Addr)
 	if err != nil {
@@ -293,10 +409,15 @@ func Start(cfg config.Config, opts Options) (_ *Manager, resultErr error) {
 		m.mu.Unlock()
 	}
 
+	adminHandler := admin.New(m)
 	m.server = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host
 		if withoutPort, _, err := net.SplitHostPort(host); err == nil {
 			host = withoutPort
+		}
+		if strings.EqualFold(host, adminHostname) {
+			adminHandler.ServeHTTP(w, r)
+			return
 		}
 		m.mu.RLock()
 		proxy, ok := m.routes[strings.ToLower(host)]
@@ -500,6 +621,10 @@ func (m *Manager) handleControl(conn net.Conn) {
 func (m *Manager) controlAction(action, site string) (ControlResult, error) {
 	m.mutationMu.Lock()
 	defer m.mutationMu.Unlock()
+	return m.controlActionLocked(action, site)
+}
+
+func (m *Manager) controlActionLocked(action, site string) (ControlResult, error) {
 	m.mu.RLock()
 	stopping := m.stopping
 	state := m.state

@@ -3,7 +3,8 @@
 Cozy is a small, standard-library-only Go CLI for running local development
 services behind clean `http://<name>.localhost` URLs. Its embedded reverse
 proxy listens on loopback and selects each service by the HTTP `Host` header.
-It does not install, configure, or modify DNS.
+It does not install, configure, or modify DNS. A built-in admin dashboard is
+available at `http://cozy.localhost:8080/`.
 
 ## Install
 
@@ -40,6 +41,9 @@ argument uses that assigned port, and `--no-open` keeps the background service
 from opening its internal backend URL. Treat the site configuration as trusted
 local configuration. Set `COZY_CONFIG` or pass `--config` to select a different
 configuration file.
+
+The `cozy.localhost` hostname is reserved for the admin dashboard and cannot
+be assigned to a managed service.
 
 The `agtask.localhost` entry starts the dashboard using:
 
@@ -80,21 +84,23 @@ managed services while preserving the running supervisor and proxy.
 `cozy logs` prints a site's captured output, and `cozy open` opens its clean URL
 using the macOS `open` command.
 
-The default proxy listener is `127.0.0.1:80`, which keeps public-facing URLs
-free of a port. If that address is already occupied or the operating system
-denies access, Cozy reports the listener error; it does not request elevated
-privileges or reconfigure the system. Release the conflicting listener or
-choose an explicit listener for development or testing:
+## Admin dashboard
+
+Start Cozy without specifying a port:
 
 ```sh
-cozy check --listen 127.0.0.1:8080
-cozy up --listen 127.0.0.1:8080
+cozy up
 ```
 
-An explicitly selected nondefault listener must be included in requests to the
-proxy. Clean port-free URLs require an available port 80 listener. Use
-`--config` to select a configuration file and `--state-dir` to select a runtime
-directory for supported commands.
+The predefined listener is `127.0.0.1:8080`. Open
+`http://cozy.localhost:8080/` to see every running service, its status, backend
+port, process ID, and logs. Restart an individual service from its card or add
+a new `.localhost` service using the built-in form. New services are saved to
+the active configuration, started immediately, and routed without interrupting
+existing sites. Admin mutations are restricted to same-origin local requests.
+
+Use `--listen` to explicitly select another loopback port, `--config` to select
+a configuration file, and `--state-dir` to select a runtime directory.
 
 ## Runtime state
 
@@ -123,5 +129,5 @@ go test ./...
 ```
 
 Tests use temporary directories and automatically allocated loopback ports;
-they do not depend on DNS changes, port 80, installed local services, or an
-existing Cozy instance.
+they do not depend on DNS changes, installed local services, or an existing
+Cozy instance.
