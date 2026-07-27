@@ -1,0 +1,4 @@
+/cozy
+/coverage.out
+*.test
+*.prof

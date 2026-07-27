@@ -1,0 +1,8 @@
+version: 1
+sites:
+  - name: fishy.localhost
+    url: http://fishy.localhost
+    run: fishy --host 127.0.0.1 --port "$PORT" --no-open
+  - name: agtask.localhost
+    url: http://agtask.localhost
+    run: /Users/kevinlin/code/devtools/bin/cozy __agtask_dashboard
