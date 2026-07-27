@@ -8,7 +8,9 @@
 ## Quickstart
 
 ```sh
+fishy
 fishy < diagram.mmd
+fishy flow.md
 fishy --source-file flow.md
 ```
 
@@ -20,7 +22,7 @@ fishy [path| -] [--source-file FILE] [--host HOST] [--port PORT] [--title TITLE]
 
 ## Arguments
 
-- `path`: optional Mermaid file path. Omit it or pass `-` to read from stdin.
+- `path`: optional Mermaid or Markdown file path. Markdown files ending in `.md` or `.markdown` automatically use source-file mode. Pass `-` to require Mermaid from stdin. With no path and no piped input, Fishy opens an editable Mermaid playground.
 
 ## Options
 
@@ -32,7 +34,10 @@ fishy [path| -] [--source-file FILE] [--host HOST] [--port PORT] [--title TITLE]
 
 ## Behavior
 
-- `fishy` reads Mermaid text first, then starts a local HTTP server and prints the preview URL.
+- `fishy` with no path or piped diagram opens with a small editable Mermaid example and a live browser preview.
+- The editor updates after typing pauses briefly. Invalid syntax shows the Mermaid parse error without replacing the editable source or the last valid preview.
+- When Mermaid is supplied through stdin or a path, Fishy keeps the existing read-only preview behavior.
+- Positional `.md` and `.markdown` files automatically extract all fenced `mermaid` blocks instead of treating the full document as one diagram.
 - If the input is a single fenced Markdown block such as ```` ```mermaid ... ``` ````, `fishy` strips the outer fence automatically.
 - With `--source-file`, `fishy` parses the Markdown file for all fenced `mermaid` code blocks and renders each as a separate preview block.
 - Source-file preview titles come from the nearest preceding Markdown heading. Blocks before any heading are titled `Mermaid block N`.
@@ -54,6 +59,9 @@ cat diagram.mmd | fishy
 fishy ./diagram.mmd --port 8123
 
 # render all Mermaid blocks from a Markdown file and refresh on edits
+fishy ./flow.md
+
+# the explicit source-file form is equivalent
 fishy --source-file ./flow.md
 
 # keep the server headless and print the URL only

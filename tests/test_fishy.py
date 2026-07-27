@@ -38,6 +38,8 @@ class FishyCliTest(unittest.TestCase):
         self.assertIn("installDiagramPointerControls", body)
         self.assertIn("pointerdown", body)
         self.assertIn("dblclick", body)
+        self.assertNotIn('id="mermaid-editor"', body)
+        self.assertIn("const EDITABLE = false", body)
 
         with urlopen(f"{url}/source.mmd", timeout=5) as response:
             source_body = response.read().decode("utf-8")
@@ -124,10 +126,61 @@ class FishyCliTest(unittest.TestCase):
 
             self.assertNotEqual(first_version, second_version)
 
-    def test_rejects_empty_input(self) -> None:
+    def test_markdown_path_automatically_extracts_mermaid_blocks(self) -> None:
+        markdown_source = (
+            "# Large document\n"
+            + ("Background text that is not Mermaid.\n" * 2_000)
+            + "\n```mermaid\n"
+            + "graph TD\n"
+            + "    A[Start] --> B[Done]\n"
+            + "```\n"
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_file = Path(temp_dir) / "design.md"
+            source_file.write_text(markdown_source, encoding="utf-8")
+            proc = self._start_cli_for_path(source_file)
+            self.addCleanup(self._stop_process, proc)
+
+            _, url = self._wait_for_url(proc)
+            with urlopen(url, timeout=5) as response:
+                body = response.read().decode("utf-8")
+
+            self.assertIn("Rendering 1 Mermaid block", body)
+            self.assertIn("Large document", body)
+            self.assertIn("graph TD", body)
+            self.assertNotIn("Background text that is not Mermaid", body)
+
+    def test_empty_launch_serves_live_mermaid_editor(self) -> None:
+        proc = self._start_empty_cli()
+        self.addCleanup(self._stop_process, proc)
+
+        _, url = self._wait_for_url(proc)
+        with urlopen(url, timeout=5) as response:
+            body = response.read().decode("utf-8")
+        with urlopen(f"{url}/source.mmd", timeout=5) as response:
+            source_body = response.read().decode("utf-8")
+
+        self.assertIn('id="mermaid-editor"', body)
+        self.assertIn("flowchart LR", body)
+        self.assertIn("Type or paste Mermaid syntax", body)
+        self.assertIn("const EDITABLE = true", body)
+        self.assertIn('editor.addEventListener("input"', body)
+        self.assertIn("await mermaid.parse(source)", body)
+        self.assertIn("Mermaid parse error:", body)
+        self.assertIn("mermaidRoot.innerHTML = svg", body)
+        self.assertIn("const diagramContexts = new WeakMap()", body)
+        self.assertIn("if (!context.controlsInstalled)", body)
+        self.assertNotIn('<a href="/source.mmd">', body)
+        self.assertEqual(
+            source_body,
+            "flowchart LR\n    A[Type Mermaid] --> B[See a live preview]",
+        )
+
+    def test_explicit_empty_stdin_is_still_rejected(self) -> None:
         env = os.environ.copy()
         result = subprocess.run(
-            [sys.executable, str(CLI), "--no-open"],
+            [sys.executable, str(CLI), "-", "--no-open"],
             cwd=ROOT,
             env=env,
             stdin=subprocess.DEVNULL,
@@ -162,6 +215,37 @@ class FishyCliTest(unittest.TestCase):
                 sys.executable,
                 str(CLI),
                 "--source-file",
+                str(source_file),
+                "--no-open",
+                "--port",
+                "0",
+            ],
+            cwd=ROOT,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def _start_empty_cli(self) -> subprocess.Popen[str]:
+        env = os.environ.copy()
+        return subprocess.Popen(
+            [sys.executable, str(CLI), "--no-open", "--port", "0"],
+            cwd=ROOT,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def _start_cli_for_path(self, source_file: Path) -> subprocess.Popen[str]:
+        env = os.environ.copy()
+        return subprocess.Popen(
+            [
+                sys.executable,
+                str(CLI),
                 str(source_file),
                 "--no-open",
                 "--port",

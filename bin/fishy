@@ -22,6 +22,9 @@ import webbrowser
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 0
 DEFAULT_TITLE = "Fishy Mermaid Preview"
+DEFAULT_EDITOR_SOURCE = """flowchart LR
+    A[Type Mermaid] --> B[See a live preview]"""
+MARKDOWN_SUFFIXES = {".md", ".markdown"}
 MERMAID_MODULE_URL = "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs"
 FENCED_BLOCK_RE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
 ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]+|$)(?P<title>.*)$")
@@ -39,6 +42,15 @@ class PreviewPayload:
     source: str
     source_version: str
     caption: str
+    editable: bool = False
+
+
+EDITOR_TEMPLATE = """    <section class="panel editor-panel">
+      <label for="mermaid-editor">Mermaid source</label>
+      <textarea id="mermaid-editor" spellcheck="false" autocapitalize="off">{source}</textarea>
+      <p class="editor-help">The preview updates as you type.</p>
+      <p class="editor-error" id="mermaid-error" role="alert" hidden></p>
+    </section>"""
 
 
 DIAGRAM_SECTION_TEMPLATE = """      <section class="panel diagram" data-diagram-index="{index}">
@@ -152,6 +164,55 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     .diagram-list {{
       display: grid;
       gap: 1rem;
+    }}
+
+    .editor-panel {{
+      width: min(1100px, 100%);
+      margin: 0 auto;
+      padding: 1rem;
+      display: grid;
+      gap: 0.55rem;
+    }}
+
+    .editor-panel label {{
+      font-weight: 700;
+    }}
+
+    #mermaid-editor {{
+      width: 100%;
+      min-height: 12rem;
+      resize: vertical;
+      padding: 0.9rem 1rem;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.92);
+      color: var(--ink);
+      font: 0.95rem/1.5 "SFMono-Regular", "Menlo", monospace;
+      tab-size: 2;
+    }}
+
+    #mermaid-editor:focus {{
+      outline: 3px solid rgba(13, 138, 168, 0.18);
+      border-color: var(--accent);
+    }}
+
+    .editor-help,
+    .editor-error {{
+      margin: 0;
+      font-size: 0.92rem;
+    }}
+
+    .editor-help {{
+      color: var(--muted);
+    }}
+
+    .editor-error {{
+      padding: 0.65rem 0.8rem;
+      border: 1px solid rgba(176, 45, 45, 0.24);
+      border-radius: 12px;
+      background: rgba(255, 231, 231, 0.82);
+      color: #8d2020;
+      white-space: pre-wrap;
     }}
 
     .diagram {{
@@ -340,8 +401,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       <p class="eyebrow">fishy</p>
       <h1>{title}</h1>
       <p class="caption">{caption}</p>
-      <p class="caption"><a href="/source.mmd">download source</a></p>
+{source_action}
     </section>
+{editor}
     <div class="diagram-list">
 {diagrams}
     </div>
@@ -368,6 +430,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     const MIN_SCALE = 0.05;
     const MAX_SCALE = 3;
     const SOURCE_VERSION = "{source_version}";
+    const EDITABLE = {editable};
+    const diagramContexts = new WeakMap();
 
     function getNoteLabel(noteTextNode) {{
       const tspans = Array.from(noteTextNode.querySelectorAll("tspan"))
@@ -591,19 +655,23 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     }}
 
     function installDiagramControls(diagram) {{
-      const context = {{
-        viewport: diagram.querySelector(".diagram-viewport"),
-        stage: diagram.querySelector(".diagram-stage"),
-        zoomLabel: diagram.querySelector(".diagram-zoom-label"),
-        fitButton: diagram.querySelector(".diagram-fit-button"),
-        zoomOutButton: diagram.querySelector(".diagram-zoom-out-button"),
-        zoomInButton: diagram.querySelector(".diagram-zoom-in-button"),
-        mermaidRoot: diagram.querySelector(".mermaid"),
-        diagramMetrics: null,
-        fitScale: 1,
-        currentScale: 1,
-        activePan: null,
-      }};
+      let context = diagramContexts.get(diagram);
+      if (!context) {{
+        context = {{
+          viewport: diagram.querySelector(".diagram-viewport"),
+          stage: diagram.querySelector(".diagram-stage"),
+          zoomLabel: diagram.querySelector(".diagram-zoom-label"),
+          fitButton: diagram.querySelector(".diagram-fit-button"),
+          zoomOutButton: diagram.querySelector(".diagram-zoom-out-button"),
+          zoomInButton: diagram.querySelector(".diagram-zoom-in-button"),
+          mermaidRoot: diagram.querySelector(".mermaid"),
+          diagramMetrics: null,
+          fitScale: 1,
+          currentScale: 1,
+          activePan: null,
+        }};
+        diagramContexts.set(diagram, context);
+      }}
 
       if (!context.viewport || !context.stage || !context.zoomLabel || !context.mermaidRoot) {{
         return;
@@ -616,11 +684,14 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 
       context.diagramMetrics = readDiagramMetrics(svg);
       fitDiagram(context);
-      context.fitButton.addEventListener("click", () => fitDiagram(context));
-      context.zoomOutButton.addEventListener("click", () => zoomBy(context, -ZOOM_STEP));
-      context.zoomInButton.addEventListener("click", () => zoomBy(context, ZOOM_STEP));
-      installDiagramPointerControls(context);
-      window.addEventListener("resize", () => fitDiagram(context));
+      if (!context.controlsInstalled) {{
+        context.fitButton.addEventListener("click", () => fitDiagram(context));
+        context.zoomOutButton.addEventListener("click", () => zoomBy(context, -ZOOM_STEP));
+        context.zoomInButton.addEventListener("click", () => zoomBy(context, ZOOM_STEP));
+        installDiagramPointerControls(context);
+        window.addEventListener("resize", () => fitDiagram(context));
+        context.controlsInstalled = true;
+      }}
     }}
 
     function installSourceFileRefresh() {{
@@ -644,6 +715,65 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       window.setInterval(checkForChanges, 1000);
     }}
 
+    function formatMermaidError(error) {{
+      if (error instanceof Error && error.message) {{
+        return error.message;
+      }}
+      return String(error);
+    }}
+
+    function installMermaidEditor() {{
+      const editor = document.getElementById("mermaid-editor");
+      const errorMessage = document.getElementById("mermaid-error");
+      const diagram = document.querySelector(".diagram");
+      const mermaidRoot = diagram?.querySelector(".mermaid");
+      const sourceDisplay = diagram?.querySelector(".source");
+      if (!editor || !errorMessage || !diagram || !mermaidRoot) {{
+        return;
+      }}
+
+      let renderRevision = 0;
+      let renderTimer = null;
+      const renderSource = async () => {{
+        const source = editor.value;
+        const revision = ++renderRevision;
+        if (sourceDisplay) {{
+          sourceDisplay.textContent = source;
+        }}
+        if (!source.trim()) {{
+          errorMessage.textContent = "Enter Mermaid syntax to render a preview.";
+          errorMessage.hidden = false;
+          return;
+        }}
+
+        try {{
+          await mermaid.parse(source);
+          const renderId = `fishy-editor-${{revision}}`;
+          const {{ svg, bindFunctions }} = await mermaid.render(renderId, source);
+          if (revision !== renderRevision) {{
+            return;
+          }}
+          mermaidRoot.innerHTML = svg;
+          bindFunctions?.(mermaidRoot);
+          errorMessage.textContent = "";
+          errorMessage.hidden = true;
+          installDiagramControls(diagram);
+          installNoteHoverTooltips(mermaidRoot);
+        }} catch (error) {{
+          if (revision !== renderRevision) {{
+            return;
+          }}
+          errorMessage.textContent = `Mermaid parse error: ${{formatMermaidError(error)}}`;
+          errorMessage.hidden = false;
+        }}
+      }};
+
+      editor.addEventListener("input", () => {{
+        window.clearTimeout(renderTimer);
+        renderTimer = window.setTimeout(renderSource, 150);
+      }});
+    }}
+
     await mermaid.run({{
       querySelector: ".mermaid",
     }});
@@ -653,6 +783,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     installNoteHoverTooltips(document);
     if (SOURCE_VERSION) {{
       installSourceFileRefresh();
+    }}
+    if (EDITABLE) {{
+      installMermaidEditor();
     }}
     window.addEventListener("scroll", hideTooltip, true);
     window.addEventListener("resize", hideTooltip);
@@ -677,6 +810,26 @@ class StaticPreviewSource:
                 "Mermaid runtime loads in the browser, so the preview stays local while "
                 "diagram parsing happens client-side."
             ),
+        )
+
+    def read_payload(self) -> PreviewPayload:
+        return self._payload
+
+    def read_version(self) -> str:
+        return ""
+
+
+class EditorPreviewSource:
+    def __init__(self, diagram_title: str):
+        self._payload = PreviewPayload(
+            diagrams=[MermaidDiagram(title=diagram_title, source=DEFAULT_EDITOR_SOURCE)],
+            source=DEFAULT_EDITOR_SOURCE,
+            source_version="",
+            caption=(
+                "Type or paste Mermaid syntax below. Fishy renders a live preview in "
+                "this browser while keeping your source editable."
+            ),
+            editable=True,
         )
 
     def read_payload(self) -> PreviewPayload:
@@ -718,7 +871,13 @@ class MarkdownFilePreviewSource:
 
 
 class FishyHandler(BaseHTTPRequestHandler):
-    def __init__(self, *args, preview_source: StaticPreviewSource | MarkdownFilePreviewSource, title: str, **kwargs):
+    def __init__(
+        self,
+        *args,
+        preview_source: StaticPreviewSource | EditorPreviewSource | MarkdownFilePreviewSource,
+        title: str,
+        **kwargs,
+    ):
         self._preview_source = preview_source
         self._title = title
         super().__init__(*args, **kwargs)
@@ -770,7 +929,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "path",
         nargs="?",
-        help="Mermaid file path. Omit or use '-' to read from stdin.",
+        help="Mermaid or Markdown file path. Omit or use '-' to read Mermaid from stdin.",
     )
     parser.add_argument(
         "--source-file",
@@ -819,6 +978,23 @@ def _read_mermaid_source(path_arg: str | None) -> str:
     if not source.strip():
         raise FishyError("Mermaid definition is empty")
     return source
+
+
+def _read_empty_launch_source() -> str | None:
+    if sys.stdin.isatty():
+        return None
+    try:
+        source = sys.stdin.read()
+    except OSError as exc:
+        raise FishyError(f"failed to read Mermaid from stdin: {exc}") from exc
+    normalized_source = _normalize_mermaid_source(source)
+    return normalized_source if normalized_source.strip() else None
+
+
+def _is_markdown_path(path_arg: str | None) -> bool:
+    if not path_arg or path_arg == "-":
+        return False
+    return Path(path_arg).suffix.lower() in MARKDOWN_SUFFIXES
 
 
 def _normalize_mermaid_source(source: str) -> str:
@@ -926,8 +1102,19 @@ def _build_html_page(title: str, payload: PreviewPayload) -> str:
     return PAGE_TEMPLATE.format(
         title=html.escape(title),
         caption=html.escape(payload.caption),
+        source_action=(
+            ""
+            if payload.editable
+            else '      <p class="caption"><a href="/source.mmd">download source</a></p>'
+        ),
+        editor=(
+            EDITOR_TEMPLATE.format(source=html.escape(payload.source))
+            if payload.editable
+            else ""
+        ),
         diagrams=_render_diagram_sections(payload.diagrams),
         source_version=html.escape(payload.source_version, quote=True),
+        editable="true" if payload.editable else "false",
         mermaid_url=html.escape(MERMAID_MODULE_URL, quote=True),
     )
 
@@ -948,8 +1135,17 @@ def main() -> int:
         return 1
 
     try:
-        if args.source_file:
-            preview_source = MarkdownFilePreviewSource(Path(args.source_file).expanduser())
+        if args.source_file or _is_markdown_path(args.path):
+            source_path = args.source_file or args.path
+            assert source_path is not None
+            preview_source = MarkdownFilePreviewSource(Path(source_path).expanduser())
+        elif args.path is None:
+            mermaid_source = _read_empty_launch_source()
+            preview_source = (
+                StaticPreviewSource(mermaid_source, args.title)
+                if mermaid_source is not None
+                else EditorPreviewSource(args.title)
+            )
         else:
             preview_source = StaticPreviewSource(_read_mermaid_source(args.path), args.title)
         preview_source.read_payload()
