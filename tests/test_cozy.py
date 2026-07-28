@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import plistlib
 import subprocess
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "bin" / "cozy"
+LAUNCH_AGENT = ROOT / "config" / "cozy" / "com.kevinlin.cozy.plist"
 
 
 class CozyCliTest(unittest.TestCase):
@@ -93,6 +95,48 @@ class CozyCliTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("missing.yaml", result.stderr)
+
+    def test_launch_agent_supervises_the_foreground_cozy_process(self) -> None:
+        self.assertTrue(LAUNCH_AGENT.is_file())
+
+        with LAUNCH_AGENT.open("rb") as source:
+            agent = plistlib.load(source)
+
+        self.assertEqual(agent["Label"], "com.kevinlin.cozy")
+        self.assertEqual(
+            agent["ProgramArguments"],
+            [
+                str(CLI),
+                "__serve",
+                "--config",
+                str(ROOT / "config" / "cozy" / "config.yaml"),
+                "--listen",
+                "127.0.0.1:8080",
+            ],
+        )
+        self.assertEqual(agent["WorkingDirectory"], str(ROOT))
+        self.assertTrue(agent["RunAtLoad"])
+        self.assertTrue(agent["KeepAlive"])
+        self.assertGreaterEqual(agent["ExitTimeOut"], 10)
+
+    def test_launch_agent_can_resolve_managed_service_executables(self) -> None:
+        with LAUNCH_AGENT.open("rb") as source:
+            agent = plistlib.load(source)
+
+        environment = agent["EnvironmentVariables"]
+        self.assertIn(str(ROOT / "bin"), environment["PATH"].split(os.pathsep))
+        self.assertEqual(
+            environment["GOCACHE"],
+            "/Users/kevinlin/.cache/cozy-go-build",
+        )
+        self.assertEqual(
+            agent["StandardOutPath"],
+            "/Users/kevinlin/Library/Logs/com.kevinlin.cozy.log",
+        )
+        self.assertEqual(
+            agent["StandardErrorPath"],
+            "/Users/kevinlin/Library/Logs/com.kevinlin.cozy.error.log",
+        )
 
 
 if __name__ == "__main__":

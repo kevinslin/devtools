@@ -102,6 +102,36 @@ existing sites. Admin mutations are restricted to same-origin local requests.
 Use `--listen` to explicitly select another loopback port, `--config` to select
 a configuration file, and `--state-dir` to select a runtime directory.
 
+## Start automatically at login
+
+Cozy includes a macOS user LaunchAgent at
+`config/cozy/com.kevinlin.cozy.plist`. Install and start it with:
+
+```sh
+install -m 0644 \
+  /Users/kevinlin/code/devtools/config/cozy/com.kevinlin.cozy.plist \
+  /Users/kevinlin/Library/LaunchAgents/com.kevinlin.cozy.plist
+launchctl bootstrap "gui/$(id -u)" \
+  /Users/kevinlin/Library/LaunchAgents/com.kevinlin.cozy.plist
+```
+
+The agent starts Cozy at login on `127.0.0.1:8080`, supervises the foreground
+Cozy process, and restarts the supervisor automatically if it exits. Fishy,
+AGTask, and other configured sites are started together with the admin
+dashboard. The agent supplies the Devtools executable path and Go build cache
+explicitly because macOS LaunchAgents do not load interactive shell profiles.
+
+Check the running agent and stop automatic restarts with:
+
+```sh
+launchctl print "gui/$(id -u)/com.kevinlin.cozy"
+launchctl bootout "gui/$(id -u)/com.kevinlin.cozy"
+```
+
+Use `launchctl bootout`, not `cozy down`, when stopping a launchd-managed Cozy
+for more than a moment: the agent's `KeepAlive` setting restarts the foreground
+supervisor after `cozy down`.
+
 ## Runtime state
 
 On macOS, the default runtime directory is:
