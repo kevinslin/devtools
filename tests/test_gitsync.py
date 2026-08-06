@@ -72,7 +72,7 @@ class GitsyncTest(unittest.TestCase):
         return run([sys.executable, str(CLI), "--config", str(self.config), *args], env=env)
 
     def test_validate_accepts_cron_lists_ranges_and_steps(self) -> None:
-        self.write_config(sync_schedule="*/15 8-18 * * 1,3,5")
+        self.write_config(sync_schedule="*/15 8-18 * * 1,3,5", mode="pull")
         result = self.cli("validate")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["status"], "valid")
@@ -87,7 +87,12 @@ class GitsyncTest(unittest.TestCase):
         self.config.write_text(json.dumps(raw))
         result = self.cli("validate")
         self.assertEqual(result.returncode, 2)
-        self.assertIn("must contain exactly", result.stderr)
+        self.assertIn("with optional mode", result.stderr)
+
+        self.write_config(mode="sideways")
+        result = self.cli("validate")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("repos[0].mode must be one of: push/pull, pull", result.stderr)
 
     def test_all_pulls_remote_and_pushes_local_commits(self) -> None:
         peer = self.root / "peer"
@@ -115,7 +120,111 @@ class GitsyncTest(unittest.TestCase):
     def test_no_op_sync_still_runs_push_path(self) -> None:
         result = self.cli("sync", "--name", "test")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["results"][0]["push"], "no-op")
+        repo_result = json.loads(result.stdout)["results"][0]
+        self.assertEqual(repo_result["mode"], "push/pull")
+        self.assertEqual(repo_result["push"], "no-op")
+
+    def test_pull_mode_fast_forwards_without_pushing(self) -> None:
+        peer = self.root / "pull-peer"
+        git(self.root, "clone", str(self.remote), str(peer))
+        git(peer, "config", "user.name", "Test User")
+        git(peer, "config", "user.email", "test@example.com")
+        (peer / "remote.txt").write_text("remote\n", encoding="utf-8")
+        git(peer, "add", "remote.txt")
+        git(peer, "commit", "-m", "remote")
+        git(peer, "push")
+        remote_tip = git(self.remote, "rev-parse", "refs/heads/main")
+        self.write_config(mode="pull")
+
+        result = self.cli("sync", "--all")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        repo_result = json.loads(result.stdout)["results"][0]
+        self.assertEqual(repo_result["mode"], "pull")
+        self.assertTrue(repo_result["pulled"])
+        self.assertEqual(repo_result["push"], "skipped")
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), remote_tip)
+        self.assertEqual(git(self.remote, "rev-parse", "refs/heads/main"), remote_tip)
+
+    def test_pull_mode_leaves_ahead_only_commit_local(self) -> None:
+        (self.repo / "local.txt").write_text("local\n", encoding="utf-8")
+        git(self.repo, "add", "local.txt")
+        git(self.repo, "commit", "-m", "local")
+        local_tip = git(self.repo, "rev-parse", "HEAD")
+        remote_tip = git(self.remote, "rev-parse", "refs/heads/main")
+        self.write_config(mode="pull")
+
+        result = self.cli("sync", "--all")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        repo_result = json.loads(result.stdout)["results"][0]
+        self.assertFalse(repo_result["pulled"])
+        self.assertEqual(repo_result["push"], "skipped")
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), local_tip)
+        self.assertEqual(git(self.remote, "rev-parse", "refs/heads/main"), remote_tip)
+
+    def test_dirty_pull_mode_blocks_before_fetch(self) -> None:
+        peer = self.root / "dirty-peer"
+        git(self.root, "clone", str(self.remote), str(peer))
+        git(peer, "config", "user.name", "Test User")
+        git(peer, "config", "user.email", "test@example.com")
+        (peer / "remote.txt").write_text("remote\n", encoding="utf-8")
+        git(peer, "add", "remote.txt")
+        git(peer, "commit", "-m", "remote")
+        git(peer, "push")
+        head_before = git(self.repo, "rev-parse", "HEAD")
+        fetch_head = self.repo / ".git" / "FETCH_HEAD"
+        fetch_head_before = fetch_head.read_bytes() if fetch_head.exists() else None
+        (self.repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        self.write_config(mode="pull")
+
+        result = self.cli("sync", "--all")
+
+        self.assertEqual(result.returncode, 1)
+        repo_result = json.loads(result.stdout)["results"][0]
+        self.assertEqual(repo_result["mode"], "pull")
+        self.assertIn("dirty worktree", repo_result["blocker"])
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), head_before)
+        fetch_head_after = fetch_head.read_bytes() if fetch_head.exists() else None
+        self.assertEqual(fetch_head_after, fetch_head_before)
+
+    def test_pull_mode_merges_divergence_without_updating_remote(self) -> None:
+        peer = self.root / "diverged-peer"
+        git(self.root, "clone", str(self.remote), str(peer))
+        git(peer, "config", "user.name", "Test User")
+        git(peer, "config", "user.email", "test@example.com")
+        (peer / "remote.txt").write_text("remote\n", encoding="utf-8")
+        git(peer, "add", "remote.txt")
+        git(peer, "commit", "-m", "remote")
+        git(peer, "push")
+        remote_tip = git(self.remote, "rev-parse", "refs/heads/main")
+        (self.repo / "local.txt").write_text("local\n", encoding="utf-8")
+        git(self.repo, "add", "local.txt")
+        git(self.repo, "commit", "-m", "local")
+        self.write_config(mode="pull")
+
+        result = self.cli("sync", "--all")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        repo_result = json.loads(result.stdout)["results"][0]
+        self.assertTrue(repo_result["pulled"])
+        self.assertEqual(repo_result["push"], "skipped")
+        self.assertTrue((self.repo / "remote.txt").exists())
+        self.assertTrue((self.repo / "local.txt").exists())
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+        self.assertEqual(git(self.remote, "rev-parse", "refs/heads/main"), remote_tip)
+
+    def test_pull_mode_ignores_push_url_identity(self) -> None:
+        git(self.repo, "remote", "set-url", "--push", "origin", str(self.root / "wrong.git"))
+        self.write_config(mode="pull")
+        result = self.cli("sync", "--all")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)["results"][0]["push"], "skipped")
+
+        self.write_config(mode="push/pull")
+        result = self.cli("sync", "--all")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("origin push", result.stdout)
 
     def test_force_manually_syncs_all_repositories_without_force_push(self) -> None:
         result = self.cli("sync", "--force")
@@ -283,14 +392,55 @@ class GitsyncTest(unittest.TestCase):
         git(self.root, "clone", str(self.remote), str(verify))
         self.assertEqual((verify / "README.md").read_text(), "local intent\nremote intent\n")
 
+    def test_pull_mode_conflict_resolution_never_mutates_remote(self) -> None:
+        self._make_conflict()
+        remote_tip = git(self.remote, "rev-parse", "refs/heads/main")
+        record = self.root / "pull-codex-record.json"
+        fake = self.root / "pull-fake-codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json,os,subprocess,sys\n"
+            "from pathlib import Path\n"
+            "Path('README.md').write_text('local intent\\nremote intent\\n')\n"
+            "subprocess.run(['git','add','README.md'],check=True)\n"
+            "subprocess.run(['git','commit','--no-edit'],check=True)\n"
+            "push=subprocess.run(['git','push','origin','HEAD:refs/heads/main'],capture_output=True,text=True)\n"
+            "record={'argv':sys.argv[1:],'cwd':os.getcwd(),'push_returncode':push.returncode,'push_stderr':push.stderr}\n"
+            "Path(os.environ['CODEX_RECORD']).write_text(json.dumps(record))\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        self.write_config(mode="pull")
+
+        result = self.cli(
+            "sync",
+            "--all",
+            extra_env={"GITSYNC_CODEX_BIN": str(fake), "CODEX_RECORD": str(record)},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        repo_result = json.loads(result.stdout)["results"][0]
+        self.assertEqual(repo_result["push"], "skipped")
+        invocation = json.loads(record.read_text())
+        self.assertEqual(invocation["argv"][1:3], ["--sandbox", "workspace-write"])
+        prompt = invocation["argv"][-1]
+        self.assertIn("do not run git push", prompt)
+        self.assertIn("otherwise mutate any remote", prompt)
+        self.assertNotEqual(invocation["push_returncode"], 0)
+        self.assertIn("remote mutation disabled in pull mode", invocation["push_stderr"])
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+        self.assertEqual(git(self.remote, "rev-parse", "refs/heads/main"), remote_tip)
+
     def test_codex_failure_leaves_exact_conflict_blocker(self) -> None:
         self._make_conflict()
         fake = self.root / "failing-codex"
         fake.write_text("#!/bin/sh\necho unsafe >&2\nexit 42\n", encoding="utf-8")
         fake.chmod(0o755)
+        self.write_config(mode="pull")
         result = self.cli("sync", "--all", extra_env={"GITSYNC_CODEX_BIN": str(fake)})
         self.assertEqual(result.returncode, 1)
         self.assertIn("Codex could not safely resolve sync conflict: unsafe", result.stdout)
+        self.assertEqual(json.loads(result.stdout)["results"][0]["mode"], "pull")
         self.assertTrue(git(self.repo, "diff", "--name-only", "--diff-filter=U"))
 
 
