@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+"""Conservatively synchronize configured Git repositories."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Iterator, Sequence
+
+
+DEFAULT_CONFIG = Path("~/.config/gitsync/agcron.json").expanduser()
+DEFAULT_STATE_DIR = Path("~/.cache/gitsync").expanduser()
+LAUNCHD_LABEL = "com.kevinlin.gitsync"
+CRON_RANGES = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
+
+
+class GitsyncError(Exception):
+    """A configuration or repository safety error."""
+
+
+@dataclass(frozen=True)
+class RepoConfig:
+    name: str
+    path: Path
+    repo: str
+    sync_schedule: str
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+def _state_dir() -> Path:
+    return Path(os.environ.get("GITSYNC_STATE_DIR", str(DEFAULT_STATE_DIR))).expanduser()
+
+
+def _run(args: Sequence[str], *, cwd: Path | None = None) -> CommandResult:
+    try:
+        proc = subprocess.run(
+            list(args), cwd=cwd, capture_output=True, text=True, check=False
+        )
+    except OSError as exc:
+        raise GitsyncError(f"failed to run {args[0]}: {exc}") from exc
+    return CommandResult(proc.returncode, proc.stdout.strip(), proc.stderr.strip())
+
+
+def _detail(result: CommandResult) -> str:
+    text = result.stderr or result.stdout or f"exit {result.returncode}"
+    return text.splitlines()[-1]
+
+
+def _git(repo: Path, *args: str) -> CommandResult:
+    return _run(("git", *args), cwd=repo)
+
+
+def _require_git(repo: Path, *args: str, action: str) -> str:
+    result = _git(repo, *args)
+    if result.returncode != 0:
+        raise GitsyncError(f"{action}: {_detail(result)}")
+    return result.stdout
+
+
+def _expand_cron_part(part: str, minimum: int, maximum: int, field: str) -> set[int]:
+    if not part:
+        raise GitsyncError(f"invalid cron {field}: empty list item")
+    base, separator, step_text = part.partition("/")
+    if separator:
+        if not step_text.isdigit() or int(step_text) < 1:
+            raise GitsyncError(f"invalid cron {field}: step must be a positive integer")
+        step = int(step_text)
+    else:
+        step = 1
+
+    if base == "*":
+        start, end = minimum, maximum
+    elif "-" in base:
+        start_text, end_text = base.split("-", 1)
+        if not start_text.isdigit() or not end_text.isdigit():
+            raise GitsyncError(f"invalid cron {field}: ranges must be numeric")
+        start, end = int(start_text), int(end_text)
+    else:
+        if separator:
+            raise GitsyncError(f"invalid cron {field}: a step requires '*' or a range")
+        if not base.isdigit():
+            raise GitsyncError(f"invalid cron {field}: values must be numeric")
+        start = end = int(base)
+
+    if start < minimum or end > maximum or start > end:
+        raise GitsyncError(
+            f"invalid cron {field}: expected values from {minimum} through {maximum}"
+        )
+    return set(range(start, end + 1, step))
+
+
+def parse_cron(expression: str) -> tuple[set[int], ...]:
+    fields = expression.split()
+    names = ("minute", "hour", "day-of-month", "month", "day-of-week")
+    if len(fields) != 5:
+        raise GitsyncError("sync_schedule must be a five-field cron expression")
+    parsed: list[set[int]] = []
+    for raw, (minimum, maximum), name in zip(fields, CRON_RANGES, names):
+        values: set[int] = set()
+        for part in raw.split(","):
+            values.update(_expand_cron_part(part, minimum, maximum, name))
+        parsed.append(values)
+    parsed[4] = {0 if value == 7 else value for value in parsed[4]}
+    return tuple(parsed)
+
+
+def cron_matches(expression: str, when: datetime) -> bool:
+    minute, hour, month_day, month, week_day = parse_cron(expression)
+    cron_week_day = (when.weekday() + 1) % 7
+    fields = expression.split()
+    day_match = when.day in month_day
+    week_match = cron_week_day in week_day
+    dom_restricted = fields[2] != "*"
+    dow_restricted = fields[4] != "*"
+    if dom_restricted and dow_restricted:
+        combined_day_match = day_match or week_match
+    elif dom_restricted:
+        combined_day_match = day_match
+    elif dow_restricted:
+        combined_day_match = week_match
+    else:
+        combined_day_match = True
+    return (
+        when.minute in minute
+        and when.hour in hour
+        and when.month in month
+        and combined_day_match
+    )
+
+
+def load_config(path: Path) -> list[RepoConfig]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise GitsyncError(f"failed to read config {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise GitsyncError(f"invalid config JSON: {exc}") from exc
+    if not isinstance(raw, dict) or set(raw) != {"repos"}:
+        raise GitsyncError("config must be an object with exactly one top-level key: repos")
+    if not isinstance(raw["repos"], list):
+        raise GitsyncError("config.repos must be an array")
+
+    repos: list[RepoConfig] = []
+    names: set[str] = set()
+    paths: set[Path] = set()
+    for index, item in enumerate(raw["repos"]):
+        if not isinstance(item, dict) or set(item) != {"name", "path", "repo", "sync_schedule"}:
+            raise GitsyncError(
+                f"repos[{index}] must contain exactly name, path, repo, and sync_schedule"
+            )
+        if any(not isinstance(item[key], str) or not item[key].strip() for key in item):
+            raise GitsyncError(f"repos[{index}] fields must be non-empty strings")
+        name = item["name"].strip()
+        repo_path = Path(item["path"]).expanduser()
+        if not repo_path.is_absolute():
+            raise GitsyncError(f"repos[{index}].path must be absolute")
+        repo_path = repo_path.resolve(strict=False)
+        if name in names:
+            raise GitsyncError(f"duplicate repository name: {name}")
+        if repo_path in paths:
+            raise GitsyncError(f"duplicate repository path: {repo_path}")
+        parse_cron(item["sync_schedule"])
+        names.add(name)
+        paths.add(repo_path)
+        repos.append(RepoConfig(name, repo_path, item["repo"], item["sync_schedule"]))
+    return repos
+
+
+def _remote_identity(value: str, *, base: Path | None = None) -> str:
+    value = value.strip().rstrip("/")
+    scp = re.fullmatch(r"(?:[^@/]+@)?([^:/]+):(.+)", value)
+    if scp and "://" not in value:
+        host, path = scp.groups()
+        return f"{host.lower()}/{path.removesuffix('.git').strip('/')}"
+    url = re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]+@)?([^/:]+)(?::\d+)?/(.+)", value)
+    if url:
+        host, path = url.groups()
+        return f"{host.lower()}/{path.removesuffix('.git').strip('/')}"
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute() and base is not None:
+        candidate = base / candidate
+    return str(candidate.resolve(strict=False)).removesuffix("/.git")
+
+
+def _is_auth_error(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "authentication failed",
+            "permission denied",
+            "could not read username",
+            "terminal prompts disabled",
+            "repository not found",
+        )
+    )
+
+
+@contextmanager
+def repository_lock(config: RepoConfig) -> Iterator[None]:
+    lock_dir = _state_dir() / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(str(config.path).encode()).hexdigest()[:12]
+    lock_path = lock_dir / f"repo-{digest}.lock"
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise GitsyncError(f"concurrent sync already running for {config.name}") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _ensure_repository(config: RepoConfig) -> bool:
+    path = config.path
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        result = _run(("git", "clone", "--", config.repo, str(path)))
+        if result.returncode != 0:
+            if _is_auth_error(result.stderr + result.stdout):
+                raise GitsyncError(f"authentication failed while cloning: {_detail(result)}")
+            raise GitsyncError(f"failed to clone missing repository: {_detail(result)}")
+        return True
+    if not path.is_dir():
+        raise GitsyncError(f"repository path is not a directory: {path}")
+    if not (path / ".git").exists():
+        contents = next(path.iterdir(), None)
+        suffix = " (not empty)" if contents is not None else ""
+        raise GitsyncError(f"repository path is not a Git repository{suffix}: {path}")
+    return False
+
+
+def _resolve_conflict_with_codex(config: RepoConfig) -> None:
+    prompt = (
+        "Resolve only the current Git merge conflict created while synchronizing this repository. "
+        "Preserve both the local committed intent and the incoming upstream intent deliberately; "
+        "do not reset, discard, amend, force-push, or change unrelated files. Inspect every unmerged "
+        "path, resolve and stage it, complete the existing merge commit, then verify `git diff "
+        "--name-only --diff-filter=U` is empty and the worktree is clean. If safe intent cannot be "
+        "determined, stop and report the exact unresolved paths without guessing."
+    )
+    codex_bin = os.environ.get("GITSYNC_CODEX_BIN") or shutil.which("codex")
+    if not codex_bin:
+        raise GitsyncError(
+            "Codex could not safely resolve sync conflict: codex executable not found; "
+            "set GITSYNC_CODEX_BIN to its absolute path"
+        )
+    result = _run((codex_bin, "exec", prompt), cwd=config.path)
+    if result.returncode != 0:
+        raise GitsyncError(f"Codex could not safely resolve sync conflict: {_detail(result)}")
+    unmerged = _git(config.path, "diff", "--name-only", "--diff-filter=U")
+    if unmerged.returncode != 0 or unmerged.stdout:
+        paths = unmerged.stdout.replace("\n", ", ") or _detail(unmerged)
+        raise GitsyncError(f"Codex left unresolved sync conflicts: {paths}")
+    merge_head = config.path / ".git" / "MERGE_HEAD"
+    status = _git(config.path, "status", "--porcelain")
+    if merge_head.exists() or status.returncode != 0 or status.stdout:
+        detail = "merge is still in progress" if merge_head.exists() else (status.stdout or _detail(status))
+        raise GitsyncError(f"Codex did not leave a clean, completed merge: {detail}")
+
+
+def _fetch(config: RepoConfig) -> None:
+    result = _git(config.path, "fetch", "--prune", "origin")
+    if result.returncode != 0:
+        if _is_auth_error(result.stderr + result.stdout):
+            raise GitsyncError(f"authentication failed while fetching origin: {_detail(result)}")
+        raise GitsyncError(f"failed to fetch origin: {_detail(result)}")
+
+
+def _merge_upstream(config: RepoConfig) -> bool:
+    counts = _require_git(
+        config.path,
+        "rev-list",
+        "--left-right",
+        "--count",
+        "HEAD...@{upstream}",
+        action="failed to compare upstream",
+    ).split()
+    if len(counts) != 2:
+        raise GitsyncError("failed to compare upstream: unexpected git output")
+    ahead, behind = map(int, counts)
+    if behind == 0:
+        return False
+    args = ("merge", "--ff-only", "@{upstream}") if ahead == 0 else ("merge", "--no-edit", "@{upstream}")
+    result = _git(config.path, *args)
+    if result.returncode == 0:
+        return True
+    unmerged = _git(config.path, "diff", "--name-only", "--diff-filter=U")
+    if unmerged.returncode == 0 and unmerged.stdout:
+        _resolve_conflict_with_codex(config)
+        return True
+    raise GitsyncError(f"non-fast-forward update could not be merged safely: {_detail(result)}")
+
+
+def _push(config: RepoConfig, upstream: str) -> str:
+    remote_branch = upstream.split("/", 1)[1]
+    destination = f"HEAD:refs/heads/{remote_branch}"
+    result = _git(config.path, "push", "origin", destination)
+    if result.returncode == 0:
+        text = f"{result.stdout}\n{result.stderr}".lower()
+        return "no-op" if "up-to-date" in text or "up to date" in text else "pushed"
+    if _is_auth_error(result.stderr + result.stdout):
+        raise GitsyncError(f"authentication failed while pushing origin: {_detail(result)}")
+    text = (result.stderr + result.stdout).lower()
+    if "non-fast-forward" not in text and "fetch first" not in text and "rejected" not in text:
+        raise GitsyncError(f"failed to push origin: {_detail(result)}")
+
+    _fetch(config)
+    _merge_upstream(config)
+    retry = _git(config.path, "push", "origin", destination)
+    if retry.returncode != 0:
+        if _is_auth_error(retry.stderr + retry.stdout):
+            raise GitsyncError(f"authentication failed while retrying push: {_detail(retry)}")
+        raise GitsyncError(f"non-fast-forward push still rejected after one merge retry: {_detail(retry)}")
+    return "pushed-after-retry"
+
+
+def sync_repository(config: RepoConfig) -> dict[str, object]:
+    with repository_lock(config):
+        cloned = _ensure_repository(config)
+        head = _git(config.path, "symbolic-ref", "--quiet", "--short", "HEAD")
+        if head.returncode != 0:
+            raise GitsyncError("detached HEAD; check out a branch before syncing")
+        status = _require_git(config.path, "status", "--porcelain", action="failed to inspect worktree")
+        if status:
+            raise GitsyncError("dirty worktree; commit or remove local changes before syncing")
+        upstream = _git(config.path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+        if upstream.returncode != 0:
+            raise GitsyncError(f"branch {head.stdout} has no upstream")
+        remote_name = upstream.stdout.split("/", 1)[0]
+        if remote_name != "origin":
+            raise GitsyncError(f"upstream must use origin, found {upstream.stdout}")
+        actual_fetch_remote = _require_git(
+            config.path, "remote", "get-url", "origin", action="failed to read origin URL"
+        )
+        actual_push_remote = _require_git(
+            config.path,
+            "remote",
+            "get-url",
+            "--push",
+            "origin",
+            action="failed to read origin push URL",
+        )
+        expected_identity = _remote_identity(config.repo, base=config.path)
+        if _remote_identity(actual_fetch_remote, base=config.path) != expected_identity:
+            raise GitsyncError(
+                "remote identity mismatch: "
+                f"config has {config.repo!r}, origin fetch has {actual_fetch_remote!r}"
+            )
+        if _remote_identity(actual_push_remote, base=config.path) != expected_identity:
+            raise GitsyncError(
+                "remote identity mismatch: "
+                f"config has {config.repo!r}, origin push has {actual_push_remote!r}"
+            )
+
+        before = _require_git(config.path, "rev-parse", "HEAD", action="failed to read HEAD")
+        _fetch(config)
+        pulled = _merge_upstream(config)
+        push_status = _push(config, upstream.stdout)
+        after = _require_git(config.path, "rev-parse", "HEAD", action="failed to read final HEAD")
+        return {
+            "name": config.name,
+            "path": str(config.path),
+            "status": "ok",
+            "cloned": cloned,
+            "pulled": pulled,
+            "push": push_status,
+            "before": before,
+            "after": after,
+        }
+
+
+def _claim_due(repos: list[RepoConfig], when: datetime) -> list[RepoConfig]:
+    due = [repo for repo in repos if cron_matches(repo.sync_schedule, when)]
+    if not due:
+        return []
+    state_dir = _state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_path = state_dir / "schedule-state.json"
+    lock_path = state_dir / "schedule-state.lock"
+    slot = when.strftime("%Y-%m-%dT%H:%M")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+        except (OSError, json.JSONDecodeError):
+            state = {}
+        selected = [repo for repo in due if state.get(repo.name) != slot]
+        for repo in selected:
+            state[repo.name] = slot
+        temporary = state_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.replace(state_path)
+        return selected
+
+
+def _launchd_plist(config_path: Path, executable: Path) -> str:
+    from xml.sax.saxutils import escape
+
+    log_dir = Path("~/Library/Logs").expanduser()
+    codex_bin = os.environ.get("GITSYNC_CODEX_BIN") or shutil.which("codex")
+    codex_environment = ""
+    if codex_bin:
+        codex_environment = (
+            "  <key>EnvironmentVariables</key>\n"
+            "  <dict><key>GITSYNC_CODEX_BIN</key>"
+            f"<string>{escape(str(Path(codex_bin).expanduser().resolve(strict=False)))}</string></dict>\n"
+        )
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{escape(str(executable))}</string>
+    <string>--config</string><string>{escape(str(config_path))}</string>
+    <string>sync</string><string>--due</string>
+  </array>
+{codex_environment}\
+  <key>StartInterval</key><integer>60</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>{escape(str(log_dir / (LAUNCHD_LABEL + '.log')))}</string>
+  <key>StandardErrorPath</key><string>{escape(str(log_dir / (LAUNCHD_LABEL + '.error.log')))}</string>
+</dict>
+</plist>
+'''
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("validate", help="validate configuration")
+    sync = subparsers.add_parser("sync", help="synchronize repositories")
+    selection = sync.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--due", action="store_true", help="sync repositories due now")
+    selection.add_argument(
+        "--all",
+        "--force",
+        dest="all",
+        action="store_true",
+        help="manually sync every repository, ignoring schedules (never force-pushes)",
+    )
+    selection.add_argument("--name", help="sync one repository by name")
+    launchd = subparsers.add_parser("launchd-plist", help="print a launchd agent plist")
+    launchd.add_argument("--executable", type=Path, default=Path(__file__).resolve())
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    config_path = args.config.expanduser().resolve(strict=False)
+    try:
+        repos = load_config(config_path)
+        if args.command == "validate":
+            print(json.dumps({"status": "valid", "config": str(config_path), "repos": len(repos)}))
+            return 0
+        if args.command == "launchd-plist":
+            print(_launchd_plist(config_path, args.executable.expanduser().resolve(strict=False)), end="")
+            return 0
+
+        if args.all:
+            selected = repos
+        elif args.name:
+            selected = [repo for repo in repos if repo.name == args.name]
+            if not selected:
+                raise GitsyncError(f"unknown repository name: {args.name}")
+        else:
+            selected = _claim_due(repos, datetime.now().astimezone())
+
+        results: list[dict[str, object]] = []
+        for repo in selected:
+            try:
+                results.append(sync_repository(repo))
+            except GitsyncError as exc:
+                results.append({"name": repo.name, "path": str(repo.path), "status": "blocked", "blocker": str(exc)})
+        summary = {
+            "status": "ok" if all(item["status"] == "ok" for item in results) else "blocked",
+            "selected": len(selected),
+            "results": results,
+        }
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0 if summary["status"] == "ok" else 1
+    except GitsyncError as exc:
+        print(f"gitsync: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
