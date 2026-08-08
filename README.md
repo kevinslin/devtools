@@ -11,7 +11,7 @@ A bunch of useful tools. Designed by human. Made by codex.
 
 ## CLI index
 
-- 🌱 `seed`: [gitsync](tools/gitsync/README.md); entry point `tools/gitsync/bin/gitsync`; safely synchronize cron-scheduled Git repositories with optional post-sync hooks using launchd
+- 🌱 `seed`: [gitsync](tools/gitsync/README.md); entry point `tools/gitsync/bin/gitsync`; inspect fetch/worktree status and safely synchronize cron-scheduled Git repositories with optional post-sync hooks using launchd
 - 🌳 `oak`: [tokemon](tools/tokemon/README.md) <img src="assets/tokemon-inline.png" alt="Tokemon token mascot" width="24" height="24" style="vertical-align: text-bottom;" />; entry point `tools/tokemon/bin/tokemon`; report token usage from local Codex and Claude session logs, including the data backend used by the Tokemon menu app
 - 🌳 `oak`: [jsonlint](tools/jsonlint/README.md) <img src="assets/jsonlint-inline.png" alt="JSON validator mascot" width="24" height="24" style="vertical-align: text-bottom;" />; entry point `tools/jsonlint/bin/jsonlint`; validate JSON from a file path or stdin
 - 🌳 `oak`: [mdpaste](tools/mdpaste/README.md) <img src="assets/mdpaste-inline.png" alt="Markdown clipboard mascot" width="24" height="24" style="vertical-align: text-bottom;" />; entry point `tools/mdpaste/bin/mdpaste`; convert Markdown in the clipboard into rich text for paste targets like Gmail and Google Docs

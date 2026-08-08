@@ -21,7 +21,7 @@ from typing import Iterator, Mapping, Sequence
 
 
 DEFAULT_CONFIG = Path("~/.config/gitsync/agcron.json").expanduser()
-DEFAULT_STATE_DIR = Path("~/.cache/gitsync").expanduser()
+DEFAULT_STATE_HOME = Path("~/.local/state").expanduser()
 LAUNCHD_LABEL = "com.kevinlin.gitsync"
 CRON_RANGES = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
 PUSH_PULL_MODE = "push/pull"
@@ -55,7 +55,103 @@ class CommandResult:
 
 
 def _state_dir() -> Path:
-    return Path(os.environ.get("GITSYNC_STATE_DIR", str(DEFAULT_STATE_DIR))).expanduser()
+    override = os.environ.get("GITSYNC_STATE_DIR")
+    if override:
+        return Path(override).expanduser()
+    state_home = Path(os.environ.get("XDG_STATE_HOME") or str(DEFAULT_STATE_HOME)).expanduser()
+    return state_home / "gitsync"
+
+
+def _repository_state_path(config: RepoConfig) -> Path:
+    digest = hashlib.sha256(str(config.path).encode()).hexdigest()[:12]
+    return _state_dir() / "repositories" / f"{digest}.json"
+
+
+def _record_fetch(config: RepoConfig) -> None:
+    state_path = _repository_state_path(config)
+    temporary: Path | None = None
+    try:
+        state_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=state_path.parent,
+            prefix=f".{state_path.stem}-",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(
+                {
+                    "name": config.name,
+                    "path": str(config.path),
+                    "last_fetched": datetime.now().astimezone().isoformat(timespec="seconds"),
+                },
+                handle,
+                indent=2,
+                sort_keys=True,
+            )
+            handle.write("\n")
+        temporary.replace(state_path)
+    except OSError as exc:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise GitsyncError(f"failed to record fetch state for {config.name}: {exc}") from exc
+
+
+def _last_fetched(config: RepoConfig) -> str | None:
+    state_path = _repository_state_path(config)
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        state = None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise GitsyncError(f"failed to read fetch state for {config.name}: {exc}") from exc
+    if isinstance(state, dict) and isinstance(state.get("last_fetched"), str):
+        return state["last_fetched"]
+
+    git_path = _git(config.path, "rev-parse", "--git-path", "FETCH_HEAD")
+    if git_path.returncode != 0:
+        return None
+    fetch_head = Path(git_path.stdout)
+    if not fetch_head.is_absolute():
+        fetch_head = config.path / fetch_head
+    try:
+        return datetime.fromtimestamp(fetch_head.stat().st_mtime).astimezone().isoformat(
+            timespec="seconds"
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise GitsyncError(f"failed to inspect fetch time for {config.name}: {exc}") from exc
+
+
+def repository_status(config: RepoConfig) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "name": config.name,
+        "path": str(config.path),
+        "repo": config.repo,
+        "sync_schedule": config.sync_schedule,
+        "mode": config.mode,
+        "last_fetched": None,
+        "dirty": None,
+    }
+    if not config.path.exists():
+        entry["status"] = "missing"
+        return entry
+    if not config.path.is_dir():
+        entry["status"] = "invalid"
+        entry["error"] = "repository path is not a directory"
+        return entry
+
+    status = _git(config.path, "--no-optional-locks", "status", "--porcelain")
+    if status.returncode != 0:
+        entry["status"] = "invalid"
+        entry["error"] = _detail(status)
+        return entry
+    entry["status"] = "ok"
+    entry["dirty"] = bool(status.stdout)
+    entry["last_fetched"] = _last_fetched(config)
+    return entry
 
 
 def _run(
@@ -393,6 +489,7 @@ def _fetch(config: RepoConfig) -> None:
         if _is_auth_error(result.stderr + result.stdout):
             raise GitsyncError(f"authentication failed while fetching origin: {_detail(result)}")
         raise GitsyncError(f"failed to fetch origin: {_detail(result)}")
+    _record_fetch(config)
 
 
 def _merge_upstream(config: RepoConfig) -> bool:
@@ -610,6 +707,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("validate", help="validate configuration")
+    subparsers.add_parser("status", help="show configured repositories, fetch times, and worktree state")
     sync = subparsers.add_parser("sync", help="synchronize repositories")
     selection = sync.add_mutually_exclusive_group(required=True)
     selection.add_argument("--due", action="store_true", help="sync repositories due now")
@@ -633,6 +731,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         repos = load_config(config_path)
         if args.command == "validate":
             print(json.dumps({"status": "valid", "config": str(config_path), "repos": len(repos)}))
+            return 0
+        if args.command == "status":
+            print(
+                json.dumps(
+                    {"status": "ok", "repos": [repository_status(repo) for repo in repos]},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
             return 0
         if args.command == "launchd-plist":
             print(_launchd_plist(config_path, args.executable.expanduser().resolve(strict=False)), end="")

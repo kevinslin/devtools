@@ -68,6 +68,7 @@ Do not use a bare or repository-wide `chezmoi apply` to activate the hook: unrel
 
 ```bash
 gitsync validate
+gitsync status
 gitsync sync --due
 gitsync sync --all
 gitsync sync --force
@@ -76,6 +77,41 @@ gitsync --config /path/to/agcron.json sync --all
 ```
 
 `--due` claims each matching repository once per local clock minute. `--all` and its manual-friendly alias `--force` ignore schedules and sync every configured repository. Here, “force” only forces an immediate run: it never overrides the configured mode or enables Git force-push, reset, discard, or safety-check bypasses. `--name` selects one configured repository. Results are JSON; exit `0` means all selected repositories synced, `1` means at least one repository was safely blocked, and `2` means the command or configuration was invalid.
+
+## Repository status
+
+`gitsync status` lists every configured repository without fetching, syncing,
+creating a missing checkout, or writing state:
+
+```json
+{
+  "status": "ok",
+  "repos": [
+    {
+      "name": "agents",
+      "path": "/Users/kevinlin/agents",
+      "repo": "https://github.com/openai/kevinlin-agents.git",
+      "sync_schedule": "*/10 * * * *",
+      "mode": "pull",
+      "last_fetched": "2026-08-08T11:30:00-07:00",
+      "dirty": false,
+      "status": "ok"
+    }
+  ]
+}
+```
+
+`last_fetched` is the timestamp of the most recent successful fetch, even when
+a later merge, push, or post-sync hook fails. Existing repositories that have
+not yet recorded gitsync state fall back to their Git `FETCH_HEAD` timestamp;
+repositories without any observed fetch report `null`. A missing checkout is
+reported with `status: "missing"` and `dirty: null`; invalid repository paths
+are reported without attempting to repair them.
+
+Fetch history, scheduled-run claims, and repository locks live in
+`$XDG_STATE_HOME/gitsync/`, or `~/.local/state/gitsync/` when `XDG_STATE_HOME`
+is unset. `GITSYNC_STATE_DIR` overrides the complete directory for isolated
+tests or an explicitly managed deployment.
 
 ## Scheduling with launchd
 
@@ -94,7 +130,7 @@ To replace an existing registration, boot it out first, regenerate the plist, an
 launchctl bootout "gui/$(id -u)/com.kevinlin.gitsync"
 ```
 
-The generated plist uses the resolved CLI and config paths. Logs go to `~/Library/Logs/com.kevinlin.gitsync.log` and `.error.log`. Scheduled runs keep claim and lock files under `~/.cache/gitsync`.
+The generated plist uses the resolved CLI and config paths. Logs go to `~/Library/Logs/com.kevinlin.gitsync.log` and `.error.log`. Scheduled runs keep claim and lock files under `$XDG_STATE_HOME/gitsync/`, defaulting to `~/.local/state/gitsync/`.
 
 ## Safety behavior
 

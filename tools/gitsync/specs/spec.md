@@ -36,6 +36,11 @@ syncs and newly cloned repositories.
   identity and old/new Git heads exposed through environment variables.
 - Release a scheduled due claim only when its post-sync hook fails, allowing a
   same-minute retry without changing ordinary blocker suppression.
+- Add a read-only `status` command exposing configured repositories, their
+  latest successful fetch timestamps, and their current dirty-worktree state.
+- Store fetch history, schedule claims, and repository locks in
+  `$XDG_STATE_HOME/gitsync/`, defaulting to `~/.local/state/gitsync/`, while
+  preserving the existing `GITSYNC_STATE_DIR` override.
 - Add integration coverage for pull-only success, dirty-worktree denial, and
   conflict recovery, hook validation and execution, guarded ordinary pushes,
   and scheduled retry behavior.
@@ -186,6 +191,25 @@ JSON consumers retain a stable shape:
 `push/pull` retains `no-op`, `pushed`, and `pushed-after-retry`. `pull` always
 reports `skipped`, including when no incoming commit exists.
 
+### Repository status and persistent state
+
+`gitsync status` loads every configured repository and returns a JSON object
+with `status: "ok"` and a `repos` array. Each entry includes the repository
+name, canonical path, configured remote, schedule, mode, `last_fetched`,
+`dirty`, and per-repository status. Missing checkouts and invalid paths are
+reported rather than cloned or repaired. Worktree inspection uses Git's
+`--no-optional-locks` mode; status never fetches or writes state.
+
+Every successful `git fetch` immediately records a timezone-aware timestamp in
+an atomically replaced, per-repository state file. This timestamp remains
+available if a later merge, push, or post-sync hook fails. Repositories with no
+recorded gitsync history fall back to the modification time of `FETCH_HEAD`;
+repositories without either source report `null`.
+
+Persistent repository history, schedule claims, and locks share the XDG state
+root: `$XDG_STATE_HOME/gitsync/`, or `~/.local/state/gitsync/` by default.
+`GITSYNC_STATE_DIR` takes precedence when explicitly configured.
+
 ## Implementation
 
 1. Extend `RepoConfig` and `load_config` in
@@ -225,6 +249,9 @@ reports `skipped`, including when no incoming commit exists.
 | Hooks receive the correct context | Run no-op, fast-forward, and newly cloned syncs; assert working directory, literal argv, repository identity, and old/new heads. |
 | Pull-only hooks reject ordinary pushes | Execute an ordinary `git push` from a trusted test hook and verify the wrapper blocks it without changing the remote. |
 | Hook failures retry without broadening retries | Assert a failed post-sync hook releases only its due claim while an ordinary dirty-worktree blocker keeps its claim. |
+| Status inventories repositories safely | Configure clean, dirty, and missing repositories; verify all are listed without fetch, clone, or state writes. |
+| Successful fetch history remains observable | Verify a timezone-aware timestamp survives successful sync and later hook failure, with `FETCH_HEAD` fallback for older repositories. |
+| Persistent state follows XDG conventions | Set `XDG_STATE_HOME` and verify fetch records and repository locks are created under its `gitsync/` subdirectory. |
 | Agents reconciliation works end to end | Pull a temporary upstream commit through real `gitsync`; execute the committed agents hook and verify chezmoi updates the private destination. |
 | Conflicting local changes remain recoverable | Verify backups, clean three-way merges, deduplicated Slack escalation, preserved symlinks, and pending baselines across later upstream commits. |
 | Existing push/pull behavior does not regress | Run the full focused `test_gitsync.py` suite, including push retry, upstream targeting, locks, cron, and manual `--force`. |

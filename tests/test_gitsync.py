@@ -71,6 +71,104 @@ class GitsyncTest(unittest.TestCase):
             env.update(extra_env)
         return run([sys.executable, str(CLI), "--config", str(self.config), *args], env=env)
 
+    def test_status_lists_clean_dirty_and_missing_repositories_without_mutating_state(self) -> None:
+        dirty_repo = self.root / "dirty-repo"
+        git(self.root, "clone", str(self.remote), str(dirty_repo))
+        (dirty_repo / "untracked.txt").write_text("local change\n", encoding="utf-8")
+        missing_repo = self.root / "missing-repo"
+        configured = json.loads(self.config.read_text(encoding="utf-8"))["repos"]
+        configured.extend(
+            [
+                {
+                    "name": "dirty",
+                    "path": str(dirty_repo),
+                    "repo": str(self.remote),
+                    "sync_schedule": "*/10 * * * *",
+                    "mode": "pull",
+                },
+                {
+                    "name": "missing",
+                    "path": str(missing_repo),
+                    "repo": str(self.remote),
+                    "sync_schedule": "*/15 * * * *",
+                },
+            ]
+        )
+        self.config.write_text(json.dumps({"repos": configured}), encoding="utf-8")
+
+        result = self.cli("status")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "ok")
+        entries = {entry["name"]: entry for entry in payload["repos"]}
+        self.assertEqual(set(entries), {"test", "dirty", "missing"})
+        self.assertFalse(entries["test"]["dirty"])
+        self.assertTrue(entries["dirty"]["dirty"])
+        self.assertEqual(entries["dirty"]["mode"], "pull")
+        self.assertEqual(entries["missing"]["status"], "missing")
+        self.assertIsNone(entries["missing"]["dirty"])
+        self.assertFalse(missing_repo.exists())
+        self.assertFalse(self.state.exists())
+
+    def test_status_reports_successful_fetch_from_persistent_state(self) -> None:
+        before = self.cli("status")
+        self.assertEqual(before.returncode, 0, before.stderr)
+        self.assertIsNone(json.loads(before.stdout)["repos"][0]["last_fetched"])
+
+        synced = self.cli("sync", "--all")
+        self.assertEqual(synced.returncode, 0, synced.stdout + synced.stderr)
+
+        result = self.cli("status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = json.loads(result.stdout)["repos"][0]
+        self.assertEqual(entry["path"], str(self.repo.resolve()))
+        self.assertFalse(entry["dirty"])
+        self.assertIsNotNone(datetime.fromisoformat(entry["last_fetched"]).tzinfo)
+        state_files = list((self.state / "repositories").glob("*.json"))
+        self.assertEqual(len(state_files), 1)
+        self.assertEqual(
+            json.loads(state_files[0].read_text(encoding="utf-8"))["last_fetched"],
+            entry["last_fetched"],
+        )
+
+    def test_status_reads_existing_fetch_head_without_creating_state(self) -> None:
+        git(self.repo, "fetch", "origin")
+
+        result = self.cli("status")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNotNone(json.loads(result.stdout)["repos"][0]["last_fetched"])
+        self.assertFalse(self.state.exists())
+
+    def test_successful_fetch_is_recorded_when_later_hook_fails(self) -> None:
+        self.write_config(post_sync=["./missing-post-sync"])
+
+        synced = self.cli("sync", "--all")
+
+        self.assertEqual(synced.returncode, 1)
+        result = self.cli("status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNotNone(json.loads(result.stdout)["repos"][0]["last_fetched"])
+
+    def test_sync_defaults_to_xdg_state_home(self) -> None:
+        state_home = self.root / "xdg-state"
+        environment = os.environ.copy()
+        environment.pop("GITSYNC_STATE_DIR", None)
+        environment["XDG_STATE_HOME"] = str(state_home)
+
+        result = subprocess.run(
+            [sys.executable, str(CLI), "--config", str(self.config), "sync", "--all"],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((state_home / "gitsync" / "locks").is_dir())
+        self.assertEqual(len(list((state_home / "gitsync" / "repositories").glob("*.json"))), 1)
+
     def test_validate_accepts_cron_lists_ranges_and_steps(self) -> None:
         self.write_config(sync_schedule="*/15 8-18 * * 1,3,5", mode="pull")
         result = self.cli("validate")
