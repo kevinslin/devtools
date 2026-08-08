@@ -139,13 +139,6 @@ class GitsyncTest(unittest.TestCase):
         self.assertTrue((verify / "remote.txt").exists())
         self.assertTrue((verify / "local.txt").exists())
 
-    def test_no_op_sync_still_runs_push_path(self) -> None:
-        result = self.cli("sync", "--name", "test")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        repo_result = json.loads(result.stdout)["results"][0]
-        self.assertEqual(repo_result["mode"], "push/pull")
-        self.assertEqual(repo_result["push"], "no-op")
-
     def test_post_sync_runs_after_no_op_with_literal_arguments(self) -> None:
         record = self.root / "post-sync-record.json"
         injected = self.root / "must-not-exist"
@@ -164,6 +157,9 @@ class GitsyncTest(unittest.TestCase):
         result = self.cli("sync", "--name", "test")
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        repo_result = json.loads(result.stdout)["results"][0]
+        self.assertEqual(repo_result["mode"], "push/pull")
+        self.assertEqual(repo_result["push"], "no-op")
         invocation = json.loads(record.read_text(encoding="utf-8"))
         self.assertEqual(invocation["cwd"], str(self.repo.resolve()))
         self.assertEqual(invocation["repo"], str(self.repo.resolve()))
@@ -346,14 +342,6 @@ class GitsyncTest(unittest.TestCase):
         self.assertEqual(summary["selected"], 1)
         self.assertEqual(summary["results"][0]["push"], "no-op")
 
-    def test_missing_repository_is_cloned(self) -> None:
-        missing = self.root / "missing"
-        self.write_config(path=str(missing))
-        result = self.cli("sync", "--all")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue((missing / ".git").exists())
-        self.assertTrue(json.loads(result.stdout)["results"][0]["cloned"])
-
     def test_post_sync_runs_for_newly_cloned_repository(self) -> None:
         missing = self.root / "hook-clone"
         record = self.root / "clone-heads.json"
@@ -367,6 +355,8 @@ class GitsyncTest(unittest.TestCase):
         result = self.cli("sync", "--all")
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((missing / ".git").exists())
+        self.assertTrue(json.loads(result.stdout)["results"][0]["cloned"])
         head = git(missing, "rev-parse", "HEAD")
         self.assertEqual(json.loads(record.read_text(encoding="utf-8")), [head, head])
 

@@ -395,27 +395,6 @@ class SshxCliTest(unittest.TestCase):
             self.assertIn("./.custom-work", work_result.stdout)
             self.assertNotIn("./.custom-default", work_result.stdout)
 
-    def test_loads_config_from_home_config_directory_by_default(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            home = tmp_path / "home"
-            home.mkdir()
-            _write_file(home / ".home-profile", "home\n")
-            _write_profile_config(
-                home / ".config" / "sshx" / "config.yaml",
-                default_paths=(".home-profile",),
-            )
-
-            result = self.run_cli(
-                ["--dry-run", "--sync-method", "rsync", "devbox"],
-                home=home,
-                ssh_bin=tmp_path / "fake-ssh",
-                rsync_bin=tmp_path / "fake-rsync",
-            )
-
-            self.assertEqual(result.returncode, 0, msg=result.stderr)
-            self.assertIn("./.home-profile", result.stdout)
-
     def test_xdg_config_home_overrides_default_config_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

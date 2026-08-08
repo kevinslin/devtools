@@ -63,3 +63,13 @@ For every CLI in this project, keep `README.md` updated.
   - `🌳 oak`: battle tested. good for general usage
 - If a CLI is renamed or removed, update or remove its root `README.md` entry,
   project README, and any compatibility symlink in the same change.
+
+## Testing
+
+- Add tests only when they cover a distinct production behavior, meaningful
+  failure mode, or integration boundary.
+- Do not add tests that merely validate fixtures they construct, duplicate
+  stronger existing tests, or check implementation trivia.
+- Fold related assertions into existing integration tests when practical, and
+  run focused suites during iteration; reserve expensive full-suite runs for
+  changes that require broad verification.

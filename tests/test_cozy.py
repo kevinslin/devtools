@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import plistlib
 import subprocess
 import tempfile
 import unittest
@@ -21,37 +20,6 @@ class CozyCliTest(unittest.TestCase):
         self.home.mkdir()
         self.default_config = self.home / ".config" / "cozy" / "config.yaml"
         self.write_config(self.default_config)
-        self.launch_agent = (
-            self.home / "Library" / "LaunchAgents" / "com.kevinlin.cozy.plist"
-        )
-        self.launch_agent.parent.mkdir(parents=True)
-        agent = {
-            "Label": "com.kevinlin.cozy",
-            "ProgramArguments": [
-                str(CLI),
-                "__serve",
-                "--config",
-                str(self.default_config),
-                "--listen",
-                "127.0.0.1:8080",
-            ],
-            "WorkingDirectory": str(ROOT),
-            "RunAtLoad": True,
-            "KeepAlive": True,
-            "ExitTimeOut": 15,
-            "EnvironmentVariables": {
-                "PATH": os.pathsep.join([str(ROOT / "bin"), "/usr/bin", "/bin"]),
-                "GOCACHE": str(GO_CACHE),
-            },
-            "StandardOutPath": str(
-                self.home / "Library" / "Logs" / "com.kevinlin.cozy.log"
-            ),
-            "StandardErrorPath": str(
-                self.home / "Library" / "Logs" / "com.kevinlin.cozy.error.log"
-            ),
-        }
-        with self.launch_agent.open("wb") as destination:
-            plistlib.dump(agent, destination)
 
     def write_config(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -102,20 +70,6 @@ class CozyCliTest(unittest.TestCase):
         self.assertIn("Usage: cozy", result.stdout)
         self.assertIn("refresh", result.stdout)
         self.assertIn("restart", result.stdout)
-
-    def test_default_agtask_site_uses_the_existing_launcher(self) -> None:
-        configuration = self.default_config.read_text(encoding="utf-8")
-        agtask_site = configuration.split("  - name: agtask.localhost\n", 1)[1]
-        dashboard_command = next(
-            line.removeprefix("    run: ")
-            for line in agtask_site.splitlines()
-            if line.startswith("    run: ")
-        )
-        dashboard_executable = Path(dashboard_command.split(maxsplit=1)[0])
-
-        self.assertEqual(dashboard_executable, CLI)
-        self.assertTrue(dashboard_executable.is_file())
-        self.assertTrue(os.access(dashboard_executable, os.X_OK))
 
     def test_check_uses_default_user_configuration(self) -> None:
         result = self.run_cli(
@@ -212,49 +166,6 @@ class CozyCliTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("missing.yaml", result.stderr)
-
-    def test_launch_agent_supervises_the_foreground_cozy_process(self) -> None:
-        self.assertTrue(self.launch_agent.is_file())
-
-        with self.launch_agent.open("rb") as source:
-            agent = plistlib.load(source)
-
-        self.assertEqual(agent["Label"], "com.kevinlin.cozy")
-        self.assertEqual(
-            agent["ProgramArguments"],
-            [
-                str(CLI),
-                "__serve",
-                "--config",
-                str(self.default_config),
-                "--listen",
-                "127.0.0.1:8080",
-            ],
-        )
-        self.assertEqual(agent["WorkingDirectory"], str(ROOT))
-        self.assertTrue(agent["RunAtLoad"])
-        self.assertTrue(agent["KeepAlive"])
-        self.assertGreaterEqual(agent["ExitTimeOut"], 10)
-
-    def test_launch_agent_can_resolve_managed_service_executables(self) -> None:
-        with self.launch_agent.open("rb") as source:
-            agent = plistlib.load(source)
-
-        environment = agent["EnvironmentVariables"]
-        self.assertIn(str(ROOT / "bin"), environment["PATH"].split(os.pathsep))
-        self.assertEqual(
-            environment["GOCACHE"],
-            str(GO_CACHE),
-        )
-        self.assertEqual(
-            agent["StandardOutPath"],
-            str(self.home / "Library" / "Logs" / "com.kevinlin.cozy.log"),
-        )
-        self.assertEqual(
-            agent["StandardErrorPath"],
-            str(self.home / "Library" / "Logs" / "com.kevinlin.cozy.error.log"),
-        )
-
 
 if __name__ == "__main__":
     unittest.main()
