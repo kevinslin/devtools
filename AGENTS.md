@@ -12,21 +12,32 @@ tools/<project>/ or apps/<project>/
   README.md   # Human-facing documentation; required for every project.
   AGENTS.md   # Project-specific agent instructions, only when needed.
   bin/        # Project-owned executable entry points.
-  config/     # Project-owned runtime configuration.
   docs/       # Supporting architecture, flow, or research documentation.
+  playbooks/  # Portable Ansible playbooks and task source, when needed.
   specs/      # Project design and implementation specifications.
+  src/        # Project implementation sources, when needed.
 ```
 
 Create optional directories only when the project actually has content for
-them. Project-specific implementation sources may also live under `src/`.
+them.
+
+Keep runtime configuration outside this repository at
+`~/.config/<tool>/` or `~/.config/<application>/`. The portable source of
+truth for managed configuration belongs in `~/agents/config/`, where the
+agents repository's chezmoi source synchronizes it into the home directory.
+Never add repository-root or project-owned `config/` directories, runtime
+configuration compatibility symlinks, or LaunchAgent source files to this
+repository. Ordinary build and source manifests such as `package.json`,
+`tsconfig.json`, and Chrome extension `manifest.json` are implementation
+inputs, not machine-local runtime configuration, and remain with their
+projects.
 
 Keep the repository-root `README.md` as the concise project catalog. Root
 `bin/` contains compatibility symlinks to tool or application executables
 because existing shell environments, LaunchAgents, and shared tests rely on
-those paths. Root `config/` may likewise retain narrowly scoped compatibility
-symlinks for installed consumers. Preserve any installed application entry
-paths under `apps/`. Shared tests, assets, package manifests, and repository-wide
-instructions remain at the repository root.
+those paths. Preserve any installed application entry paths under `apps/`.
+Shared tests, assets, package manifests, and repository-wide instructions
+remain at the repository root.
 
 ## CLI documentation requirement
 

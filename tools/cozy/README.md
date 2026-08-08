@@ -14,14 +14,17 @@ available at `http://cozy.localhost:8080/`.
 
 The executable entry point is `tools/cozy/bin/cozy` in the `devtools` repository. It
 automatically builds and caches the Go source from `tools/cozy/src`, rebuilds when
-that source changes, and loads the project-managed default configuration.
+that source changes, and loads your user-managed default configuration.
 The existing `devtools/bin/cozy` path remains available as a compatibility
 symlink. Add `devtools/tools/cozy/bin` or `devtools/bin` to your `PATH` to run the
 shorter `cozy` commands below.
 
 ## Configure
 
-The default site configuration lives in `tools/cozy/config/config.yaml`:
+The default site configuration lives in `~/.config/cozy/config.yaml`, or
+`$XDG_CONFIG_HOME/cozy/config.yaml` when `XDG_CONFIG_HOME` is set. The portable
+source of truth is the separate `~/agents` chezmoi configuration; the
+`devtools` repository does not own machine-local runtime configuration:
 
 ```yaml
 version: 1
@@ -105,15 +108,24 @@ a configuration file, and `--state-dir` to select a runtime directory.
 
 ## Start automatically at login
 
-Cozy includes a macOS user LaunchAgent at
-`tools/cozy/config/com.kevinlin.cozy.plist`. Install and start it with:
+The `~/agents` chezmoi source owns both `~/.config/cozy/config.yaml` and the
+macOS user LaunchAgent at `~/Library/LaunchAgents/com.kevinlin.cozy.plist`.
+Install or update only these managed targets with:
 
 ```sh
-install -m 0644 \
-  /Users/kevinlin/code/devtools/tools/cozy/config/com.kevinlin.cozy.plist \
-  /Users/kevinlin/Library/LaunchAgents/com.kevinlin.cozy.plist
+chezmoi --source "$HOME/agents" apply \
+  "$HOME/.config/cozy" \
+  "$HOME/Library/LaunchAgents/com.kevinlin.cozy.plist"
 launchctl bootstrap "gui/$(id -u)" \
-  /Users/kevinlin/Library/LaunchAgents/com.kevinlin.cozy.plist
+  "$HOME/Library/LaunchAgents/com.kevinlin.cozy.plist"
+```
+
+If the agent is already loaded, reload it after applying an updated plist:
+
+```sh
+launchctl bootout "gui/$(id -u)/com.kevinlin.cozy"
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/com.kevinlin.cozy.plist"
 ```
 
 The agent starts Cozy at login on `127.0.0.1:8080`, supervises the foreground
@@ -121,8 +133,6 @@ Cozy process, and restarts the supervisor automatically if it exits. Fishy,
 AGTask, and other configured sites are started together with the admin
 dashboard. The agent supplies the Devtools executable path and Go build cache
 explicitly because macOS LaunchAgents do not load interactive shell profiles.
-The existing `devtools/config/cozy` compatibility symlink keeps previously
-installed LaunchAgents working without reinstallation.
 
 Check the running agent and stop automatic restarts with:
 

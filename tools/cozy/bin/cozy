@@ -50,7 +50,7 @@ if [[ ! -x "${cozy_binary}" ]] ||
 fi
 
 if [[ -z "${COZY_CONFIG+x}" ]]; then
-    export COZY_CONFIG="${cozy_project_root}/config/config.yaml"
+    export COZY_CONFIG="${XDG_CONFIG_HOME:-${HOME}/.config}/cozy/config.yaml"
 fi
 
 exec "${cozy_binary}" "$@"

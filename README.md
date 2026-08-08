@@ -48,13 +48,19 @@ tools/<project>/ or apps/<project>/
   README.md
   AGENTS.md  # Only when the project needs agent-specific instructions.
   bin/
-  config/
   docs/
+  playbooks/
   specs/
+  src/
 ```
 
 Project directories contain only the optional subdirectories they actually
 need. The root `bin/` directory retains compatibility symlinks for the
-existing shell `PATH`, LaunchAgents, and shared test suite; project-owned
-configuration and application sources may likewise retain compatibility
-symlinks where installed consumers require their original paths.
+existing shell `PATH`, LaunchAgents, and shared test suite.
+
+Runtime configuration lives outside the repository under
+`~/.config/<tool>/` or `~/.config/<application>/`. Its portable chezmoi source
+lives in `~/agents/config/`, which synchronizes managed settings into the home
+directory. Source and build manifests, including `package.json`,
+`tsconfig.json`, and Chrome extension `manifest.json`, remain in their projects
+because they describe the implementation rather than machine-local settings.

@@ -99,14 +99,33 @@ func TestParseOptionsUsesCozyConfigEnvironment(t *testing.T) {
 }
 
 func TestParseOptionsFallsBackWhenCozyConfigIsEmpty(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
 	t.Setenv("COZY_CONFIG", "")
 	var stderr bytes.Buffer
 	opts, err := parseOptions("check", []string{"--state-dir", t.TempDir()}, &stderr)
 	if err != nil {
 		t.Fatalf("parse fallback configuration: %v", err)
 	}
+	defaultConfig := filepath.Join(home, ".config", "cozy", "config.yaml")
 	if opts.configPath != defaultConfig {
 		t.Fatalf("configuration path = %q, want fallback %q", opts.configPath, defaultConfig)
+	}
+}
+
+func TestParseOptionsUsesXDGConfigHome(t *testing.T) {
+	configHome := filepath.Join(t.TempDir(), "xdg-configuration")
+	t.Setenv("COZY_CONFIG", "")
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	var stderr bytes.Buffer
+	opts, err := parseOptions("check", []string{"--state-dir", t.TempDir()}, &stderr)
+	if err != nil {
+		t.Fatalf("parse XDG-backed configuration: %v", err)
+	}
+	defaultConfig := filepath.Join(configHome, "cozy", "config.yaml")
+	if opts.configPath != defaultConfig {
+		t.Fatalf("configuration path = %q, want XDG fallback %q", opts.configPath, defaultConfig)
 	}
 }
 

@@ -1,0 +1,8 @@
+version: 1
+bases:
+  - name: devtools
+    description: Developer tools, local applications, and their project documentation.
+    root: .
+    path_style: directory
+    schemas:
+      - name: devtools

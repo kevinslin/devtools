@@ -18,12 +18,18 @@ sshx [--profile NAME] [--sync-method auto|rsync|tar] [-i PATH] [-o KEY=VALUE] [-
 
 ## Profiles
 
-`sshx` reads profile path lists from `tools/sshx/config/config.yaml` and uses the `default` profile unless you pass `--profile`.
+`sshx` reads profile path lists from `~/.config/sshx/config.yaml` and uses the
+`default` profile unless you pass `--profile`. If `XDG_CONFIG_HOME` is set, the
+configuration lives at `$XDG_CONFIG_HOME/sshx/config.yaml` instead. The agents
+workspace manages and syncs this external configuration through its standalone
+chezmoi source.
 
 - `default`: syncs the paths listed under `profiles.default`.
 - `work`: syncs the paths listed under `profiles.work`; currently this is the default profile minus `.zshrc`.
 
-For tests or local experiments, set `SSHX_CONFIG_PATH=/path/to/config.yaml` to load a different config file.
+For tests or local experiments, set `SSHX_CONFIG_PATH=/path/to/config.yaml` to
+load a different config file. This explicit override takes precedence over
+`XDG_CONFIG_HOME`.
 
 ## Default Profile
 
@@ -85,7 +91,7 @@ It intentionally skips secret-heavy paths like `.ssh`, Codex auth state such as 
 - `-i, --identity-file PATH`: pass an SSH identity file to both `rsync` and `ssh`.
 - `-o, --option KEY=VALUE`: pass an SSH `-o` option to both `rsync` and `ssh`.
 - `-p, --port PORT`: pass a custom SSH port to both `rsync` and `ssh`.
-- `--profile NAME`: select a sync profile from `tools/sshx/config/config.yaml`. Available bundled profiles: `default`, `work`.
+- `--profile NAME`: select a sync profile from `~/.config/sshx/config.yaml`. Available managed profiles: `default`, `work`.
 - `--sync-method auto|rsync|tar`: choose the sync transport. `auto` checks whether the remote has `rsync`, uses it when available, and falls back to `tar` over SSH when it is missing.
 - `--path RELATIVE_PATH`: add another home-relative file or directory to sync.
 - `--no-defaults`: sync only the paths you provide with `--path`.

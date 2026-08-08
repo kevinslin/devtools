@@ -12,8 +12,8 @@ import sys
 import time
 
 
-DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "config.yaml"
 SSHX_CONFIG_ENV = "SSHX_CONFIG_PATH"
+XDG_CONFIG_HOME_ENV = "XDG_CONFIG_HOME"
 SSH_BIN_ENV = "SSHX_SSH_BIN"
 RSYNC_BIN_ENV = "SSHX_RSYNC_BIN"
 TAR_BIN_ENV = "SSHX_TAR_BIN"
@@ -57,7 +57,7 @@ def _build_parser(profile_names: tuple[str, ...]) -> argparse.ArgumentParser:
         "--profile",
         choices=profile_names,
         default="default",
-        help="sync profile to use for default paths from tools/sshx/config/config.yaml",
+        help="sync profile to use for default paths from ~/.config/sshx/config.yaml",
     )
     parser.add_argument(
         "--path",
@@ -101,7 +101,11 @@ def _profile_config_path() -> Path:
     raw = os.environ.get(SSHX_CONFIG_ENV)
     if raw:
         return Path(raw).expanduser().resolve()
-    return DEFAULT_CONFIG_PATH
+    config_home = os.environ.get(XDG_CONFIG_HOME_ENV)
+    base_path = (
+        Path(config_home).expanduser() if config_home else Path.home() / ".config"
+    )
+    return (base_path / "sshx" / "config.yaml").resolve()
 
 
 def _strip_yaml_comment(line: str) -> str:
@@ -178,6 +182,11 @@ def _parse_profile_config(text: str) -> dict[str, tuple[str, ...]]:
 def _load_sync_profiles(config_path: Path) -> dict[str, tuple[str, ...]]:
     try:
         text = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ValueError(
+            f"sshx config not found at {config_path}; "
+            f"create it or set {SSHX_CONFIG_ENV}"
+        ) from exc
     except OSError as exc:
         raise ValueError(f"failed to read sshx config {config_path}: {exc}") from exc
 

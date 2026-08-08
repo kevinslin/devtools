@@ -4,3 +4,8 @@
 .pytest_cache/
 node_modules/
 .build/
+
+# Runtime configuration belongs in ~/.config/<project>/ and ~/agents chezmoi.
+/config/
+/tools/*/config/
+/apps/*/config/

@@ -11,11 +11,51 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "bin" / "sshx"
+DEFAULT_PROFILE_PATHS = (
+    ".bashrc",
+    ".codex/agents",
+    ".codex/config.toml",
+    ".codex/hooks",
+    ".codex/hooks.json",
+    ".codex/rules",
+    ".codex/skills",
+    ".profile",
+    ".zlogin",
+    ".zprofile",
+    ".zshenv",
+    ".zshrc",
+    ".gitconfig",
+    ".git.scmbrc",
+    ".scmbrc",
+    ".tmux.conf",
+    ".vimrc",
+    ".config/fish",
+    ".config/git",
+    ".config/iterm2",
+    ".config/nvim",
+    ".config/uv",
+)
 
 
 def _write_file(path: Path, content: str = "") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def _write_profile_config(
+    path: Path,
+    *,
+    default_paths: tuple[str, ...] = DEFAULT_PROFILE_PATHS,
+    work_paths: tuple[str, ...] | None = None,
+) -> None:
+    if work_paths is None:
+        work_paths = tuple(item for item in default_paths if item != ".zshrc")
+    lines = ["profiles:", "  default:"]
+    lines.extend(f"    - {item}" for item in default_paths)
+    if work_paths:
+        lines.append("  work:")
+        lines.extend(f"    - {item}" for item in work_paths)
+    _write_file(path, "\n".join(lines) + "\n")
 
 
 def _write_fake_exec(path: Path, *, log_path: Path, exit_code: int = 0) -> None:
@@ -143,8 +183,13 @@ class SshxCliTest(unittest.TestCase):
         tar_bin: Path | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        default_config_path = home / ".config" / "sshx" / "config.yaml"
+        if not default_config_path.exists():
+            _write_profile_config(default_config_path)
         env = os.environ.copy()
         env["HOME"] = str(home)
+        env.pop("SSHX_CONFIG_PATH", None)
+        env.pop("XDG_CONFIG_HOME", None)
         env["SSHX_SSH_BIN"] = str(ssh_bin)
         env["SSHX_RSYNC_BIN"] = str(rsync_bin)
         if tar_bin is not None:
@@ -350,28 +395,108 @@ class SshxCliTest(unittest.TestCase):
             self.assertIn("./.custom-work", work_result.stdout)
             self.assertNotIn("./.custom-default", work_result.stdout)
 
-    def test_legacy_config_path_remains_usable_as_explicit_override(self) -> None:
+    def test_loads_config_from_home_config_directory_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             home = tmp_path / "home"
             home.mkdir()
-            _write_file(home / ".zshrc", "export PATH=/usr/local/bin:$PATH\n")
-            _write_file(home / ".gitconfig", "[user]\nname = Test User\n")
-
-            legacy_config_path = ROOT / "config" / "sshx" / "config.yaml"
-            self.assertTrue(legacy_config_path.is_file())
+            _write_file(home / ".home-profile", "home\n")
+            _write_profile_config(
+                home / ".config" / "sshx" / "config.yaml",
+                default_paths=(".home-profile",),
+            )
 
             result = self.run_cli(
-                ["--dry-run", "--sync-method", "rsync", "--profile", "work", "devbox"],
+                ["--dry-run", "--sync-method", "rsync", "devbox"],
                 home=home,
                 ssh_bin=tmp_path / "fake-ssh",
                 rsync_bin=tmp_path / "fake-rsync",
-                extra_env={"SSHX_CONFIG_PATH": str(legacy_config_path)},
             )
 
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            self.assertIn("./.gitconfig", result.stdout)
-            self.assertNotIn("./.zshrc", result.stdout)
+            self.assertIn("./.home-profile", result.stdout)
+
+    def test_xdg_config_home_overrides_default_config_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home = tmp_path / "home"
+            home.mkdir()
+            _write_file(home / ".home-profile", "home\n")
+            _write_file(home / ".xdg-profile", "xdg\n")
+            _write_profile_config(
+                home / ".config" / "sshx" / "config.yaml",
+                default_paths=(".home-profile",),
+            )
+            config_home = tmp_path / "xdg-config"
+            _write_profile_config(
+                config_home / "sshx" / "config.yaml",
+                default_paths=(".xdg-profile",),
+            )
+
+            result = self.run_cli(
+                ["--dry-run", "--sync-method", "rsync", "devbox"],
+                home=home,
+                ssh_bin=tmp_path / "fake-ssh",
+                rsync_bin=tmp_path / "fake-rsync",
+                extra_env={"XDG_CONFIG_HOME": str(config_home)},
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("./.xdg-profile", result.stdout)
+            self.assertNotIn("./.home-profile", result.stdout)
+
+    def test_explicit_config_path_overrides_xdg_config_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home = tmp_path / "home"
+            home.mkdir()
+            _write_file(home / ".xdg-profile", "xdg\n")
+            _write_file(home / ".explicit-profile", "explicit\n")
+            config_home = tmp_path / "xdg-config"
+            _write_profile_config(
+                config_home / "sshx" / "config.yaml",
+                default_paths=(".xdg-profile",),
+            )
+            explicit_config_path = tmp_path / "explicit.yaml"
+            _write_profile_config(
+                explicit_config_path,
+                default_paths=(".explicit-profile",),
+            )
+
+            result = self.run_cli(
+                ["--dry-run", "--sync-method", "rsync", "devbox"],
+                home=home,
+                ssh_bin=tmp_path / "fake-ssh",
+                rsync_bin=tmp_path / "fake-rsync",
+                extra_env={
+                    "XDG_CONFIG_HOME": str(config_home),
+                    "SSHX_CONFIG_PATH": str(explicit_config_path),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("./.explicit-profile", result.stdout)
+            self.assertNotIn("./.xdg-profile", result.stdout)
+
+    def test_missing_config_reports_expected_path_and_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home = tmp_path / "home"
+            home.mkdir()
+            config_home = tmp_path / "missing-config"
+
+            result = self.run_cli(
+                ["--dry-run", "devbox"],
+                home=home,
+                ssh_bin=tmp_path / "fake-ssh",
+                rsync_bin=tmp_path / "fake-rsync",
+                extra_env={"XDG_CONFIG_HOME": str(config_home)},
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("sshx config not found", result.stderr)
+            self.assertIn(str(config_home / "sshx" / "config.yaml"), result.stderr)
+            self.assertIn("SSHX_CONFIG_PATH", result.stderr)
 
     def test_missing_explicit_path_returns_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,0 +1,70 @@
+version: 1.0
+output:
+  file_extension: md
+variables:
+  project:
+    values: ["*"]
+    description: The name of an individual command-line tool or local application.
+  document:
+    values: ["*"]
+    description: A project-specific architecture, flow, research, or design document.
+schema:
+  README:
+    description: Root project catalog, CLI index, and maturity classifications.
+  AGENTS:
+    description: Repository-wide instructions and project organization conventions.
+  tools:
+    description: Command-line tool projects; each project owns its documentation and implementation.
+    children:
+      "{{project}}":
+        description: One command-line tool project under tools/<project>/.
+        children:
+          README:
+            description: Required human-facing documentation for the tool.
+          AGENTS:
+            description: Optional project-specific agent instructions.
+          bin:
+            description: Project-owned executable entry points; root bin/ may contain compatibility symlinks.
+            dynamic_child: true
+          docs:
+            description: Optional architecture, flow, reference, and research documentation.
+            children:
+              "{{document}}":
+                description: A supporting human-readable project document.
+          specs:
+            description: Optional project design and implementation specifications.
+            children:
+              "{{document}}":
+                description: A project design or implementation specification.
+          src:
+            description: Optional project-owned implementation sources.
+            dynamic_child: true
+  apps:
+    description: Local application and extension projects, separate from command-line tools.
+    children:
+      "{{project}}":
+        description: One local application project under apps/<project>/.
+        children:
+          README:
+            description: Required human-facing documentation for the application.
+          AGENTS:
+            description: Optional application-specific agent instructions.
+          bin:
+            description: Optional application-owned executable or launcher entry points.
+            dynamic_child: true
+          docs:
+            description: Optional architecture, flow, reference, and research documentation.
+            children:
+              "{{document}}":
+                description: A supporting human-readable application document.
+          specs:
+            description: Optional application design and implementation specifications.
+            children:
+              "{{document}}":
+                description: An application design or implementation specification.
+          src:
+            description: Optional application-owned implementation sources.
+            dynamic_child: true
+  bin:
+    description: Stable legacy command paths implemented as compatibility symlinks to project-owned executables.
+    dynamic_child: true

@@ -23,7 +23,6 @@ import (
 )
 
 const (
-	defaultConfig    = "cozy.yaml"
 	defaultListen    = "127.0.0.1:8080"
 	startTimeout     = 10 * time.Second
 	stopTimeout      = 10 * time.Second
@@ -135,7 +134,7 @@ func runAgtaskDashboard(args []string, stdout, stderr io.Writer) int {
 func usage(output io.Writer) {
 	fmt.Fprintln(output, "Usage: cozy <up|down|status|logs|open|check|refresh|restart> [flags] [site]")
 	fmt.Fprintln(output, "Live operations: cozy refresh; cozy restart [site]")
-	fmt.Fprintln(output, "Flags: --config cozy.yaml --listen 127.0.0.1:8080 --state-dir <directory>")
+	fmt.Fprintln(output, "Flags: --config ~/.config/cozy/config.yaml --listen 127.0.0.1:8080 --state-dir <directory>")
 }
 
 func parseOptions(command string, args []string, stderr io.Writer) (commandOptions, error) {
@@ -144,9 +143,17 @@ func parseOptions(command string, args []string, stderr io.Writer) (commandOptio
 	opts := commandOptions{}
 	configPath := os.Getenv("COZY_CONFIG")
 	if configPath == "" {
-		configPath = defaultConfig
+		configHome := os.Getenv("XDG_CONFIG_HOME")
+		if configHome == "" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return commandOptions{}, fmt.Errorf("locate user configuration directory: %w", err)
+			}
+			configHome = filepath.Join(home, ".config")
+		}
+		configPath = filepath.Join(configHome, "cozy", "config.yaml")
 	}
-	flags.StringVar(&opts.configPath, "config", configPath, "path to cozy.yaml")
+	flags.StringVar(&opts.configPath, "config", configPath, "path to the Cozy configuration")
 	flags.StringVar(&opts.listen, "listen", defaultListen, "loopback proxy listener")
 	flags.StringVar(&opts.stateDir, "state-dir", "", "runtime state directory")
 	if err := flags.Parse(args); err != nil {

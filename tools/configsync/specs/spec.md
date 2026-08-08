@@ -14,7 +14,7 @@ Build `configsync` as an Ansible playbook that runs locally on each computer. Ch
 
 **Changes**
 
-- Add a local playbook, safe configuration defaults, small task files, operator documentation, and focused tests.
+- Add a portable local playbook with safe in-code defaults, small task files, operator documentation, and focused tests; keep runtime configuration and optional LaunchAgent source in the agents repository's chezmoi source.
 - Support independent `self` and `work` profiles, host-local overrides, read-only health checks, and optional macOS scheduling.
 - Preserve a future Windows boundary without claiming native Windows support.
 
@@ -28,7 +28,7 @@ Build `configsync` as an Ansible playbook that runs locally on each computer. Ch
 
 ### Configuration and invocation
 
-Repository-owned `tools/configsync/config/config.yaml` contains nonsecret defaults. Machine-local `~/.config/configsync/local.yaml` selects profiles and private paths; sensitive local configuration uses mode `0600`. Merge defaults, platform values, selected `self`, selected `work`, then host-local overrides. `self` and `work` are independent trust domains; work-only values cannot be committed to personal repositories.
+Portable, nonsecret implementation defaults live in the playbook's source variables. Runtime settings live outside the devtools checkout at `~/.config/configsync/config.yaml`; an optional `~/.config/configsync/local.yaml` supplies host-specific overrides. Keep the portable source of managed configuration in `~/agents/config/` and synchronize it through that repository's explicitly selected chezmoi source. Sensitive local configuration uses mode `0600`; never commit plaintext credentials. Merge playbook defaults, runtime configuration, platform values, selected `self`, selected `work`, then host-local overrides. `self` and `work` are independent trust domains; work-only values cannot be committed to personal repositories.
 
 ```yaml
 profiles: [self, work]
@@ -51,10 +51,10 @@ scheduler:
 Run the standard Ansible interface directly:
 
 ```bash
-ansible-playbook -i localhost, -c local tools/configsync/config/site.yml
-ansible-playbook -i localhost, -c local tools/configsync/config/site.yml --check
-ansible-playbook -i localhost, -c local tools/configsync/config/site.yml --tags status
-ansible-playbook -i localhost, -c local tools/configsync/config/site.yml --tags doctor
+ansible-playbook -i localhost, -c local tools/configsync/playbooks/site.yml
+ansible-playbook -i localhost, -c local tools/configsync/playbooks/site.yml --check
+ansible-playbook -i localhost, -c local tools/configsync/playbooks/site.yml --tags status
+ansible-playbook -i localhost, -c local tools/configsync/playbooks/site.yml --tags doctor
 ```
 
 Tasks execute in fixed order: preflight, selected provider tasks, then explicitly enabled scheduler installation. There is no generic dependency graph. A future `tools/configsync/bin/configsync` wrapper is optional; if introduced, it only forwards to Ansible and must satisfy the [repository CLI documentation requirements](../../../AGENTS.md).
@@ -62,11 +62,11 @@ Tasks execute in fixed order: preflight, selected provider tasks, then explicitl
 ### Provider ownership
 
 - **Preflight:** Require a supported macOS host, installed Ansible/chezmoi/selected provider executables, valid profile configuration, approved work-only inputs, and nonoverlapping destination ownership. Fail before mutation on tracked secrets, a dirty dotfiles source, missing selected configuration, or a destination claimed by multiple tools.
-- **Dotfiles:** Run `chezmoi status`/`chezmoi verify`, then apply only when drift is safe and the selected profile authorizes the source. Preserve templates and local edits; never mirror `~/.config`, `.ssh`, Codex auth/session state, or generated `.codex/skills`.
+- **Dotfiles:** Explicitly select the approved chezmoi source for each managed target; devtool runtime configuration is owned by the `~/agents/config/` source, while any broader dotfiles source remains separately owned. Run source-scoped chezmoi status/verification, then apply only when drift is safe and the selected profile authorizes the source. Preserve templates and local edits; never mirror all of `~/.config`, `.ssh`, Codex auth/session state, or generated `.codex/skills`.
 - **Git repositories:** Run `gitsync validate` and inspect the already installed `com.kevinlin.gitsync` LaunchAgent. Existing `gitsync` owns all repository operations and schedules. Preserve each repository's existing `mode`: `pull` never pushes; omitted `mode` defaults to `push/pull`. Do not add metadata to its JSON, invoke another repository scheduler, or manage its worktrees with Ansible Git tasks. [Current gitsync contract](../../gitsync/README.md).
 - **Agent configuration:** Keep `agent_sync.enabled: false` until a machine-local, existing JSON configuration path is explicitly supplied. If enabled, call `agent-sync <config>`; check mode calls `agent-sync --dry-run <config>`. Reject overlapping `.codex/agents` ownership with chezmoi. No previously observed configuration path is assumed to exist. [Existing agent-sync contract](../../agent-sync/README.md).
 - **Packages:** Skip package management until a Brewfile is explicitly configured. Compare with `brew bundle check --file=<path>` and install only missing declarations using `brew bundle install --no-upgrade --file=<path>`. `community.general.homebrew_bundle` does not exist; use Ansible built-ins and the Homebrew CLI unless a real collection dependency is intentionally added.
-- **Scheduling:** Preserve the existing gitsync job exactly. Optional configuration reconciliation uses a separate `com.kevinlin.configsync` LaunchAgent with explicit executable paths, `PATH`, safe log locations, and quarter-hour `StartCalendarInterval`. Wrap scheduled apply/pull with `/usr/bin/lockf -k -t 0` so overlapping runs do not execute. If using `ansible-pull`, give it a dedicated, clean checkout; never use `--clean` or point it at a provider-managed worktree.
+- **Scheduling:** Preserve the existing gitsync job exactly. Optional configuration reconciliation uses a separate `com.kevinlin.configsync` LaunchAgent whose source belongs to the agents repository's chezmoi source, not the devtools checkout. Use explicit executable paths, `PATH`, safe log locations, and quarter-hour `StartCalendarInterval`. Wrap scheduled apply/pull with `/usr/bin/lockf -k -t 0` so overlapping runs do not execute. If using `ansible-pull`, give it a dedicated, clean checkout; never use `--clean` or point it at a provider-managed worktree.
 
 ### Safety and failure behavior
 
@@ -81,17 +81,18 @@ macOS is the supported platform. Reject `platform: windows` before mutation: Ans
 ## Implementation
 
 1. Document explicit Ansible installation and required built-in modules; Ansible is not currently installed. Do not add an Ansible Galaxy collection unless an actual collection-backed task requires one.
-2. Add `tools/configsync/config/site.yml`, `tools/configsync/config/config.yaml`, and focused task files such as `tasks/preflight.yml`, `tasks/dotfiles.yml`, `tasks/repositories.yml`, `tasks/agent-sync.yml`, `tasks/packages.yml`, and `tasks/scheduler.yml`.
-3. Implement profile/platform selection and host-local overlays with ordinary Ansible variables and conditions. Keep agent-sync and package management disabled until their required inputs exist.
+2. Add `tools/configsync/playbooks/site.yml` with nonsecret implementation defaults and focused playbook task files such as `tasks/preflight.yml`, `tasks/dotfiles.yml`, `tasks/repositories.yml`, `tasks/agent-sync.yml`, `tasks/packages.yml`, and `tasks/scheduler.yml`.
+3. Load runtime settings from `~/.config/configsync/config.yaml`, apply optional `~/.config/configsync/local.yaml` overrides, and implement profile/platform selection with ordinary Ansible variables and conditions. Manage portable configuration through the `~/agents/config/` chezmoi source. Keep agent-sync and package management disabled until their required inputs exist.
 4. Implement read-only status/doctor tags, safe check-mode probes, provider ownership checks, and the existing `gitsync` pull-mode preservation contract.
-5. Add an opt-in `tools/configsync/config/launchd/com.kevinlin.configsync.plist.j2`; manage only that label after successful provider checks. A dedicated `ansible-pull` checkout is optional.
+5. If scheduling is explicitly enabled, manage an opt-in `com.kevinlin.configsync` LaunchAgent from the agents repository's chezmoi source; manage only that label after successful provider checks. Do not add a plist or runtime configuration under `tools/configsync/`. A dedicated `ansible-pull` checkout is optional.
 6. Expand `tools/configsync/README.md` and add `tests/test_configsync.py`. Update the repository `README.md` only if implementation also introduces an optional `tools/configsync/bin/configsync` entrypoint.
 
 ## Verification
 
 | Required outcome | How to verify |
 | --- | --- |
-| Playbook structure is valid | After implementation, run `ansible-playbook -i localhost, -c local tools/configsync/config/site.yml --syntax-check`. |
+| Playbook structure is valid | After implementation, run `ansible-playbook -i localhost, -c local tools/configsync/playbooks/site.yml --syntax-check`. |
+| Runtime configuration remains external | Confirm runtime files resolve under `~/.config/configsync/`, portable managed sources belong to `~/agents/config/`, and the devtools project has no runtime `config/` directory or LaunchAgent source. |
 | No custom orchestration is introduced | Confirm standard Ansible commands work without a required wrapper, provider framework, dependency graph, or daemon. |
 | Missing prerequisites are actionable | Simulate missing Ansible or an enabled provider executable and verify a clear bootstrap error before changes. |
 | Profiles remain isolated | Exercise `self`, `work`, and both; reject work data from a personal source and overlapping owned destinations. |
@@ -99,7 +100,7 @@ macOS is the supported platform. Reject `platform: windows` before mutation: Ans
 | gitsync preserves current behavior | Verify its config/plist remain unchanged, `gitsync validate` succeeds, and an existing `mode: pull` never changes or pushes. |
 | Agent sync remains opt-in | Unconfigured agent-sync is skipped; an enabled missing config blocks; a configured preview passes the exact positional config path. |
 | Packages are conservative | Missing Brewfile skips the role; missing packages install with `--no-upgrade`; cleanup and global upgrades never run. |
-| Scheduling is isolated | Validate the optional `com.kevinlin.configsync` plist, calendar trigger, nonblocking lock, and unchanged existing gitsync label. |
+| Scheduling is isolated | Validate the agents-chezmoi-owned optional `com.kevinlin.configsync` plist, calendar trigger, nonblocking lock, and unchanged existing gitsync label. |
 | Repeated application is idempotent | Run twice against isolated fixtures; the second run produces no provider changes or duplicate jobs. |
 | Windows fails honestly | Set `platform: windows`; assert a precise unsupported-platform error before mutation. |
 | Existing repository tests remain green | Run `python -m unittest discover -s tests`; never run `npm run precommit`. |
