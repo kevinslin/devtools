@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from typing import Iterator, Mapping, Sequence
 
 
 DEFAULT_CONFIG = Path("~/.config/gitsync/agcron.json").expanduser()
+DEFAULT_LOG_DIR = Path("/tmp")
 DEFAULT_STATE_HOME = Path("~/.local/state").expanduser()
 LAUNCHD_LABEL = "com.kevinlin.gitsync"
 CRON_RANGES = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
@@ -52,6 +54,47 @@ class CommandResult:
     returncode: int
     stdout: str
     stderr: str
+
+
+def _log_sync_run(
+    args: argparse.Namespace,
+    config_path: Path,
+    result: Mapping[str, object],
+    exit_code: int,
+) -> None:
+    now = datetime.now().astimezone()
+    directory = Path(os.environ.get("GITSYNC_LOG_DIR", str(DEFAULT_LOG_DIR))).expanduser()
+    log_path = directory / f"gitsync-{now:%Y-%m-%d}.log"
+    selection = "all" if args.all else args.name if args.name else "due"
+    entry = {
+        "timestamp": now.isoformat(timespec="seconds"),
+        "config": str(config_path),
+        "selection": selection,
+        "exit_code": exit_code,
+        **result,
+    }
+    descriptor: int | None = None
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(log_path, flags, 0o600)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+            or metadata.st_nlink != 1
+        ):
+            raise OSError("log must be a private, single-link file owned by the current user")
+        encoded = (json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        if os.write(descriptor, encoded) != len(encoded):
+            raise OSError("incomplete log write")
+    except OSError as exc:
+        print(f"gitsync: warning: failed to write daily run log {log_path}: {exc}", file=sys.stderr)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _state_dir() -> Path:
@@ -777,9 +820,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "selected": len(selected),
             "results": results,
         }
+        exit_code = 0 if summary["status"] == "ok" else 1
+        _log_sync_run(args, config_path, summary, exit_code)
         print(json.dumps(summary, indent=2, sort_keys=True))
-        return 0 if summary["status"] == "ok" else 1
+        return exit_code
     except GitsyncError as exc:
+        if args.command == "sync":
+            _log_sync_run(args, config_path, {"status": "error", "error": str(exc)}, 2)
         print(f"gitsync: {exc}", file=sys.stderr)
         return 2
 

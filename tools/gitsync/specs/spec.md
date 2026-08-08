@@ -41,6 +41,8 @@ syncs and newly cloned repositories.
 - Store fetch history, schedule claims, and repository locks in
   `$XDG_STATE_HOME/gitsync/`, defaulting to `~/.local/state/gitsync/`, while
   preserving the existing `GITSYNC_STATE_DIR` override.
+- Append a private, structured record for every sync run to the local-date
+  file `/tmp/gitsync-YYYY-MM-DD.log`.
 - Add integration coverage for pull-only success, dirty-worktree denial, and
   conflict recovery, hook validation and execution, guarded ordinary pushes,
   and scheduled retry behavior.
@@ -210,6 +212,24 @@ Persistent repository history, schedule claims, and locks share the XDG state
 root: `$XDG_STATE_HOME/gitsync/`, or `~/.local/state/gitsync/` by default.
 `GITSYNC_STATE_DIR` takes precedence when explicitly configured.
 
+### Daily sync-run logging
+
+Each parsed `sync` invocation appends one compact JSON line to
+`/tmp/gitsync-YYYY-MM-DD.log`, using the current local date and a
+timezone-aware timestamp. Records include the resolved config path, requested
+selection, exit code, overall status, and either the repository result summary
+or configuration error. Blocked repositories, empty due selections, and
+configuration failures are logged without altering existing stdout, stderr,
+or exit-code contracts. `status`, `validate`, and `launchd-plist` never create
+run logs.
+
+The log is opened with append-only, close-on-exec, no-follow, and nonblocking
+flags. The resulting descriptor must identify a regular, single-link file
+owned by the current user with mode `0600`; unsafe symlinks, FIFOs, hardlinks,
+or permissive files are rejected. Logging errors are reported as warnings but
+never turn a completed synchronization into a failure. `GITSYNC_LOG_DIR`
+provides an explicit isolated-test override.
+
 ## Implementation
 
 1. Extend `RepoConfig` and `load_config` in
@@ -252,6 +272,8 @@ root: `$XDG_STATE_HOME/gitsync/`, or `~/.local/state/gitsync/` by default.
 | Status inventories repositories safely | Configure clean, dirty, and missing repositories; verify all are listed without fetch, clone, or state writes. |
 | Successful fetch history remains observable | Verify a timezone-aware timestamp survives successful sync and later hook failure, with `FETCH_HEAD` fallback for older repositories. |
 | Persistent state follows XDG conventions | Set `XDG_STATE_HOME` and verify fetch records and repository locks are created under its `gitsync/` subdirectory. |
+| Daily run logs capture real outcomes safely | Run successful and blocked syncs; assert appended dated JSON records, timezone-aware timestamps, exit codes, blockers, and mode `0600`. |
+| Logging preserves read-only and safety boundaries | Verify non-sync commands do not create logs, configuration failures are recorded, and symlinked log targets are refused without changing sync results. |
 | Agents reconciliation works end to end | Pull a temporary upstream commit through real `gitsync`; execute the committed agents hook and verify chezmoi updates the private destination. |
 | Conflicting local changes remain recoverable | Verify backups, clean three-way merges, deduplicated Slack escalation, preserved symlinks, and pending baselines across later upstream commits. |
 | Existing push/pull behavior does not regress | Run the full focused `test_gitsync.py` suite, including push retry, upstream targeting, locks, cron, and manual `--force`. |

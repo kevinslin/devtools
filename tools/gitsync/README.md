@@ -78,6 +78,27 @@ gitsync --config /path/to/agcron.json sync --all
 
 `--due` claims each matching repository once per local clock minute. `--all` and its manual-friendly alias `--force` ignore schedules and sync every configured repository. Here, “force” only forces an immediate run: it never overrides the configured mode or enables Git force-push, reset, discard, or safety-check bypasses. `--name` selects one configured repository. Results are JSON; exit `0` means all selected repositories synced, `1` means at least one repository was safely blocked, and `2` means the command or configuration was invalid.
 
+## Daily run logs
+
+Every `gitsync sync` invocation appends one JSON record to:
+
+```text
+/tmp/gitsync-YYYY-MM-DD.log
+```
+
+The filename uses the machine's local date. Each newline-delimited record
+includes a timezone-aware timestamp, configuration path, requested selection,
+exit code, overall status, and either per-repository results or the
+configuration error. Successful, blocked, zero-repository, manual, and
+scheduled syncs are all recorded. Read-only commands such as `status`,
+`validate`, and `launchd-plist` do not create log entries.
+
+Daily log files are append-only and private (`0600`). Unsafe symlinks,
+non-regular files, multiply linked files, files owned by another user, or
+files readable by other users are refused. Logging failures produce a concise
+warning without changing the sync result. `GITSYNC_LOG_DIR` can override
+`/tmp` for an isolated test or explicitly managed deployment.
+
 ## Repository status
 
 `gitsync status` lists every configured repository without fetching, syncing,
@@ -130,7 +151,11 @@ To replace an existing registration, boot it out first, regenerate the plist, an
 launchctl bootout "gui/$(id -u)/com.kevinlin.gitsync"
 ```
 
-The generated plist uses the resolved CLI and config paths. Logs go to `~/Library/Logs/com.kevinlin.gitsync.log` and `.error.log`. Scheduled runs keep claim and lock files under `$XDG_STATE_HOME/gitsync/`, defaulting to `~/.local/state/gitsync/`.
+The generated plist uses the resolved CLI and config paths. Launchd still
+captures raw stdout and stderr in `~/Library/Logs/com.kevinlin.gitsync.log`
+and `.error.log`; each scheduled sync also appends its structured result to
+`/tmp/gitsync-YYYY-MM-DD.log`. Scheduled runs keep claim and lock files under
+`$XDG_STATE_HOME/gitsync/`, defaulting to `~/.local/state/gitsync/`.
 
 ## Safety behavior
 

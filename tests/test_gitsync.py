@@ -33,6 +33,7 @@ class GitsyncTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.state = self.root / "state"
+        self.logs = self.root / "logs"
         self.remote = self.root / "remote.git"
         git(self.root, "init", "--bare", str(self.remote))
         seed = self.root / "seed"
@@ -66,10 +67,58 @@ class GitsyncTest(unittest.TestCase):
         self.config.write_text(json.dumps({"repos": [item]}), encoding="utf-8")
 
     def cli(self, *args: str, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-        env = {"GITSYNC_STATE_DIR": str(self.state)}
+        env = {"GITSYNC_STATE_DIR": str(self.state), "GITSYNC_LOG_DIR": str(self.logs)}
         if extra_env:
             env.update(extra_env)
         return run([sys.executable, str(CLI), "--config", str(self.config), *args], env=env)
+
+    def test_sync_appends_success_and_blocked_runs_to_private_daily_log(self) -> None:
+        successful = self.cli("sync", "--all")
+        self.assertEqual(successful.returncode, 0, successful.stderr)
+
+        (self.repo / "untracked.txt").write_text("local change\n", encoding="utf-8")
+        blocked = self.cli("sync", "--all")
+        self.assertEqual(blocked.returncode, 1, blocked.stdout + blocked.stderr)
+
+        daily_log = self.logs / f"gitsync-{datetime.now().astimezone():%Y-%m-%d}.log"
+        entries = [json.loads(line) for line in daily_log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(entries), 2)
+        self.assertEqual([entry["exit_code"] for entry in entries], [0, 1])
+        self.assertEqual([entry["status"] for entry in entries], ["ok", "blocked"])
+        self.assertEqual(entries[0]["results"][0]["name"], "test")
+        self.assertIn("dirty worktree", entries[1]["results"][0]["blocker"])
+        self.assertEqual(daily_log.stat().st_mode & 0o777, 0o600)
+        self.assertIsNotNone(datetime.fromisoformat(entries[0]["timestamp"]).tzinfo)
+
+    def test_sync_logs_configuration_failures_without_logging_read_only_commands(self) -> None:
+        validated = self.cli("validate")
+        self.assertEqual(validated.returncode, 0, validated.stderr)
+        status = self.cli("status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertFalse(self.logs.exists())
+
+        self.config.write_text("not valid JSON\n", encoding="utf-8")
+        failed = self.cli("sync", "--all")
+
+        self.assertEqual(failed.returncode, 2)
+        daily_log = self.logs / f"gitsync-{datetime.now().astimezone():%Y-%m-%d}.log"
+        entry = json.loads(daily_log.read_text(encoding="utf-8"))
+        self.assertEqual(entry["exit_code"], 2)
+        self.assertEqual(entry["status"], "error")
+        self.assertIn("invalid config JSON", entry["error"])
+
+    def test_sync_refuses_symlinked_daily_log_without_overwriting_its_target(self) -> None:
+        self.logs.mkdir()
+        target = self.root / "protected.txt"
+        target.write_text("preserve this file\n", encoding="utf-8")
+        daily_log = self.logs / f"gitsync-{datetime.now().astimezone():%Y-%m-%d}.log"
+        daily_log.symlink_to(target)
+
+        result = self.cli("sync", "--all")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("failed to write daily run log", result.stderr)
+        self.assertEqual(target.read_text(encoding="utf-8"), "preserve this file\n")
 
     def test_status_lists_clean_dirty_and_missing_repositories_without_mutating_state(self) -> None:
         dirty_repo = self.root / "dirty-repo"
@@ -156,6 +205,7 @@ class GitsyncTest(unittest.TestCase):
         environment = os.environ.copy()
         environment.pop("GITSYNC_STATE_DIR", None)
         environment["XDG_STATE_HOME"] = str(state_home)
+        environment["GITSYNC_LOG_DIR"] = str(self.logs)
 
         result = subprocess.run(
             [sys.executable, str(CLI), "--config", str(self.config), "sync", "--all"],
