@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+"""Inventory Codex sessions running inside tmux panes."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+import re
+import subprocess
+import sys
+from collections import defaultdict, deque
+from pathlib import Path
+
+
+TMUX_SEPARATOR = "\t"
+DEFAULT_CAPTURE_LINES = 80
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+MAX_EVIDENCE_LENGTH = 120
+SOURCE_OR_DIFF_LINE_RE = re.compile(r"^(?:\d+\s+[+-]\s|[+-]\s)")
+
+
+class CodexTmuxError(Exception):
+    """Raised when the inventory cannot be collected."""
+
+
+@dataclass(frozen=True)
+class Pane:
+    session_name: str
+    window_index: str
+    window_name: str
+    pane_index: str
+    pane_id: str
+    pane_pid: int
+    pane_current_command: str
+    pane_current_path: str
+    pane_active: bool
+
+
+@dataclass(frozen=True)
+class Process:
+    pid: int
+    ppid: int
+    stat: str
+    command: str
+    args: str
+
+
+@dataclass(frozen=True)
+class CodexMatch:
+    process: Process
+    descendants: list[Process]
+
+
+@dataclass(frozen=True)
+class State:
+    name: str
+    evidence: str
+
+
+STATE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    (
+        "needs-approval",
+        re.compile(
+            r"\b(approval required|requires approval|approve\?|allow this command|"
+            r"allow the command|do you want to|confirm\?|continue\?|proceed\?)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "working",
+        re.compile(
+            r"^\s*(?:[•*]\s*)?(running command|running|thinking|working|"
+            r"executing|applying patch|compacting)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "idle",
+        re.compile(
+            r"\b(ask codex|type a message|press enter|ready|what can i help)\b",
+            re.IGNORECASE,
+        ),
+    ),
+]
+
+
+def _run(command: list[str]) -> str:
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise CodexTmuxError(f"{command[0]} was not found on PATH") from exc
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        if detail:
+            raise CodexTmuxError(f"{command[0]} failed: {detail}")
+        raise CodexTmuxError(f"{command[0]} failed with exit code {result.returncode}")
+
+    return result.stdout
+
+
+def _parse_bool(raw: str) -> bool:
+    return raw == "1" or raw.lower() in {"true", "yes", "on"}
+
+
+def _parse_pane_line(line: str) -> Pane | None:
+    parts = line.rstrip("\n").split(TMUX_SEPARATOR)
+    if len(parts) != 9:
+        return None
+    (
+        session_name,
+        window_index,
+        window_name,
+        pane_index,
+        pane_id,
+        raw_pane_pid,
+        pane_current_command,
+        pane_current_path,
+        raw_pane_active,
+    ) = parts
+    try:
+        pane_pid = int(raw_pane_pid)
+    except ValueError:
+        return None
+    return Pane(
+        session_name=session_name,
+        window_index=window_index,
+        window_name=window_name,
+        pane_index=pane_index,
+        pane_id=pane_id,
+        pane_pid=pane_pid,
+        pane_current_command=pane_current_command,
+        pane_current_path=pane_current_path,
+        pane_active=_parse_bool(raw_pane_active),
+    )
+
+
+def list_tmux_panes() -> list[Pane]:
+    fields = [
+        "#{session_name}",
+        "#{window_index}",
+        "#{window_name}",
+        "#{pane_index}",
+        "#{pane_id}",
+        "#{pane_pid}",
+        "#{pane_current_command}",
+        "#{pane_current_path}",
+        "#{pane_active}",
+    ]
+    output = _run(["tmux", "list-panes", "-a", "-F", TMUX_SEPARATOR.join(fields)])
+    panes = []
+    for line in output.splitlines():
+        pane = _parse_pane_line(line)
+        if pane is not None:
+            panes.append(pane)
+    return panes
+
+
+def _parse_process_line(line: str) -> Process | None:
+    parts = line.strip().split(None, 4)
+    if len(parts) < 4:
+        return None
+    pid_raw, ppid_raw, stat, command = parts[:4]
+    args = parts[4] if len(parts) == 5 else command
+    try:
+        pid = int(pid_raw)
+        ppid = int(ppid_raw)
+    except ValueError:
+        return None
+    return Process(pid=pid, ppid=ppid, stat=stat, command=command, args=args)
+
+
+def list_processes() -> dict[int, Process]:
+    output = _run(["ps", "-axo", "pid=,ppid=,stat=,comm=,args="])
+    processes: dict[int, Process] = {}
+    for line in output.splitlines():
+        process = _parse_process_line(line)
+        if process is not None:
+            processes[process.pid] = process
+    return processes
+
+
+def _descendants(
+    root_pid: int,
+    children_by_parent: dict[int, list[Process]],
+) -> list[Process]:
+    found: list[Process] = []
+    queue: deque[Process] = deque(children_by_parent.get(root_pid, []))
+    seen: set[int] = set()
+    while queue:
+        process = queue.popleft()
+        if process.pid in seen:
+            continue
+        seen.add(process.pid)
+        found.append(process)
+        queue.extend(children_by_parent.get(process.pid, []))
+    return found
+
+
+def _basename(value: str) -> str:
+    if not value:
+        return ""
+    return Path(value).name
+
+
+def _first_arg(args: str) -> str:
+    return args.strip().split(None, 1)[0] if args.strip() else ""
+
+
+def _looks_like_codex(process: Process) -> bool:
+    command_name = _basename(process.command).lower()
+    first_arg_name = _basename(_first_arg(process.args)).lower()
+    known_names = {"codex", "openai-codex", "codex-cli"}
+    if command_name in known_names or first_arg_name in known_names:
+        return True
+
+    args = process.args.lower()
+    return (
+        "/@openai/codex/" in args
+        or "node_modules/@openai/codex/" in args
+        or "/codex.js" in args
+    )
+
+
+def find_codex_process(pane: Pane, processes: dict[int, Process]) -> CodexMatch | None:
+    children_by_parent: dict[int, list[Process]] = defaultdict(list)
+    for process in processes.values():
+        children_by_parent[process.ppid].append(process)
+
+    root_process = processes.get(pane.pane_pid)
+    if root_process is not None and _looks_like_codex(root_process):
+        codex_descendants = _descendants(root_process.pid, children_by_parent)
+        return CodexMatch(process=root_process, descendants=codex_descendants)
+
+    pane_descendants = _descendants(pane.pane_pid, children_by_parent)
+    for process in pane_descendants:
+        if _looks_like_codex(process):
+            codex_descendants = _descendants(process.pid, children_by_parent)
+            return CodexMatch(process=process, descendants=codex_descendants)
+    return None
+
+
+def capture_pane(pane_id: str, lines: int) -> str:
+    start = f"-{max(lines, 1)}"
+    return _run(["tmux", "capture-pane", "-p", "-t", pane_id, "-S", start])
+
+
+def _clean_line(line: str) -> str:
+    clean = ANSI_RE.sub("", line).strip()
+    if len(clean) <= MAX_EVIDENCE_LENGTH:
+        return clean
+    return f"{clean[: MAX_EVIDENCE_LENGTH - 1]}..."
+
+
+def _visible_lines(capture: str) -> list[str]:
+    return [
+        line
+        for line in (_clean_line(raw) for raw in capture.splitlines())
+        if line
+    ]
+
+
+def _state_from_capture(capture: str) -> State | None:
+    lines = _visible_lines(capture)
+    for line in reversed(lines):
+        if SOURCE_OR_DIFF_LINE_RE.search(line):
+            continue
+        for state_name, pattern in STATE_PATTERNS:
+            if pattern.search(line):
+                return State(name=state_name, evidence=line)
+    return None
+
+
+def _tool_processes(codex_match: CodexMatch) -> list[Process]:
+    tools: list[Process] = []
+    for process in codex_match.descendants:
+        if "Z" in process.stat or "<defunct>" in process.args:
+            continue
+        if _looks_like_codex(process):
+            continue
+        if _looks_like_codex_helper(process):
+            continue
+        tools.append(process)
+    return tools
+
+
+def _looks_like_codex_helper(process: Process) -> bool:
+    args = process.args.lower()
+    command = process.command.lower()
+    return (
+        "mcp_identity_proxy.py" in args
+        or "js_mcp.py" in args
+        or "skycomputeruseclient" in args
+        or command.endswith("codex computer")
+        or " mcp=" in args
+    )
+
+
+def classify_state(
+    codex_match: CodexMatch | None,
+    *,
+    captured_text: str | None,
+) -> State:
+    if codex_match is None:
+        return State(name="not-codex", evidence="no Codex process under pane PID")
+
+    capture_state = _state_from_capture(captured_text or "")
+    if capture_state is not None and capture_state.name == "needs-approval":
+        return capture_state
+
+    tool_processes = _tool_processes(codex_match)
+    if tool_processes:
+        preview = ", ".join(
+            f"{_basename(process.command) or process.command}({process.pid})"
+            for process in tool_processes[:3]
+        )
+        suffix = "" if len(tool_processes) <= 3 else f", +{len(tool_processes) - 3} more"
+        return State(name="running-tool", evidence=f"child processes: {preview}{suffix}")
+
+    if capture_state is not None:
+        return capture_state
+
+    return State(name="unknown", evidence="Codex process found; no matching visible status")
+
+
+def _pane_payload(
+    pane: Pane,
+    *,
+    codex_match: CodexMatch | None,
+    state: State,
+) -> dict[str, object]:
+    location = f"{pane.session_name}:{pane.window_index}.{pane.pane_index}"
+    pane_display_id = pane.pane_id.removeprefix("%")
+    payload: dict[str, object] = {
+        "location": location,
+        "session_name": pane.session_name,
+        "window_index": pane.window_index,
+        "window_name": pane.window_name,
+        "pane_index": pane.pane_index,
+        "pane_id": pane.pane_id,
+        "pane_display_id": pane_display_id,
+        "pane_pid": pane.pane_pid,
+        "pane_current_command": pane.pane_current_command,
+        "pane_current_path": pane.pane_current_path,
+        "pane_active": pane.pane_active,
+        "codex": codex_match is not None,
+        "state": state.name,
+        "state_evidence": state.evidence,
+    }
+    if codex_match is not None:
+        payload["codex_pid"] = codex_match.process.pid
+        payload["codex_command"] = codex_match.process.args
+        payload["codex_process_stat"] = codex_match.process.stat
+        payload["codex_descendant_count"] = len(codex_match.descendants)
+        payload["codex_helper_count"] = sum(
+            1
+            for process in codex_match.descendants
+            if "Z" not in process.stat
+            and "<defunct>" not in process.args
+            and _looks_like_codex_helper(process)
+        )
+    return payload
+
+
+def collect_inventory(
+    *,
+    include_all: bool,
+    capture: bool,
+    capture_lines: int,
+) -> dict[str, object]:
+    panes = list_tmux_panes()
+    processes = list_processes()
+
+    rows: list[dict[str, object]] = []
+    for pane in panes:
+        codex_match = find_codex_process(pane, processes)
+        if codex_match is None and not include_all:
+            continue
+
+        captured_text: str | None = None
+        if capture and codex_match is not None:
+            try:
+                captured_text = capture_pane(pane.pane_id, capture_lines)
+            except CodexTmuxError as exc:
+                captured_text = ""
+                state = State(name="unknown", evidence=str(exc))
+            else:
+                state = classify_state(codex_match, captured_text=captured_text)
+        else:
+            state = classify_state(codex_match, captured_text=None)
+
+        rows.append(_pane_payload(pane, codex_match=codex_match, state=state))
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "pane_count": len(panes),
+        "codex_pane_count": sum(1 for row in rows if row["codex"]),
+        "panes": rows,
+    }
+
+
+def _stringify(value: object) -> str:
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _truncate(value: str, width: int) -> str:
+    if len(value) <= width:
+        return value
+    if width <= 1:
+        return value[:width]
+    return f"{value[: width - 1]}..."
+
+
+def _print_table(inventory: dict[str, object]) -> None:
+    rows = inventory["panes"]
+    if not isinstance(rows, list) or not rows:
+        print("No Codex tmux panes found.")
+        return
+
+    columns = [
+        ("location", "LOCATION", 14),
+        ("pane_display_id", "PANE", 6),
+        ("window_name", "WINDOW", 18),
+        ("pane_active", "ACTIVE", 6),
+        ("state", "STATE", 14),
+        ("codex_pid", "CODEX_PID", 9),
+        ("pane_current_path", "CWD", 32),
+        ("state_evidence", "EVIDENCE", 48),
+    ]
+    widths = [
+        min(
+            max(len(header), *(len(_stringify(row.get(key))) for row in rows)),
+            max_width,
+        )
+        for key, header, max_width in columns
+    ]
+    header = "  ".join(
+        header.ljust(width) for (_, header, _), width in zip(columns, widths)
+    )
+    print(header)
+    print("  ".join("-" * width for width in widths))
+    for row in rows:
+        print(
+            "  ".join(
+                _truncate(_stringify(row.get(key)), width).ljust(width)
+                for (key, _, _), width in zip(columns, widths)
+            )
+        )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Inventory Codex sessions running inside tmux panes."
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="include tmux panes that do not have a Codex process",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default="table",
+        help="output format",
+    )
+    parser.add_argument(
+        "--capture-lines",
+        type=int,
+        default=DEFAULT_CAPTURE_LINES,
+        help="recent pane lines to inspect for visible Codex state",
+    )
+    parser.add_argument(
+        "--no-capture",
+        action="store_true",
+        help="skip tmux capture-pane state inspection",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        inventory = collect_inventory(
+            include_all=args.all,
+            capture=not args.no_capture,
+            capture_lines=args.capture_lines,
+        )
+    except CodexTmuxError as exc:
+        print(f"codex-tmux: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        json.dump(inventory, sys.stdout, indent=2, sort_keys=True)
+        print()
+    else:
+        _print_table(inventory)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -6,8 +6,8 @@
     "strict": true,
     "noEmitOnError": true,
     "outDir": ".build",
-    "rootDir": "src",
+    "rootDir": "tools/claw-debug/src",
     "types": ["node"]
   },
-  "include": ["src/**/*.ts"]
+  "include": ["tools/claw-debug/src/**/*.ts"]
 }

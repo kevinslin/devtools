@@ -1,0 +1,636 @@
+#!/usr/bin/env python3
+"""Serve a Markdown preview locally from stdin or a file."""
+
+from __future__ import annotations
+
+import argparse
+from functools import partial
+import html
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import re
+from pathlib import Path
+import sys
+import webbrowser
+
+try:
+    from markdown_it import MarkdownIt
+    from markdown_it.rules_core import StateCore
+    from markdown_it.token import Token
+except ImportError:  # pragma: no cover - exercised via runtime check
+    MarkdownIt = None
+    StateCore = object  # type: ignore[assignment]
+    Token = object  # type: ignore[assignment]
+
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 0
+DEFAULT_TITLE = "Markdown Preview"
+TASK_PREFIX_RE = re.compile(r"^\[(?P<mark>[ xX])\]\s+")
+NON_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f6f1e8;
+      --paper: rgba(255, 251, 245, 0.94);
+      --paper-strong: #fffdfa;
+      --ink: #2a241d;
+      --muted: #6e6254;
+      --line: rgba(42, 36, 29, 0.12);
+      --accent: #9a4f24;
+      --accent-soft: rgba(154, 79, 36, 0.12);
+      --shadow: 0 22px 50px rgba(61, 44, 24, 0.12);
+      --code-bg: #2a241d;
+      --code-ink: #f8efe3;
+      --quote: #b8794a;
+    }}
+
+    * {{
+      box-sizing: border-box;
+    }}
+
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
+      background:
+        radial-gradient(circle at top left, rgba(154, 79, 36, 0.18), transparent 26rem),
+        radial-gradient(circle at right 20%, rgba(193, 157, 111, 0.15), transparent 22rem),
+        linear-gradient(180deg, #fbf6ef 0%, var(--bg) 48%, #f3ece1 100%);
+    }}
+
+    a {{
+      color: var(--accent);
+    }}
+
+    main {{
+      width: min(1180px, calc(100vw - 2rem));
+      margin: 1.5rem auto 2.25rem;
+      display: grid;
+      gap: 1rem;
+    }}
+
+    .panel {{
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(16px);
+    }}
+
+    .hero {{
+      padding: 1.3rem 1.45rem;
+    }}
+
+    .eyebrow {{
+      margin: 0;
+      color: var(--accent);
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+    }}
+
+    h1 {{
+      margin: 0.5rem 0 0.35rem;
+      font-size: clamp(2.3rem, 5vw, 4.4rem);
+      line-height: 0.9;
+      letter-spacing: -0.03em;
+    }}
+
+    .caption {{
+      margin: 0.2rem 0 0;
+      max-width: 56rem;
+      color: var(--muted);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }}
+
+    .caption a {{
+      font-weight: 600;
+    }}
+
+    .preview-shell {{
+      display: grid;
+      gap: 1rem;
+      grid-template-columns: minmax(0, 1.8fr) minmax(260px, 0.9fr);
+      align-items: start;
+      padding: 1rem;
+    }}
+
+    .preview-pane {{
+      min-width: 0;
+      background: var(--paper-strong);
+      border: 1px solid rgba(42, 36, 29, 0.08);
+      border-radius: 20px;
+      padding: clamp(1.2rem, 2vw, 2.2rem);
+      overflow: auto;
+    }}
+
+    .preview-pane h1,
+    .preview-pane h2,
+    .preview-pane h3,
+    .preview-pane h4,
+    .preview-pane h5,
+    .preview-pane h6 {{
+      position: relative;
+      margin: 1.4em 0 0.45em;
+      scroll-margin-top: 1.2rem;
+    }}
+
+    .preview-pane h1:first-child,
+    .preview-pane h2:first-child,
+    .preview-pane h3:first-child {{
+      margin-top: 0;
+    }}
+
+    .preview-pane p,
+    .preview-pane li,
+    .preview-pane blockquote,
+    .preview-pane th,
+    .preview-pane td {{
+      font-size: 1.02rem;
+      line-height: 1.66;
+    }}
+
+    .preview-pane code {{
+      font-family: "SFMono-Regular", "Menlo", monospace;
+      font-size: 0.92em;
+      background: rgba(154, 79, 36, 0.1);
+      border-radius: 6px;
+      padding: 0.12rem 0.32rem;
+    }}
+
+    .preview-pane pre {{
+      margin: 1.2rem 0;
+      padding: 1rem 1.1rem;
+      background: var(--code-bg);
+      color: var(--code-ink);
+      border-radius: 16px;
+      overflow: auto;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+    }}
+
+    .preview-pane pre code {{
+      background: transparent;
+      padding: 0;
+      color: inherit;
+    }}
+
+    .preview-pane blockquote {{
+      margin: 1.1rem 0;
+      padding: 0.2rem 0 0.2rem 1rem;
+      border-left: 4px solid var(--quote);
+      color: var(--muted);
+    }}
+
+    .preview-pane table {{
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1rem 0;
+      overflow: hidden;
+      border-radius: 14px;
+    }}
+
+    .preview-pane th,
+    .preview-pane td {{
+      border: 1px solid rgba(42, 36, 29, 0.1);
+      padding: 0.72rem 0.8rem;
+      vertical-align: top;
+    }}
+
+    .preview-pane th {{
+      background: rgba(154, 79, 36, 0.08);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      text-align: left;
+    }}
+
+    .preview-pane img {{
+      max-width: 100%;
+      border-radius: 14px;
+      display: block;
+      margin: 1rem auto;
+    }}
+
+    .preview-pane hr {{
+      border: 0;
+      border-top: 1px solid var(--line);
+      margin: 1.6rem 0;
+    }}
+
+    .preview-pane ul,
+    .preview-pane ol {{
+      padding-left: 1.45rem;
+    }}
+
+    .preview-pane li + li {{
+      margin-top: 0.3rem;
+    }}
+
+    .preview-pane .task-list-item {{
+      list-style: none;
+      margin-left: -1.35rem;
+      padding-left: 0.15rem;
+    }}
+
+    .preview-pane .task-list-item-checkbox {{
+      width: 1rem;
+      height: 1rem;
+      margin: 0 0.6rem 0 0;
+      vertical-align: -0.12rem;
+      accent-color: var(--accent);
+    }}
+
+    .preview-pane .header-anchor {{
+      margin-left: 0.45rem;
+      text-decoration: none;
+      color: rgba(154, 79, 36, 0.5);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      font-size: 0.75em;
+      opacity: 0;
+      transition: opacity 120ms ease;
+    }}
+
+    .preview-pane h1:hover .header-anchor,
+    .preview-pane h2:hover .header-anchor,
+    .preview-pane h3:hover .header-anchor,
+    .preview-pane h4:hover .header-anchor,
+    .preview-pane h5:hover .header-anchor,
+    .preview-pane h6:hover .header-anchor {{
+      opacity: 1;
+    }}
+
+    .meta-pane {{
+      display: grid;
+      gap: 1rem;
+      min-width: 0;
+    }}
+
+    .meta-card {{
+      background: rgba(255, 253, 249, 0.86);
+      border: 1px solid rgba(42, 36, 29, 0.08);
+      border-radius: 20px;
+      padding: 1rem 1.05rem;
+    }}
+
+    .meta-card h2 {{
+      margin: 0 0 0.5rem;
+      font-size: 0.95rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+    }}
+
+    .meta-card p,
+    .meta-card li {{
+      margin: 0;
+      color: var(--muted);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      line-height: 1.5;
+    }}
+
+    .meta-card ul {{
+      margin: 0;
+      padding-left: 1.1rem;
+      display: grid;
+      gap: 0.45rem;
+    }}
+
+    .source {{
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: "SFMono-Regular", "Menlo", monospace;
+      font-size: 0.92rem;
+      line-height: 1.55;
+      color: var(--ink);
+    }}
+
+    @media (max-width: 900px) {{
+      .preview-shell {{
+        grid-template-columns: 1fr;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="panel hero">
+      <p class="eyebrow">mdpreview</p>
+      <h1>{title}</h1>
+      <p class="caption">Markdown rendered locally in your browser through a small localhost server. Source stays on your machine and the page applies markdown-it plugins for heading anchors, task lists, and external-link handling.</p>
+      <p class="caption"><a href="/source.md">download source</a></p>
+    </section>
+    <section class="panel preview-shell">
+      <article class="preview-pane" id="preview-root">
+{rendered_html}
+      </article>
+      <aside class="meta-pane">
+        <section class="meta-card">
+          <h2>What you are seeing</h2>
+          <ul>
+            <li>Markdown rendered with markdown-it.</li>
+            <li>Heading anchors generated through a plugin.</li>
+            <li>Task list markers turned into disabled checkboxes.</li>
+            <li>External links opened in a new tab with safe rel attributes.</li>
+          </ul>
+        </section>
+        <section class="meta-card">
+          <h2>Source</h2>
+          <pre class="source">{source}</pre>
+        </section>
+      </aside>
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+
+class MdPreviewError(RuntimeError):
+    """Raised when mdpreview cannot continue."""
+
+
+class MdPreviewHandler(BaseHTTPRequestHandler):
+    def __init__(self, *args, html_page: bytes, markdown_source: bytes, **kwargs):
+        self._html_page = html_page
+        self._markdown_source = markdown_source
+        super().__init__(*args, **kwargs)
+
+    def do_GET(self) -> None:
+        if self.path in {"/", "/index.html"}:
+            self._send_bytes(self._html_page, "text/html; charset=utf-8")
+            return
+        if self.path == "/source.md":
+            self._send_bytes(self._markdown_source, "text/plain; charset=utf-8")
+            return
+        if self.path == "/favicon.ico":
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.end_headers()
+            return
+
+        self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+    def log_message(self, format: str, *args) -> None:
+        return
+
+    def _send_bytes(self, payload: bytes, content_type: str) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Serve a Markdown preview locally from stdin or a file."
+    )
+    parser.add_argument(
+        "path",
+        nargs="?",
+        help="Markdown file path. Omit or use '-' to read from stdin.",
+    )
+    parser.add_argument(
+        "--host",
+        default=DEFAULT_HOST,
+        help=f"Address to bind (default: {DEFAULT_HOST}).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help="TCP port to bind (default: 0, which asks the OS for a free port).",
+    )
+    parser.add_argument(
+        "--title",
+        default=DEFAULT_TITLE,
+        help=f"Page title to display (default: {DEFAULT_TITLE!r}).",
+    )
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not open the preview in a browser automatically.",
+    )
+    return parser.parse_args()
+
+
+def _require_runtime() -> None:
+    if MarkdownIt is None:
+        raise MdPreviewError(
+            "mdpreview requires markdown-it-py. Install it with: python3 -m pip install markdown-it-py"
+        )
+
+
+def _read_markdown_source(path_arg: str | None) -> tuple[str, str]:
+    if path_arg and path_arg != "-":
+        path = Path(path_arg).expanduser()
+        try:
+            source = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise MdPreviewError(f"failed to read Markdown file {path}: {exc}") from exc
+        title = path.name
+    else:
+        if sys.stdin.isatty():
+            raise MdPreviewError("provide Markdown via stdin or pass a Markdown file path")
+        try:
+            source = sys.stdin.read()
+        except OSError as exc:
+            raise MdPreviewError(f"failed to read Markdown from stdin: {exc}") from exc
+        title = DEFAULT_TITLE
+
+    if not source.strip():
+        raise MdPreviewError("Markdown input is empty")
+    return source, title
+
+
+def _slugify(text: str) -> str:
+    slug = NON_SLUG_RE.sub("-", text.strip().lower()).strip("-")
+    return slug or "section"
+
+
+def _text_token(content: str) -> Token:
+    token = Token("text", "", 0)
+    token.content = content
+    return token
+
+
+def _html_inline_token(content: str) -> Token:
+    token = Token("html_inline", "", 0)
+    token.content = content
+    return token
+
+
+def _heading_anchor_plugin(md: MarkdownIt) -> None:
+    def add_heading_anchors(state: StateCore) -> None:
+        slug_counts: dict[str, int] = {}
+        tokens = state.tokens
+        for index, token in enumerate(tokens):
+            if token.type != "heading_open":
+                continue
+
+            inline = tokens[index + 1] if index + 1 < len(tokens) else None
+            if inline is None or inline.type != "inline":
+                continue
+
+            label = "".join(child.content for child in (inline.children or [])).strip()
+            slug_base = _slugify(label)
+            slug_count = slug_counts.get(slug_base, 0)
+            slug_counts[slug_base] = slug_count + 1
+            slug = slug_base if slug_count == 0 else f"{slug_base}-{slug_count + 1}"
+            token.attrSet("id", slug)
+            inline.children = list(inline.children or []) + [
+                _html_inline_token(
+                    f'<a class="header-anchor" href="#{html.escape(slug, quote=True)}" '
+                    'aria-label="Link to this section">#</a>'
+                )
+            ]
+
+    md.core.ruler.push("heading_anchors", add_heading_anchors)
+
+
+def _external_links_plugin(md: MarkdownIt) -> None:
+    default_render = md.renderer.rules.get("link_open")
+
+    def render_link_open(tokens, idx, options, env):
+        href = tokens[idx].attrGet("href") or ""
+        if href.startswith("http://") or href.startswith("https://"):
+            tokens[idx].attrSet("target", "_blank")
+            tokens[idx].attrSet("rel", "noreferrer noopener")
+        if default_render is not None:
+            return default_render(tokens, idx, options, env)
+        return md.renderer.renderToken(tokens, idx, options, env)
+
+    md.renderer.rules["link_open"] = render_link_open
+
+
+def _task_list_plugin(md: MarkdownIt) -> None:
+    def convert_task_lists(state: StateCore) -> None:
+        tokens = state.tokens
+        stack: list[int] = []
+
+        for index, token in enumerate(tokens):
+            if token.type == "list_item_open":
+                stack.append(index)
+                continue
+            if token.type == "list_item_close":
+                if stack:
+                    stack.pop()
+                continue
+            if token.type != "inline" or not stack:
+                continue
+
+            children = list(token.children or [])
+            if not children:
+                continue
+
+            first_text_index = next(
+                (child_index for child_index, child in enumerate(children) if child.type == "text"),
+                None,
+            )
+            if first_text_index is None:
+                continue
+
+            first_text = children[first_text_index]
+            match = TASK_PREFIX_RE.match(first_text.content)
+            if not match:
+                continue
+
+            checked = match.group("mark").lower() == "x"
+            remaining = first_text.content[match.end():]
+            checkbox_html = (
+                '<input class="task-list-item-checkbox" type="checkbox" disabled'
+                + (" checked" if checked else "")
+                + ">"
+            )
+            replacement = [_html_inline_token(checkbox_html)]
+            if remaining:
+                replacement.append(_text_token(remaining))
+            replacement.extend(children[first_text_index + 1 :])
+            token.children = children[:first_text_index] + replacement
+            tokens[stack[-1]].attrJoin("class", "task-list-item")
+
+    md.core.ruler.push("task_lists", convert_task_lists)
+
+
+def _build_renderer() -> MarkdownIt:
+    assert MarkdownIt is not None
+    renderer = MarkdownIt("commonmark", {"html": False})
+    renderer.enable("table")
+    renderer.enable("strikethrough")
+    renderer.use(_heading_anchor_plugin)
+    renderer.use(_task_list_plugin)
+    renderer.use(_external_links_plugin)
+    return renderer
+
+
+def _build_html_page(title: str, rendered_html: str, markdown_source: str) -> str:
+    indented_html = "\n".join(
+        f"        {line}" if line else "" for line in rendered_html.splitlines()
+    )
+    return PAGE_TEMPLATE.format(
+        title=html.escape(title),
+        rendered_html=indented_html,
+        source=html.escape(markdown_source),
+    )
+
+
+def _display_host(bound_host: str, requested_host: str) -> str:
+    if requested_host in {"0.0.0.0", "::", ""}:
+        return "127.0.0.1"
+    return bound_host
+
+
+def main() -> int:
+    args = _parse_args()
+    if args.port < 0 or args.port > 65535:
+        print("mdpreview: --port must be between 0 and 65535", file=sys.stderr)
+        return 1
+
+    try:
+        _require_runtime()
+        markdown_source, inferred_title = _read_markdown_source(args.path)
+        renderer = _build_renderer()
+        rendered_html = renderer.render(markdown_source)
+        title = args.title if args.title != DEFAULT_TITLE or not args.path else inferred_title
+    except MdPreviewError as exc:
+        print(f"mdpreview: {exc}", file=sys.stderr)
+        return 1
+
+    html_page = _build_html_page(title, rendered_html, markdown_source).encode("utf-8")
+    handler = partial(
+        MdPreviewHandler,
+        html_page=html_page,
+        markdown_source=markdown_source.encode("utf-8"),
+    )
+
+    try:
+        with ThreadingHTTPServer((args.host, args.port), handler) as server:
+            bound_host, bound_port = server.server_address[:2]
+            url = f"http://{_display_host(bound_host, args.host)}:{bound_port}"
+            print(f"mdpreview serving Markdown preview at {url}", flush=True)
+            if not args.no_open:
+                webbrowser.open(url)
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                print("\nmdpreview stopped", flush=True)
+    except OSError as exc:
+        print(f"mdpreview: failed to start server: {exc}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

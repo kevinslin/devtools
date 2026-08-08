@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""Bidirectionally sync selected files between a live folder and a git repo.
+
+Usage:
+  agent-sync init [path/to/config.json]
+  agent-sync init --force [path/to/config.json]
+  agent-sync path/to/config.json
+  agent-sync --dry-run path/to/config.json
+  agent-sync --force source path/to/config.json
+  agent-sync --force repo path/to/config.json
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass
+from fnmatch import fnmatch
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+
+
+DEFAULT_REMOTE = "origin"
+DEFAULT_BRANCH = "main"
+DEFAULT_COMMIT_MESSAGE = "agent-sync: update tracked config"
+DEFAULT_INIT_FILENAME = "agent-sync.json"
+DEFAULT_CODEX_PATHS = (
+    "AGENTS.md",
+    "agents",
+    "automations",
+    "config.toml",
+    "memories",
+    "rules",
+    "skills",
+)
+DEFAULT_EXCLUDES = (
+    ".git",
+    ".git/**",
+    ".DS_Store",
+    "**/.DS_Store",
+    "__pycache__/**",
+    "**/__pycache__/**",
+    "*.pyc",
+    "**/*.pyc",
+)
+VALID_BOOTSTRAP = {"manual", "source", "repo"}
+VALID_FORCE = {"source", "repo"}
+
+
+class SyncError(Exception):
+    """Raised for setup or execution errors."""
+
+
+@dataclass(frozen=True)
+class FileFingerprint:
+    sha256: str
+    executable: bool
+
+
+@dataclass(frozen=True)
+class SyncConfig:
+    config_path: Path
+    source_dir: Path
+    repo_dir: Path
+    paths: tuple[str, ...]
+    exclude: tuple[str, ...]
+    state_file: Path
+    remote: str
+    branch: str
+    bootstrap: str
+    commit_message: str
+    git_author_name: str | None
+    git_author_email: str | None
+
+
+@dataclass(frozen=True)
+class PlannedChange:
+    path: str
+    action: str
+
+
+def _sanitize_profile(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")
+    return cleaned or "default"
+
+
+def _default_init_config(repo_dir: Path) -> dict[str, object]:
+    profile = _sanitize_profile(f"codex-{repo_dir.name}")
+    return {
+        "profile": profile,
+        "source_dir": str(Path("~/.codex").expanduser()),
+        "repo_dir": str(repo_dir.resolve()),
+        "paths": list(DEFAULT_CODEX_PATHS),
+        "remote": DEFAULT_REMOTE,
+        "branch": DEFAULT_BRANCH,
+        "bootstrap": "source",
+        "commit_message": DEFAULT_COMMIT_MESSAGE,
+    }
+
+
+def _init_config(output_path: Path, *, overwrite: bool) -> dict[str, object]:
+    if output_path.exists() and not overwrite:
+        raise SyncError(f"config already exists: {output_path}")
+
+    payload = _default_init_config(Path.cwd())
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {
+        "status": "initialized",
+        "config_path": str(output_path),
+        "profile": payload["profile"],
+        "source_dir": payload["source_dir"],
+        "repo_dir": payload["repo_dir"],
+        "paths": payload["paths"],
+        "bootstrap": payload["bootstrap"],
+    }
+
+
+def _load_config(path: Path) -> SyncConfig:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise SyncError(f"failed to read config: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SyncError(f"invalid config JSON: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise SyncError("config must be a JSON object")
+
+    source_dir = _resolve_path(raw.get("source_dir"), base=path.parent, allow_missing=True)
+    repo_dir = _resolve_path(raw.get("repo_dir"), base=path.parent, allow_missing=False)
+    paths = _read_string_list(raw.get("paths"), key="paths")
+    if not paths:
+        raise SyncError("config.paths must not be empty")
+
+    profile = raw.get("profile")
+    if profile is None:
+        profile = repo_dir.name
+    if not isinstance(profile, str) or not profile.strip():
+        raise SyncError("config.profile must be a non-empty string when provided")
+
+    state_raw = raw.get("state_file")
+    if state_raw is None:
+        state_file = Path("~/.cache/agent-sync").expanduser() / f"{_sanitize_profile(profile)}.json"
+    else:
+        state_file = _resolve_path(state_raw, base=path.parent, allow_missing=True)
+
+    exclude = tuple(DEFAULT_EXCLUDES) + tuple(_read_string_list(raw.get("exclude", []), key="exclude"))
+
+    remote = raw.get("remote", DEFAULT_REMOTE)
+    branch = raw.get("branch", DEFAULT_BRANCH)
+    bootstrap = raw.get("bootstrap", "manual")
+    commit_message = raw.get("commit_message", DEFAULT_COMMIT_MESSAGE)
+    git_author_name = raw.get("git_author_name")
+    git_author_email = raw.get("git_author_email")
+
+    if not isinstance(remote, str) or not remote:
+        raise SyncError("config.remote must be a non-empty string")
+    if not isinstance(branch, str) or not branch:
+        raise SyncError("config.branch must be a non-empty string")
+    if not isinstance(commit_message, str) or not commit_message:
+        raise SyncError("config.commit_message must be a non-empty string")
+    if bootstrap not in VALID_BOOTSTRAP:
+        raise SyncError("config.bootstrap must be one of: manual, source, repo")
+    if git_author_name is not None and not isinstance(git_author_name, str):
+        raise SyncError("config.git_author_name must be a string when provided")
+    if git_author_email is not None and not isinstance(git_author_email, str):
+        raise SyncError("config.git_author_email must be a string when provided")
+
+    if source_dir.exists() and not source_dir.is_dir():
+        raise SyncError(f"source_dir is not a directory: {source_dir}")
+    if not repo_dir.exists():
+        raise SyncError(f"repo_dir does not exist: {repo_dir}")
+    if not repo_dir.is_dir():
+        raise SyncError(f"repo_dir is not a directory: {repo_dir}")
+
+    return SyncConfig(
+        config_path=path,
+        source_dir=source_dir,
+        repo_dir=repo_dir,
+        paths=tuple(paths),
+        exclude=exclude,
+        state_file=state_file,
+        remote=remote,
+        branch=branch,
+        bootstrap=bootstrap,
+        commit_message=commit_message,
+        git_author_name=git_author_name,
+        git_author_email=git_author_email,
+    )
+
+
+def _resolve_path(raw: object, *, base: Path, allow_missing: bool) -> Path:
+    if not isinstance(raw, str) or not raw:
+        raise SyncError("config must define non-empty string paths")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = (base / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    if not allow_missing and not candidate.exists():
+        raise SyncError(f"path does not exist: {candidate}")
+    return candidate
+
+
+def _read_string_list(raw: object, *, key: str) -> list[str]:
+    if not isinstance(raw, list):
+        raise SyncError(f"config.{key} must be an array of strings")
+    values: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item:
+            raise SyncError(f"config.{key} must contain only non-empty strings")
+        values.append(item)
+    return values
+
+
+def _fingerprint(path: Path) -> FileFingerprint:
+    sha = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                sha.update(chunk)
+    except OSError as exc:
+        raise SyncError(f"failed to read file for hashing: {path}: {exc}") from exc
+    executable = bool(path.stat().st_mode & 0o111)
+    return FileFingerprint(sha256=sha.hexdigest(), executable=executable)
+
+
+def _is_excluded(relative_path: str, patterns: tuple[str, ...]) -> bool:
+    for pattern in patterns:
+        if fnmatch(relative_path, pattern):
+            return True
+        if pattern.startswith("**/") and fnmatch(relative_path, pattern[3:]):
+            return True
+    return False
+
+
+def _expand_spec(root: Path, spec: str) -> list[Path]:
+    direct = root / spec
+    if direct.exists():
+        return [direct]
+    return sorted(root.glob(spec))
+
+
+def _build_snapshot(root: Path, config: SyncConfig) -> dict[str, FileFingerprint]:
+    if not root.exists():
+        return {}
+
+    files: set[str] = set()
+    for spec in config.paths:
+        for match in _expand_spec(root, spec):
+            if match.is_dir():
+                for child in match.rglob("*"):
+                    if child.is_file():
+                        try:
+                            relative = child.relative_to(root).as_posix()
+                        except ValueError as exc:
+                            raise SyncError(f"tracked path escaped root: {child}") from exc
+                        if not _is_excluded(relative, config.exclude):
+                            files.add(relative)
+            elif match.is_file():
+                try:
+                    relative = match.relative_to(root).as_posix()
+                except ValueError as exc:
+                    raise SyncError(f"tracked path escaped root: {match}") from exc
+                if not _is_excluded(relative, config.exclude):
+                    files.add(relative)
+
+    snapshot: dict[str, FileFingerprint] = {}
+    for relative in sorted(files):
+        snapshot[relative] = _fingerprint(root / relative)
+    return snapshot
+
+
+def _load_state(path: Path) -> tuple[str | None, dict[str, FileFingerprint]] | None:
+    if not path.exists():
+        return None
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise SyncError(f"failed to read state file: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SyncError(f"invalid state JSON: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise SyncError("state file must be a JSON object")
+
+    snapshot_raw = raw.get("snapshot", {})
+    if not isinstance(snapshot_raw, dict):
+        raise SyncError("state snapshot must be an object")
+
+    snapshot: dict[str, FileFingerprint] = {}
+    for relative, item in snapshot_raw.items():
+        if not isinstance(relative, str) or not isinstance(item, dict):
+            raise SyncError("state snapshot contains invalid entries")
+        sha256 = item.get("sha256")
+        executable = item.get("executable")
+        if not isinstance(sha256, str) or not isinstance(executable, bool):
+            raise SyncError("state snapshot entries must contain sha256 and executable")
+        snapshot[relative] = FileFingerprint(sha256=sha256, executable=executable)
+
+    commit = raw.get("last_sync_commit")
+    if commit is not None and not isinstance(commit, str):
+        raise SyncError("state last_sync_commit must be a string when present")
+    return commit, snapshot
+
+
+def _save_state(path: Path, commit: str | None, snapshot: dict[str, FileFingerprint]) -> None:
+    payload = {
+        "last_sync_commit": commit,
+        "snapshot": {relative: asdict(fingerprint) for relative, fingerprint in sorted(snapshot.items())},
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _run_command(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        joined = " ".join(cmd)
+        raise SyncError(f"failed to run command '{joined}': {exc}") from exc
+
+
+def _git(repo_dir: Path, *args: str, env: dict[str, str] | None = None) -> str:
+    proc = _run_command(["git", *args], cwd=repo_dir, env=env)
+    if proc.returncode != 0:
+        message = proc.stderr.strip() or proc.stdout.strip() or "unknown git error"
+        raise SyncError(f"git {' '.join(args)} failed: {message}")
+    return proc.stdout.strip()
+
+
+def _ensure_clean_repo(config: SyncConfig) -> None:
+    _git(config.repo_dir, "rev-parse", "--is-inside-work-tree")
+    status = _git(config.repo_dir, "status", "--porcelain")
+    if status:
+        raise SyncError(
+            "repo_dir has uncommitted changes; keep the sync clone dedicated and clean before running agent-sync"
+        )
+
+
+def _prepare_repo(config: SyncConfig) -> None:
+    _ensure_clean_repo(config)
+    _git(config.repo_dir, "checkout", config.branch)
+    _git(config.repo_dir, "pull", "--rebase", config.remote, config.branch)
+
+
+def _prepare_repo_for_dry_run(config: SyncConfig) -> None:
+    _ensure_clean_repo(config)
+    current_branch = _git(config.repo_dir, "rev-parse", "--abbrev-ref", "HEAD")
+    if current_branch != config.branch:
+        raise SyncError(
+            f"repo_dir is on branch '{current_branch}', but --dry-run requires '{config.branch}' without switching branches"
+        )
+
+
+def _apply_changes(changes: list[PlannedChange], *, from_root: Path, to_root: Path) -> None:
+    for change in changes:
+        source = from_root / change.path
+        target = to_root / change.path
+        if change.action == "delete":
+            if target.exists() or target.is_symlink():
+                target.unlink()
+                _prune_empty_parents(target.parent, to_root)
+            continue
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
+
+def _prune_empty_parents(path: Path, root: Path) -> None:
+    current = path
+    while current != root and current.exists():
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
+
+
+def _diff_snapshot(source: dict[str, FileFingerprint], target: dict[str, FileFingerprint]) -> list[PlannedChange]:
+    changes: list[PlannedChange] = []
+    for relative in sorted(set(source) | set(target)):
+        if source.get(relative) == target.get(relative):
+            continue
+        action = "delete" if source.get(relative) is None else "copy"
+        changes.append(PlannedChange(path=relative, action=action))
+    return changes
+
+
+def _plan_sync(
+    base: dict[str, FileFingerprint],
+    source: dict[str, FileFingerprint],
+    repo: dict[str, FileFingerprint],
+    *,
+    force: str | None,
+) -> tuple[list[PlannedChange], list[PlannedChange], list[str]]:
+    source_to_repo: list[PlannedChange] = []
+    repo_to_source: list[PlannedChange] = []
+    conflicts: list[str] = []
+
+    for relative in sorted(set(base) | set(source) | set(repo)):
+        base_entry = base.get(relative)
+        source_entry = source.get(relative)
+        repo_entry = repo.get(relative)
+
+        if source_entry == repo_entry:
+            continue
+        if source_entry == base_entry:
+            repo_to_source.append(
+                PlannedChange(path=relative, action="delete" if repo_entry is None else "copy")
+            )
+            continue
+        if repo_entry == base_entry:
+            source_to_repo.append(
+                PlannedChange(path=relative, action="delete" if source_entry is None else "copy")
+            )
+            continue
+        if force == "source":
+            source_to_repo.append(
+                PlannedChange(path=relative, action="delete" if source_entry is None else "copy")
+            )
+            continue
+        if force == "repo":
+            repo_to_source.append(
+                PlannedChange(path=relative, action="delete" if repo_entry is None else "copy")
+            )
+            continue
+        conflicts.append(relative)
+
+    return source_to_repo, repo_to_source, conflicts
+
+
+def _git_env(config: SyncConfig) -> dict[str, str]:
+    env = os.environ.copy()
+    if config.git_author_name:
+        env["GIT_AUTHOR_NAME"] = config.git_author_name
+        env["GIT_COMMITTER_NAME"] = config.git_author_name
+    if config.git_author_email:
+        env["GIT_AUTHOR_EMAIL"] = config.git_author_email
+        env["GIT_COMMITTER_EMAIL"] = config.git_author_email
+    return env
+
+
+def _commit_if_needed(config: SyncConfig) -> tuple[str | None, bool]:
+    status = _git(config.repo_dir, "status", "--porcelain")
+    if not status:
+        return None, False
+
+    env = _git_env(config)
+    _git(config.repo_dir, "add", "-A", ".", env=env)
+    _git(config.repo_dir, "commit", "-m", config.commit_message, env=env)
+    _git(config.repo_dir, "push", config.remote, config.branch, env=env)
+    return _git(config.repo_dir, "rev-parse", "HEAD"), True
+
+
+def _head_commit(config: SyncConfig) -> str | None:
+    commit = _git(config.repo_dir, "rev-parse", "HEAD")
+    return commit or None
+
+
+def _sync(config: SyncConfig, *, force: str | None, dry_run: bool) -> dict[str, object]:
+    if dry_run:
+        _prepare_repo_for_dry_run(config)
+    else:
+        _prepare_repo(config)
+
+    repo_snapshot = _build_snapshot(config.repo_dir, config)
+    source_snapshot = _build_snapshot(config.source_dir, config)
+    state = _load_state(config.state_file)
+
+    source_to_repo: list[PlannedChange] = []
+    repo_to_source: list[PlannedChange] = []
+    bootstrap_used: str | None = None
+
+    if state is None:
+        if source_snapshot == repo_snapshot:
+            bootstrap_used = "matched"
+        elif config.bootstrap == "source":
+            bootstrap_used = "source"
+            source_to_repo = _diff_snapshot(source_snapshot, repo_snapshot)
+        elif config.bootstrap == "repo":
+            bootstrap_used = "repo"
+            repo_to_source = _diff_snapshot(repo_snapshot, source_snapshot)
+        else:
+            raise SyncError(
+                "state file is missing and source/repo differ; set config.bootstrap to 'source' or 'repo' for the first run"
+            )
+    else:
+        _, base_snapshot = state
+        source_to_repo, repo_to_source, conflicts = _plan_sync(
+            base_snapshot,
+            source_snapshot,
+            repo_snapshot,
+            force=force,
+        )
+        if conflicts:
+            conflict_list = ", ".join(conflicts)
+            raise SyncConflictError(conflicts, f"conflicting changes detected for: {conflict_list}")
+
+    if dry_run:
+        return {
+            "status": "ok",
+            "dry_run": True,
+            "bootstrap": bootstrap_used,
+            "forced": force,
+            "source_to_repo": [change.path for change in source_to_repo],
+            "repo_to_source": [change.path for change in repo_to_source],
+            "commit": _head_commit(config),
+            "pushed": False,
+            "state_file": str(config.state_file),
+        }
+
+    if source_to_repo:
+        _apply_changes(source_to_repo, from_root=config.source_dir, to_root=config.repo_dir)
+
+    commit, pushed = _commit_if_needed(config)
+    if commit is None:
+        commit = _head_commit(config)
+
+    final_repo_snapshot = _build_snapshot(config.repo_dir, config)
+
+    if repo_to_source:
+        _apply_changes(repo_to_source, from_root=config.repo_dir, to_root=config.source_dir)
+
+    _save_state(config.state_file, commit, final_repo_snapshot)
+
+    return {
+        "status": "ok",
+        "dry_run": False,
+        "bootstrap": bootstrap_used,
+        "forced": force,
+        "source_to_repo": [change.path for change in source_to_repo],
+        "repo_to_source": [change.path for change in repo_to_source],
+        "commit": commit,
+        "pushed": pushed,
+        "state_file": str(config.state_file),
+    }
+
+
+class SyncConflictError(SyncError):
+    """Raised when both sides changed the same tracked file."""
+
+    def __init__(self, conflicts: list[str], message: str) -> None:
+        super().__init__(message)
+        self.conflicts = conflicts
+
+
+def _parse_init_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Write a default Codex agent-sync config in the current directory.")
+    parser.add_argument(
+        "config",
+        nargs="?",
+        default=DEFAULT_INIT_FILENAME,
+        help=f"Output JSON config path (default: ./{DEFAULT_INIT_FILENAME})",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite the output file if it already exists",
+    )
+    return parser.parse_args(argv)
+
+
+def _parse_sync_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Bidirectionally sync agent config files through git.")
+    parser.add_argument("config", help="Path to the sync JSON config file")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the planned sync without copying files, switching branches, writing state, committing, or pushing",
+    )
+    parser.add_argument(
+        "--force",
+        choices=sorted(VALID_FORCE),
+        help="Resolve same-file conflicts by preferring source or repo for this run",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    try:
+        if argv and argv[0] == "init":
+            args = _parse_init_args(argv[1:])
+            summary = _init_config(Path(args.config).expanduser().resolve(), overwrite=args.force)
+        else:
+            args = _parse_sync_args(argv)
+            config = _load_config(Path(args.config).expanduser().resolve())
+            summary = _sync(config, force=args.force, dry_run=args.dry_run)
+    except SyncConflictError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        for relative in exc.conflicts:
+            print(relative, file=sys.stderr)
+        return 1
+    except SyncError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

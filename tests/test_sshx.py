@@ -350,6 +350,29 @@ class SshxCliTest(unittest.TestCase):
             self.assertIn("./.custom-work", work_result.stdout)
             self.assertNotIn("./.custom-default", work_result.stdout)
 
+    def test_legacy_config_path_remains_usable_as_explicit_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home = tmp_path / "home"
+            home.mkdir()
+            _write_file(home / ".zshrc", "export PATH=/usr/local/bin:$PATH\n")
+            _write_file(home / ".gitconfig", "[user]\nname = Test User\n")
+
+            legacy_config_path = ROOT / "config" / "sshx" / "config.yaml"
+            self.assertTrue(legacy_config_path.is_file())
+
+            result = self.run_cli(
+                ["--dry-run", "--sync-method", "rsync", "--profile", "work", "devbox"],
+                home=home,
+                ssh_bin=tmp_path / "fake-ssh",
+                rsync_bin=tmp_path / "fake-rsync",
+                extra_env={"SSHX_CONFIG_PATH": str(legacy_config_path)},
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("./.gitconfig", result.stdout)
+            self.assertNotIn("./.zshrc", result.stdout)
+
     def test_missing_explicit_path_returns_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

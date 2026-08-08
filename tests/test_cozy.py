@@ -10,6 +10,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "bin" / "cozy"
+DEFAULT_CONFIG = ROOT / "tools" / "cozy" / "config" / "config.yaml"
 LAUNCH_AGENT = ROOT / "config" / "cozy" / "com.kevinlin.cozy.plist"
 
 
@@ -45,6 +46,20 @@ class CozyCliTest(unittest.TestCase):
         self.assertIn("Usage: cozy", result.stdout)
         self.assertIn("refresh", result.stdout)
         self.assertIn("restart", result.stdout)
+
+    def test_default_agtask_site_uses_the_existing_launcher(self) -> None:
+        configuration = DEFAULT_CONFIG.read_text(encoding="utf-8")
+        agtask_site = configuration.split("  - name: agtask.localhost\n", 1)[1]
+        dashboard_command = next(
+            line.removeprefix("    run: ")
+            for line in agtask_site.splitlines()
+            if line.startswith("    run: ")
+        )
+        dashboard_executable = Path(dashboard_command.split(maxsplit=1)[0])
+
+        self.assertEqual(dashboard_executable, CLI)
+        self.assertTrue(dashboard_executable.is_file())
+        self.assertTrue(os.access(dashboard_executable, os.X_OK))
 
     def test_check_honors_explicit_config_from_original_working_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

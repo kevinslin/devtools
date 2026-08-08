@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Show a git diff for changes within a recent time window."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timedelta, timezone
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+EMPTY_TREE_HASH = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+WINDOW_RE = re.compile(r"^(?P<count>\d+)(?P<unit>[hdw])$")
+NOW_OVERRIDE_ENV = "TOOL_DIFF_NOW"
+
+
+def _parse_window(raw: str) -> timedelta:
+    match = WINDOW_RE.fullmatch(raw.strip())
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"invalid time window {raw!r}; expected forms like 7h, 3d, or 1w"
+        )
+
+    count = int(match.group("count"))
+    unit = match.group("unit")
+    if unit == "h":
+        return timedelta(hours=count)
+    if unit == "d":
+        return timedelta(days=count)
+    return timedelta(weeks=count)
+
+
+def _parse_now_override(raw: str) -> datetime:
+    candidate = raw.strip()
+    if candidate.endswith("Z"):
+        candidate = f"{candidate[:-1]}+00:00"
+
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise ValueError(
+            f"{NOW_OVERRIDE_ENV} must be an ISO-8601 timestamp, got {raw!r}"
+        ) from exc
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _current_time() -> datetime:
+    override = os.environ.get(NOW_OVERRIDE_ENV)
+    if override:
+        return _parse_now_override(override)
+    return datetime.now(timezone.utc)
+
+
+def _run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _repo_root(cwd: Path) -> Path:
+    result = _run_git(["rev-parse", "--show-toplevel"], cwd=cwd)
+    if result.returncode != 0:
+        message = result.stderr.strip() or "not a git repository"
+        raise RuntimeError(message)
+    return Path(result.stdout.strip())
+
+
+def _resolve_base_ref(repo_root: Path, *, cutoff: datetime) -> str:
+    result = _run_git(
+        ["rev-list", "-1", f"--before={cutoff.isoformat()}", "HEAD"],
+        cwd=repo_root,
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or "failed to resolve commit range"
+        raise RuntimeError(message)
+
+    commit = result.stdout.strip()
+    if commit:
+        return commit
+    return EMPTY_TREE_HASH
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Show a git diff for changes since a recent time window. "
+            "Defaults to 24h."
+        )
+    )
+    parser.add_argument(
+        "window",
+        nargs="?",
+        default="24h",
+        type=_parse_window,
+        help="relative time window like 7h, 3d, or 1w (default: 24h)",
+    )
+    parser.add_argument(
+        "--name-only",
+        action="store_true",
+        help="print changed file names only",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        repo_root = _repo_root(Path.cwd())
+        cutoff = _current_time() - args.window
+        base_ref = _resolve_base_ref(repo_root, cutoff=cutoff)
+    except (RuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    git_args = ["diff"]
+    if args.name_only:
+        git_args.append("--name-only")
+    git_args.append(base_ref)
+
+    result = _run_git(git_args, cwd=repo_root)
+    if result.returncode != 0:
+        message = result.stderr.strip() or "git diff failed"
+        print(f"error: {message}", file=sys.stderr)
+        return result.returncode
+
+    sys.stdout.write(result.stdout)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

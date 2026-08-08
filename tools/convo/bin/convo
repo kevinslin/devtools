@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""Manage Codex conversation logs."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
+import json
+from pathlib import Path
+import re
+import sys
+
+import click
+
+DEFAULT_SESSIONS_ROOT = Path("~/.codex/sessions").expanduser()
+DEFAULT_ARCHIVED_ROOT = Path("~/.codex/archived_sessions").expanduser()
+TIMESTAMP_RE = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
+SESSION_ID_FROM_NAME_RE = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.IGNORECASE,
+)
+CONTEXT_RADIUS = 2
+MAX_CONTEXT_BLOCKS_PER_SESSION = 5
+
+
+@dataclass
+class Snippet:
+    start_line: int
+    end_line: int
+    lines: list[str]
+
+
+@dataclass
+class SessionResult:
+    description: str
+    absolute_path: str
+    sessionid: str
+    created: str
+    updated: str
+    created_dt: datetime | None
+    updated_dt: datetime | None
+    snippets: list[Snippet]
+    total_context_blocks: int
+    total_matches: int
+
+
+def _parse_timestamp(raw: str) -> datetime | None:
+    candidate = raw.strip()
+    if candidate.endswith("Z"):
+        candidate = f"{candidate[:-1]}+00:00"
+    try:
+        value = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _extract_timestamp_from_line(line: str) -> datetime | None:
+    match = TIMESTAMP_RE.search(line)
+    if not match:
+        return None
+    return _parse_timestamp(match.group(1))
+
+
+def _format_timestamp(value: datetime | None) -> str:
+    if value is None:
+        return "unknown"
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _extract_session_metadata_from_line(line: str) -> tuple[str | None, str | None]:
+    if "session_meta" not in line:
+        return None, None
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        return None, None
+    if record.get("type") != "session_meta":
+        return None, None
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None, None
+
+    raw_session_id = payload.get("id")
+    session_id = raw_session_id if isinstance(raw_session_id, str) and raw_session_id else None
+
+    for key in ("title", "description", "cwd"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return session_id, value.strip()
+
+    return session_id, None
+
+
+def _path_session_hint(path: Path) -> str | None:
+    match = SESSION_ID_FROM_NAME_RE.search(path.name)
+    return match.group(1) if match else None
+
+
+def _extract_sessions_path_date(path: Path, sessions_root: Path) -> date | None:
+    try:
+        rel = path.resolve().relative_to(sessions_root.resolve())
+    except ValueError:
+        return None
+    if len(rel.parts) < 3:
+        return None
+    year, month, day = rel.parts[:3]
+    if not (year.isdigit() and month.isdigit() and day.isdigit()):
+        return None
+    try:
+        return date(int(year), int(month), int(day))
+    except ValueError:
+        return None
+
+
+def _passes_path_window_filter(
+    path: Path, sessions_root: Path, from_day: date | None, to_day: date | None
+) -> bool:
+    if from_day is None and to_day is None:
+        return True
+
+    path_day = _extract_sessions_path_date(path, sessions_root)
+    if path_day is None:
+        return True
+    if from_day is not None and path_day < from_day:
+        return False
+    if to_day is not None and path_day > to_day:
+        return False
+    return True
+
+
+def _iter_session_files(sessions_root: Path, archived_root: Path) -> list[Path]:
+    files: list[Path] = []
+    for root in (sessions_root, archived_root):
+        if not root.exists():
+            continue
+        files.extend(path.resolve() for path in root.rglob("*.jsonl") if path.is_file())
+    files.sort()
+    return files
+
+
+def _merge_context_windows(
+    line_count: int,
+    match_indexes: list[int],
+    *,
+    radius: int,
+) -> list[tuple[int, int]]:
+    windows: list[tuple[int, int]] = []
+    for index in match_indexes:
+        start = max(0, index - radius)
+        end = min(line_count - 1, index + radius)
+        if windows and start <= windows[-1][1] + 1:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+            continue
+        windows.append((start, end))
+    return windows
+
+
+def _search_file(
+    path: Path,
+    pattern: re.Pattern[str],
+    *,
+    sessions_root: Path,
+    from_day: date | None,
+    to_day: date | None,
+) -> SessionResult | None:
+    if not _passes_path_window_filter(path, sessions_root, from_day, to_day):
+        return None
+
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        click.echo(f"warning: failed to read {path}: {exc}", err=True)
+        return None
+    if not lines:
+        return None
+
+    session_id: str | None = None
+    description: str | None = None
+    created_dt: datetime | None = None
+    updated_dt: datetime | None = None
+    match_indexes: list[int] = []
+
+    for index, line in enumerate(lines):
+        timestamp = _extract_timestamp_from_line(line)
+        if timestamp is not None:
+            if created_dt is None or timestamp < created_dt:
+                created_dt = timestamp
+            if updated_dt is None or timestamp > updated_dt:
+                updated_dt = timestamp
+
+        if session_id is None or description is None:
+            meta_session_id, meta_description = _extract_session_metadata_from_line(line)
+            if session_id is None and meta_session_id is not None:
+                session_id = meta_session_id
+            if description is None and meta_description is not None:
+                description = meta_description
+
+        if pattern.search(line):
+            match_indexes.append(index)
+
+    if not match_indexes:
+        return None
+
+    if from_day is not None and updated_dt is not None and updated_dt.date() < from_day:
+        return None
+    if to_day is not None and created_dt is not None and created_dt.date() > to_day:
+        return None
+
+    final_session_id = session_id or _path_session_hint(path) or "unknown"
+    final_description = description or f"Codex session {final_session_id}"
+
+    windows = _merge_context_windows(
+        len(lines),
+        match_indexes,
+        radius=CONTEXT_RADIUS,
+    )
+    snippets: list[Snippet] = []
+    for start, end in windows[:MAX_CONTEXT_BLOCKS_PER_SESSION]:
+        snippets.append(
+            Snippet(
+                start_line=start + 1,
+                end_line=end + 1,
+                lines=lines[start : end + 1],
+            )
+        )
+
+    return SessionResult(
+        description=final_description,
+        absolute_path=str(path),
+        sessionid=final_session_id,
+        created=_format_timestamp(created_dt),
+        updated=_format_timestamp(updated_dt),
+        created_dt=created_dt,
+        updated_dt=updated_dt,
+        snippets=snippets,
+        total_context_blocks=len(windows),
+        total_matches=len(match_indexes),
+    )
+
+
+def _render_markdown(results: list[SessionResult], query: str) -> str:
+    if not results:
+        return f"No matches found for regex `{query}`."
+
+    output: list[str] = []
+    for result in results:
+        output.append(f"### {result.description}")
+        output.append(f"- absolute path: {result.absolute_path}")
+        output.append(f"- sessionid: {result.sessionid}")
+        output.append(f"- created: {result.created}")
+        output.append(f"- updated: {result.updated}")
+        output.append("")
+
+        for snippet in result.snippets:
+            output.append("```text")
+            for offset, line in enumerate(snippet.lines):
+                line_number = snippet.start_line + offset
+                output.append(f"{line_number:>6}: {line}")
+            output.append("```")
+            output.append("")
+
+        omitted = result.total_context_blocks - len(result.snippets)
+        if omitted > 0:
+            output.append(f"_... {omitted} more matching context block(s) omitted._")
+            output.append("")
+
+    return "\n".join(output).rstrip()
+
+
+def _render_json(results: list[SessionResult], query: str, from_day: date | None, to_day: date | None) -> str:
+    payload = {
+        "query": query,
+        "from": from_day.isoformat() if from_day else None,
+        "to": to_day.isoformat() if to_day else None,
+        "count": len(results),
+        "results": [
+            {
+                "description": result.description,
+                "absolute_path": result.absolute_path,
+                "sessionid": result.sessionid,
+                "created": result.created,
+                "updated": result.updated,
+                "matches": result.total_matches,
+                "snippets": [
+                    {
+                        "start_line": snippet.start_line,
+                        "end_line": snippet.end_line,
+                        "lines": snippet.lines,
+                    }
+                    for snippet in result.snippets
+                ],
+            }
+            for result in results
+        ],
+    }
+    return json.dumps(payload, indent=2)
+
+
+@click.group(help="Manage Codex conversation logs.")
+def cli() -> None:
+    pass
+
+
+@cli.command(help="Search conversation logs with a regex pattern.")
+@click.argument("query")
+@click.option(
+    "--from",
+    "from_dt",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    default=None,
+    help="Inclusive start date in YYYY-MM-DD.",
+)
+@click.option(
+    "--to",
+    "to_dt",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    default=None,
+    help="Inclusive end date in YYYY-MM-DD.",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["json", "markdown"], case_sensitive=False),
+    default="markdown",
+    show_default=True,
+    help="Output format.",
+)
+@click.option(
+    "--sessions-root",
+    type=click.Path(path_type=Path, file_okay=False, dir_okay=True, resolve_path=True),
+    default=str(DEFAULT_SESSIONS_ROOT),
+    show_default=True,
+    envvar="CONVO_SESSIONS_ROOT",
+    help="Codex active sessions root.",
+)
+@click.option(
+    "--archived-root",
+    type=click.Path(path_type=Path, file_okay=False, dir_okay=True, resolve_path=True),
+    default=str(DEFAULT_ARCHIVED_ROOT),
+    show_default=True,
+    envvar="CONVO_ARCHIVED_ROOT",
+    help="Codex archived sessions root.",
+)
+def search(
+    query: str,
+    from_dt: datetime | None,
+    to_dt: datetime | None,
+    output_format: str,
+    sessions_root: Path,
+    archived_root: Path,
+) -> None:
+    from_day = from_dt.date() if from_dt else None
+    to_day = to_dt.date() if to_dt else None
+
+    if from_day and to_day and from_day > to_day:
+        raise click.UsageError("--from must be on or before --to")
+
+    try:
+        pattern = re.compile(query)
+    except re.error as exc:
+        raise click.ClickException(f"invalid regex: {exc}") from exc
+
+    results: list[SessionResult] = []
+    for path in _iter_session_files(sessions_root, archived_root):
+        result = _search_file(
+            path,
+            pattern,
+            sessions_root=sessions_root,
+            from_day=from_day,
+            to_day=to_day,
+        )
+        if result is not None:
+            results.append(result)
+
+    results.sort(
+        key=lambda item: item.updated_dt
+        or item.created_dt
+        or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+
+    if output_format.lower() == "json":
+        click.echo(_render_json(results, query, from_day, to_day))
+        return
+
+    click.echo(_render_markdown(results, query))
+
+
+def main() -> int:
+    try:
+        cli.main(args=sys.argv[1:], prog_name="convo", standalone_mode=False)
+        return 0
+    except click.ClickException as exc:
+        exc.show(file=sys.stderr)
+        return exc.exit_code
+    except click.Abort:
+        click.echo("aborted", err=True)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

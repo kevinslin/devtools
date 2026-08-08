@@ -4,7 +4,7 @@ import { dirname, resolve } from "node:path";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const built = resolve(root, ".build/claw-debug.js");
-const target = resolve(root, "bin/claw-debug");
+const target = resolve(root, "tools/claw-debug/bin/claw-debug");
 
 const generated = await readFile(built, "utf8");
 const withShebang = generated.startsWith("#!")

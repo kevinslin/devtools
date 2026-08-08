@@ -1,5 +1,6 @@
 *.pyc
 *.skill
 .DS_Store
+.pytest_cache/
 node_modules/
 .build/

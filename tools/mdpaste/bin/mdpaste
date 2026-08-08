@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""Convert Markdown from the clipboard into rich text and write it back."""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import platform
+import shutil
+import subprocess
+import sys
+import tempfile
+
+try:
+    from markdown_it import MarkdownIt
+except ImportError:  # pragma: no cover - exercised via runtime check
+    MarkdownIt = None
+
+
+ENV_PASTEBOARD_NAME = "MDPASTE_PASTEBOARD_NAME"
+
+READ_CLIPBOARD_SCRIPT = r"""
+ObjC.import('AppKit')
+ObjC.import('Foundation')
+
+function pasteboardForName(name) {
+  if (name && name.length > 0) {
+    return $.NSPasteboard.pasteboardWithName($(name))
+  }
+  return $.NSPasteboard.generalPasteboard
+}
+
+function run(argv) {
+  var outputPath = argv[0]
+  var pasteboardName = argv.length > 1 ? argv[1] : ''
+  var pasteboard = pasteboardForName(pasteboardName)
+  var value = pasteboard.stringForType($.NSPasteboardTypeString)
+
+  if (!value) {
+    throw new Error('Clipboard does not contain plain-text Markdown.')
+  }
+
+  var text = ObjC.unwrap(value)
+  if (!text || text.trim().length === 0) {
+    throw new Error('Clipboard Markdown is empty.')
+  }
+
+  var ok = value.writeToFileAtomicallyEncodingError(
+    $(outputPath),
+    true,
+    $.NSUTF8StringEncoding,
+    null
+  )
+  if (!ok) {
+    throw new Error('Failed to persist clipboard contents.')
+  }
+}
+"""
+
+WRITE_CLIPBOARD_SCRIPT = r"""
+ObjC.import('AppKit')
+ObjC.import('Foundation')
+
+function pasteboardForName(name) {
+  if (name && name.length > 0) {
+    return $.NSPasteboard.pasteboardWithName($(name))
+  }
+  return $.NSPasteboard.generalPasteboard
+}
+
+function loadUtf8String(path) {
+  var data = $.NSData.dataWithContentsOfFile($(path))
+  if (!data) {
+    throw new Error('Failed to load clipboard payload.')
+  }
+  var text = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding)
+  if (!text) {
+    throw new Error('Failed to decode clipboard payload.')
+  }
+  return text
+}
+
+function loadData(path) {
+  var data = $.NSData.dataWithContentsOfFile($(path))
+  if (!data) {
+    throw new Error('Failed to load clipboard payload.')
+  }
+  return data
+}
+
+function run(argv) {
+  var plainTextPath = argv[0]
+  var htmlPath = argv[1]
+  var rtfPath = argv[2]
+  var pasteboardName = argv.length > 3 ? argv[3] : ''
+  var pasteboard = pasteboardForName(pasteboardName)
+
+  pasteboard.clearContents
+
+  var plainText = loadUtf8String(plainTextPath)
+  var htmlData = loadData(htmlPath)
+  var rtfData = loadData(rtfPath)
+
+  if (!pasteboard.setStringForType(plainText, $.NSPasteboardTypeString)) {
+    throw new Error('Failed to write plain text to the clipboard.')
+  }
+  if (!pasteboard.setDataForType(htmlData, $.NSPasteboardTypeHTML)) {
+    throw new Error('Failed to write HTML to the clipboard.')
+  }
+  if (!pasteboard.setDataForType(rtfData, $.NSPasteboardTypeRTF)) {
+    throw new Error('Failed to write RTF to the clipboard.')
+  }
+}
+"""
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Read Markdown from the clipboard, convert it to HTML and RTF, "
+            "and write rich text back to the clipboard."
+        )
+    )
+    return parser.parse_args()
+
+
+def _require_supported_runtime() -> None:
+    if platform.system() != "Darwin":
+        raise RuntimeError("mdpaste currently supports macOS only.")
+    if MarkdownIt is None:
+        raise RuntimeError(
+            "mdpaste requires markdown-it-py. Install it with: python3 -m pip install markdown-it-py"
+        )
+    for tool in ("osascript", "textutil"):
+        if shutil.which(tool) is None:
+            raise RuntimeError(f"mdpaste requires `{tool}` to be available in PATH.")
+
+
+def _run_jxa(script: str, args: list[str]) -> None:
+    proc = subprocess.run(
+        ["osascript", "-l", "JavaScript", "-e", script, *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        message = proc.stderr.strip() or proc.stdout.strip() or "JXA clipboard command failed."
+        raise RuntimeError(message)
+
+
+def _read_clipboard_markdown(*, pasteboard_name: str | None) -> str:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_path = Path(tmpdir) / "clipboard.md"
+        args = [str(output_path)]
+        if pasteboard_name:
+            args.append(pasteboard_name)
+        _run_jxa(READ_CLIPBOARD_SCRIPT, args)
+        return output_path.read_text(encoding="utf-8")
+
+
+def _build_html_document(markdown_text: str) -> str:
+    assert MarkdownIt is not None
+    renderer = MarkdownIt("commonmark").enable("table")
+    body = renderer.render(markdown_text)
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+body {{
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.45;
+}}
+pre, code {{
+  font-family: Menlo, Consolas, monospace;
+}}
+pre {{
+  background: #f6f8fa;
+  border-radius: 6px;
+  padding: 12px;
+  white-space: pre-wrap;
+}}
+blockquote {{
+  border-left: 4px solid #d0d7de;
+  color: #57606a;
+  margin: 0;
+  padding-left: 12px;
+}}
+table {{
+  border-collapse: collapse;
+}}
+th, td {{
+  border: 1px solid #d0d7de;
+  padding: 6px 10px;
+}}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>
+"""
+
+
+def _convert_html_to_rtf(html_text: str) -> bytes:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        html_path = tmp_path / "clipboard.html"
+        rtf_path = tmp_path / "clipboard.rtf"
+        html_path.write_text(html_text, encoding="utf-8")
+        proc = subprocess.run(
+            [
+                "textutil",
+                "-convert",
+                "rtf",
+                "-inputencoding",
+                "UTF-8",
+                "-output",
+                str(rtf_path),
+                str(html_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            message = proc.stderr.strip() or "textutil failed to convert HTML to RTF."
+            raise RuntimeError(message)
+        return rtf_path.read_bytes()
+
+
+def _write_rich_clipboard(
+    *,
+    plain_text: str,
+    html_text: str,
+    rtf_bytes: bytes,
+    pasteboard_name: str | None,
+) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        plain_text_path = tmp_path / "clipboard.txt"
+        html_path = tmp_path / "clipboard.html"
+        rtf_path = tmp_path / "clipboard.rtf"
+        plain_text_path.write_text(plain_text, encoding="utf-8")
+        html_path.write_text(html_text, encoding="utf-8")
+        rtf_path.write_bytes(rtf_bytes)
+        args = [str(plain_text_path), str(html_path), str(rtf_path)]
+        if pasteboard_name:
+            args.append(pasteboard_name)
+        _run_jxa(WRITE_CLIPBOARD_SCRIPT, args)
+
+
+def main() -> int:
+    _parse_args()
+
+    try:
+        _require_supported_runtime()
+        pasteboard_name = os.environ.get(ENV_PASTEBOARD_NAME)
+        markdown_text = _read_clipboard_markdown(pasteboard_name=pasteboard_name)
+        html_text = _build_html_document(markdown_text)
+        rtf_bytes = _convert_html_to_rtf(html_text)
+        _write_rich_clipboard(
+            plain_text=markdown_text,
+            html_text=html_text,
+            rtf_bytes=rtf_bytes,
+            pasteboard_name=pasteboard_name,
+        )
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print("Converted clipboard Markdown to rich text.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
