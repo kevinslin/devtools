@@ -33,6 +33,10 @@ class GitsyncError(Exception):
     """A configuration or repository safety error."""
 
 
+class PostSyncError(GitsyncError):
+    """A failed post-sync hook that may safely be retried this minute."""
+
+
 @dataclass(frozen=True)
 class RepoConfig:
     name: str
@@ -40,6 +44,7 @@ class RepoConfig:
     repo: str
     sync_schedule: str
     mode: str
+    post_sync: tuple[str, ...] | None
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,7 @@ def _run(
             capture_output=True,
             text=True,
             check=False,
+            shell=False,
         )
     except OSError as exc:
         raise GitsyncError(f"failed to run {args[0]}: {exc}") from exc
@@ -177,14 +183,24 @@ def load_config(path: Path) -> list[RepoConfig]:
     paths: set[Path] = set()
     for index, item in enumerate(raw["repos"]):
         required_fields = {"name", "path", "repo", "sync_schedule"}
-        allowed_fields = required_fields | {"mode"}
+        allowed_fields = required_fields | {"mode", "post_sync"}
         if not isinstance(item, dict) or not required_fields.issubset(item) or not set(item).issubset(allowed_fields):
             raise GitsyncError(
                 f"repos[{index}] must contain name, path, repo, and sync_schedule, "
-                "with optional mode"
+                "with optional mode and post_sync"
             )
-        if any(not isinstance(item[key], str) or not item[key].strip() for key in item):
+        string_fields = required_fields | ({"mode"} if "mode" in item else set())
+        if any(not isinstance(item[key], str) or not item[key].strip() for key in string_fields):
             raise GitsyncError(f"repos[{index}] fields must be non-empty strings")
+        post_sync = item.get("post_sync")
+        if "post_sync" in item and (
+            not isinstance(post_sync, list)
+            or not post_sync
+            or any(not isinstance(argument, str) or not argument.strip() for argument in post_sync)
+        ):
+            raise GitsyncError(
+                f"repos[{index}].post_sync must be a non-empty array of non-empty strings"
+            )
         name = item["name"].strip()
         mode = item.get("mode", PUSH_PULL_MODE).strip()
         if mode not in SYNC_MODES:
@@ -203,7 +219,14 @@ def load_config(path: Path) -> list[RepoConfig]:
         names.add(name)
         paths.add(repo_path)
         repos.append(
-            RepoConfig(name, repo_path, item["repo"], item["sync_schedule"], mode)
+            RepoConfig(
+                name,
+                repo_path,
+                item["repo"],
+                item["sync_schedule"],
+                mode,
+                tuple(post_sync) if post_sync is not None else None,
+            )
         )
     return repos
 
@@ -420,6 +443,30 @@ def _push(config: RepoConfig, upstream: str) -> str:
     return "pushed-after-retry"
 
 
+def _run_post_sync(config: RepoConfig, before: str, after: str) -> None:
+    if config.post_sync is None:
+        return
+
+    with _resolver_environment(config) as guarded_env:
+        env = dict(guarded_env) if guarded_env is not None else os.environ.copy()
+        env.update(
+            {
+                "GITSYNC_REPO_PATH": str(config.path),
+                "GITSYNC_REPO_NAME": config.name,
+                "GITSYNC_OLD_HEAD": before,
+                "GITSYNC_NEW_HEAD": after,
+            }
+        )
+        try:
+            result = _run(config.post_sync, cwd=config.path, env=env)
+        except GitsyncError as exc:
+            raise PostSyncError(f"post-sync hook failed: {exc}") from exc
+    if result.returncode != 0:
+        raise PostSyncError(
+            f"post-sync hook failed (exit {result.returncode}): {_detail(result)}"
+        )
+
+
 def sync_repository(config: RepoConfig) -> dict[str, object]:
     with repository_lock(config):
         cloned = _ensure_repository(config)
@@ -468,6 +515,7 @@ def sync_repository(config: RepoConfig) -> dict[str, object]:
             else "skipped"
         )
         after = _require_git(config.path, "rev-parse", "HEAD", action="failed to read final HEAD")
+        _run_post_sync(config, before, after)
         return {
             "name": config.name,
             "mode": config.mode,
@@ -503,6 +551,25 @@ def _claim_due(repos: list[RepoConfig], when: datetime) -> list[RepoConfig]:
         temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         temporary.replace(state_path)
         return selected
+
+
+def _release_due_claim(config: RepoConfig, when: datetime) -> None:
+    state_dir = _state_dir()
+    state_path = state_dir / "schedule-state.json"
+    lock_path = state_dir / "schedule-state.lock"
+    slot = when.strftime("%Y-%m-%dT%H:%M")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if state.get(config.name) != slot:
+            return
+        del state[config.name]
+        temporary = state_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.replace(state_path)
 
 
 def _launchd_plist(config_path: Path, executable: Path) -> str:
@@ -571,6 +638,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(_launchd_plist(config_path, args.executable.expanduser().resolve(strict=False)), end="")
             return 0
 
+        due_at: datetime | None = None
         if args.all:
             selected = repos
         elif args.name:
@@ -578,13 +646,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not selected:
                 raise GitsyncError(f"unknown repository name: {args.name}")
         else:
-            selected = _claim_due(repos, datetime.now().astimezone())
+            due_at = datetime.now().astimezone()
+            selected = _claim_due(repos, due_at)
 
         results: list[dict[str, object]] = []
         for repo in selected:
             try:
                 results.append(sync_repository(repo))
             except GitsyncError as exc:
+                if due_at is not None and isinstance(exc, PostSyncError):
+                    _release_due_claim(repo, due_at)
                 results.append(
                     {
                         "name": repo.name,

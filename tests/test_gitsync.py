@@ -94,6 +94,28 @@ class GitsyncTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("repos[0].mode must be one of: push/pull, pull", result.stderr)
 
+    def test_validate_accepts_post_sync_argument_array(self) -> None:
+        self.write_config(post_sync=["./scripts/post-sync", "--apply"])
+
+        result = self.cli("validate")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["status"], "valid")
+
+    def test_validate_rejects_invalid_post_sync_hooks(self) -> None:
+        invalid_hooks = [None, "./hook", [], [""], ["   "], ["./hook", 3]]
+        for hook in invalid_hooks:
+            with self.subTest(hook=hook):
+                self.write_config(post_sync=hook)
+
+                result = self.cli("validate")
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(
+                    "repos[0].post_sync must be a non-empty array of non-empty strings",
+                    result.stderr,
+                )
+
     def test_all_pulls_remote_and_pushes_local_commits(self) -> None:
         peer = self.root / "peer"
         git(self.root, "clone", str(self.remote), str(peer))
@@ -123,6 +145,97 @@ class GitsyncTest(unittest.TestCase):
         repo_result = json.loads(result.stdout)["results"][0]
         self.assertEqual(repo_result["mode"], "push/pull")
         self.assertEqual(repo_result["push"], "no-op")
+
+    def test_post_sync_runs_after_no_op_with_literal_arguments(self) -> None:
+        record = self.root / "post-sync-record.json"
+        injected = self.root / "must-not-exist"
+        literal_argument = f"; touch {injected}"
+        hook = (
+            "import json,os,sys; from pathlib import Path; "
+            "Path(sys.argv[1]).write_text(json.dumps({'cwd':os.getcwd(),"
+            "'argv':sys.argv[2:],'repo':os.environ['GITSYNC_REPO_PATH'],"
+            "'name':os.environ['GITSYNC_REPO_NAME'],"
+            "'old':os.environ['GITSYNC_OLD_HEAD'],"
+            "'new':os.environ['GITSYNC_NEW_HEAD']}))"
+        )
+        before = git(self.repo, "rev-parse", "HEAD")
+        self.write_config(post_sync=[sys.executable, "-c", hook, str(record), literal_argument])
+
+        result = self.cli("sync", "--name", "test")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        invocation = json.loads(record.read_text(encoding="utf-8"))
+        self.assertEqual(invocation["cwd"], str(self.repo.resolve()))
+        self.assertEqual(invocation["repo"], str(self.repo.resolve()))
+        self.assertEqual(invocation["name"], "test")
+        self.assertEqual(invocation["old"], before)
+        self.assertEqual(invocation["new"], before)
+        self.assertEqual(invocation["argv"], [literal_argument])
+        self.assertFalse(injected.exists())
+
+    def test_post_sync_receives_heads_after_fast_forward(self) -> None:
+        peer = self.root / "hook-peer"
+        git(self.root, "clone", str(self.remote), str(peer))
+        git(peer, "config", "user.name", "Test User")
+        git(peer, "config", "user.email", "test@example.com")
+        (peer / "remote.txt").write_text("remote\n", encoding="utf-8")
+        git(peer, "add", "remote.txt")
+        git(peer, "commit", "-m", "remote")
+        git(peer, "push")
+        before = git(self.repo, "rev-parse", "HEAD")
+        after = git(self.remote, "rev-parse", "refs/heads/main")
+        record = self.root / "post-sync-heads.json"
+        hook = (
+            "import json,os,sys; from pathlib import Path; "
+            "Path(sys.argv[1]).write_text(json.dumps("
+            "[os.environ['GITSYNC_OLD_HEAD'],os.environ['GITSYNC_NEW_HEAD']]))"
+        )
+        self.write_config(mode="pull", post_sync=[sys.executable, "-c", hook, str(record)])
+
+        result = self.cli("sync", "--all")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(record.read_text(encoding="utf-8")), [before, after])
+        self.assertEqual(json.loads(result.stdout)["results"][0]["push"], "skipped")
+
+    def test_post_sync_failure_blocks_sync_with_error(self) -> None:
+        hook = "import sys; print('chezmoi needs attention',file=sys.stderr); sys.exit(23)"
+        self.write_config(post_sync=[sys.executable, "-c", hook])
+
+        result = self.cli("sync", "--all")
+
+        self.assertEqual(result.returncode, 1)
+        repo_result = json.loads(result.stdout)["results"][0]
+        self.assertEqual(repo_result["status"], "blocked")
+        self.assertIn("post-sync hook failed (exit 23): chezmoi needs attention", repo_result["blocker"])
+
+    def test_missing_post_sync_executable_blocks_sync(self) -> None:
+        self.write_config(post_sync=["./missing-post-sync"])
+
+        result = self.cli("sync", "--all")
+
+        self.assertEqual(result.returncode, 1)
+        repo_result = json.loads(result.stdout)["results"][0]
+        self.assertIn("post-sync hook failed: failed to run ./missing-post-sync", repo_result["blocker"])
+
+    def test_pull_mode_post_sync_hook_rejects_ordinary_git_push(self) -> None:
+        (self.repo / "local.txt").write_text("local\n", encoding="utf-8")
+        git(self.repo, "add", "local.txt")
+        git(self.repo, "commit", "-m", "local")
+        remote_tip = git(self.remote, "rev-parse", "refs/heads/main")
+        hook = (
+            "import subprocess,sys; "
+            "sys.exit(subprocess.run(['git','push','origin','HEAD:refs/heads/main']).returncode)"
+        )
+        self.write_config(mode="pull", post_sync=[sys.executable, "-c", hook])
+
+        result = self.cli("sync", "--all")
+
+        self.assertEqual(result.returncode, 1)
+        repo_result = json.loads(result.stdout)["results"][0]
+        self.assertIn("post-sync hook failed", repo_result["blocker"])
+        self.assertIn("remote mutation disabled in pull mode", repo_result["blocker"])
+        self.assertEqual(git(self.remote, "rev-parse", "refs/heads/main"), remote_tip)
 
     def test_pull_mode_fast_forwards_without_pushing(self) -> None:
         peer = self.root / "pull-peer"
@@ -241,6 +354,22 @@ class GitsyncTest(unittest.TestCase):
         self.assertTrue((missing / ".git").exists())
         self.assertTrue(json.loads(result.stdout)["results"][0]["cloned"])
 
+    def test_post_sync_runs_for_newly_cloned_repository(self) -> None:
+        missing = self.root / "hook-clone"
+        record = self.root / "clone-heads.json"
+        hook = (
+            "import json,os,sys; from pathlib import Path; "
+            "Path(sys.argv[1]).write_text(json.dumps("
+            "[os.environ['GITSYNC_OLD_HEAD'],os.environ['GITSYNC_NEW_HEAD']]))"
+        )
+        self.write_config(path=str(missing), post_sync=[sys.executable, "-c", hook, str(record)])
+
+        result = self.cli("sync", "--all")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        head = git(missing, "rev-parse", "HEAD")
+        self.assertEqual(json.loads(record.read_text(encoding="utf-8")), [head, head])
+
     def test_dirty_detached_missing_upstream_and_remote_mismatch_block(self) -> None:
         (self.repo / "dirty").write_text("x", encoding="utf-8")
         result = self.cli("sync", "--all")
@@ -323,6 +452,55 @@ class GitsyncTest(unittest.TestCase):
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(json.loads(first.stdout)["selected"], 1)
         self.assertEqual(json.loads(second.stdout)["selected"], 0)
+
+    def test_ordinary_sync_blocker_keeps_its_due_claim(self) -> None:
+        now = datetime.now()
+        self.write_config(sync_schedule=f"{now.minute} {now.hour} * * *")
+        (self.repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+
+        first = self.cli("sync", "--due")
+        second = self.cli("sync", "--due")
+
+        self.assertEqual(first.returncode, 1)
+        self.assertIn("dirty worktree", first.stdout)
+        self.assertEqual(json.loads(first.stdout)["selected"], 1)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(json.loads(second.stdout)["selected"], 0)
+        state_path = self.state / "schedule-state.json"
+        self.assertIn("test", json.loads(state_path.read_text(encoding="utf-8")))
+
+    def test_failed_post_sync_releases_only_its_due_claim_for_retry(self) -> None:
+        now = datetime.now()
+        record = self.root / "first-hook-attempt"
+        hook = (
+            "import sys; from pathlib import Path; "
+            "record=Path(sys.argv[1]); failed=not record.exists(); "
+            "record.touch(); "
+            "print('retry requested',file=sys.stderr) if failed else None; "
+            "sys.exit(17 if failed else 0)"
+        )
+        self.write_config(
+            sync_schedule=f"{now.minute} {now.hour} * * *",
+            post_sync=[sys.executable, "-c", hook, str(record)],
+        )
+        self.state.mkdir(parents=True, exist_ok=True)
+        other_slot = now.strftime("%Y-%m-%dT%H:%M")
+        state_path = self.state / "schedule-state.json"
+        state_path.write_text(json.dumps({"other": other_slot}), encoding="utf-8")
+
+        first = self.cli("sync", "--due")
+
+        self.assertEqual(first.returncode, 1)
+        self.assertIn("post-sync hook failed (exit 17): retry requested", first.stdout)
+        self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), {"other": other_slot})
+
+        second = self.cli("sync", "--due")
+        third = self.cli("sync", "--due")
+
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(json.loads(second.stdout)["selected"], 1)
+        self.assertEqual(json.loads(third.stdout)["selected"], 0)
+        self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["other"], other_slot)
 
     def test_launchd_plist_uses_due_mode_and_minute_trigger(self) -> None:
         result = self.cli("launchd-plist")

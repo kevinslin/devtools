@@ -11,19 +11,56 @@ The default configuration is `~/.config/gitsync/agcron.json`:
   "repos": [
     {
       "name": "agents",
-      "path": "/Users/kevinlin/agents",
-      "repo": "git@github.com:example/agents.git",
+      "path": "~/agents",
+      "repo": "https://github.com/openai/kevinlin-agents.git",
       "sync_schedule": "*/10 * * * *",
-      "mode": "pull"
+      "mode": "pull",
+      "post_sync": ["./scripts/chezmoi-post-sync"]
     }
   ]
 }
 ```
 
-Every entry must contain `name`, absolute `path`, `repo`, and `sync_schedule`. The optional `mode` is either `push/pull` or `pull`; when omitted, it defaults to `push/pull` for compatibility. Names and paths must be unique. Schedules are numeric, five-field cron expressions (`minute hour day-of-month month day-of-week`) supporting `*`, lists, ranges, and steps. Sunday is `0` or `7`. As in cron, day-of-month and day-of-week use OR semantics when both are restricted.
+Every entry must contain `name`, `path`, `repo`, and `sync_schedule`. The `path` must be absolute after expanding a leading `~`, so `~/agents` is valid; shell variables such as `$HOME/agents` are not expanded. The optional `mode` is either `push/pull` or `pull`; when omitted, it defaults to `push/pull` for compatibility. The optional `post_sync` must be a non-empty argument array whose entries are non-empty strings. Names and paths must be unique. Schedules are numeric, five-field cron expressions (`minute hour day-of-month month day-of-week`) supporting `*`, lists, ranges, and steps. Sunday is `0` or `7`. As in cron, day-of-month and day-of-week use OR semantics when both are restricted.
 
 - `push/pull` fetches and merges upstream commits, then pushes local commits. Both the `origin` fetch and push URLs must identify the configured `repo`.
 - `pull` fetches and merges upstream commits but never pushes. Only the `origin` fetch URL is validated, and JSON results report `"push": "skipped"`.
+
+## Post-sync hooks
+
+When configured, `post_sync` runs after every successful Git synchronization, including no-op pulls and newly cloned repositories. The command runs directly without a shell, with the synchronized repository as its working directory. Relative executable paths such as `./scripts/post-sync` are therefore resolved from that repository.
+
+Hooks inherit the process environment plus:
+
+- `GITSYNC_REPO_PATH`: absolute, canonical repository path.
+- `GITSYNC_REPO_NAME`: configured repository name.
+- `GITSYNC_OLD_HEAD`: commit before fetching and merging.
+- `GITSYNC_NEW_HEAD`: commit after synchronization.
+
+For a newly cloned repository, `GITSYNC_OLD_HEAD` is the clone's initial checked-out commit; it normally equals `GITSYNC_NEW_HEAD`. In `pull` mode, hooks inherit the same Git push/send-pack guard used for conflict resolution. This prevents ordinary or accidental Git pushes, but is not a security boundary: hooks execute trusted code and a deliberately malicious hook can bypass the guard. Configure only hooks you trust. A failing or missing hook blocks the repository sync, reports its error, and releases that repository's scheduled claim so the same clock-minute run can retry; ordinary repository safety blockers retain their existing once-per-minute claim.
+
+### Example: reconcile `kevinlin-agents` with chezmoi
+
+The configuration above runs `~/agents/scripts/chezmoi-post-sync` after each successful pull of `kevinlin-agents`. The hook explicitly selects `~/agents` as its standalone chezmoi source; `.chezmoiroot` resolves the managed source directory to `~/agents/config`, and `config/.chezmoiignore` keeps repository-local `AGENTS.md` and `README.md` documentation out of the home directory.
+
+For each managed file, the hook compares three versions: the rendered source at `GITSYNC_OLD_HEAD`, the rendered source at `GITSYNC_NEW_HEAD`, and the current machine-local destination.
+
+- Incoming-only changes are applied through chezmoi, preserving private-file permissions.
+- Machine-local-only changes are retained.
+- Independent local and incoming changes are backed up, then reconciled with a three-way merge.
+- Overlapping edits, binary conflicts, unsupported symlinks, and existing files without a safe baseline stop without overwriting local data. Blocking destination symlinks are backed up without following them; directories are never copied recursively.
+- Unresolved conflicts invoke the installed `slack-notify` helper with the hostname, affected targets, and backup location. Notifications are deduplicated across retries, and pending merge baselines survive subsequent upstream updates.
+
+Backups and conflict state live under `~/.local/state/kevinlin-agents/chezmoi-post-sync/`; backup directories are private. Scheduled hooks also resolve Homebrew's `chezmoi` and `slack-post` when launchd supplies only a minimal `PATH`.
+
+After changing the repository-managed gitsync configuration, activate only that target:
+
+```bash
+chezmoi --source "$HOME/agents" apply "$HOME/.config/gitsync/agcron.json"
+gitsync --config "$HOME/.config/gitsync/agcron.json" validate
+```
+
+Do not use a bare or repository-wide `chezmoi apply` to activate the hook: unrelated machine-local configuration may differ. The repository must also be clean before scheduled synchronization can run.
 
 ## Commands
 
@@ -66,4 +103,5 @@ The generated plist uses the resolved CLI and config paths. Logs go to `~/Librar
 - A push rejected because the remote advanced gets one fetch/merge/push retry. A second rejection is an exact blocker. Nothing is force-pushed.
 - Authentication failures are reported as blockers without changing credentials.
 - Locks are keyed by canonical repository path, so differently named config entries cannot run concurrently against the same worktree.
+- Configured post-sync hooks execute while the repository lock remains held; shell metacharacters in arguments are passed literally.
 - If a merge conflicts, `codex exec` runs from that repository with a prompt limited to the current sync conflict. The sync resumes only after Codex completes the merge and leaves no unmerged paths or dirty worktree; otherwise the precise conflict state is preserved and reported as a blocker. In `pull` mode, Codex uses its workspace-write sandbox, the prompt forbids remote mutation, and the resolver environment blocks Git push/send-pack operations with a failing pre-push hook; a completed merge remains local.
