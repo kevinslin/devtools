@@ -66,7 +66,7 @@ syncs and newly cloned repositories.
       "repo": "https://github.com/openai/kevinlin-agents.git",
       "sync_schedule": "*/10 * * * *",
       "mode": "pull",
-      "post_sync": ["./scripts/chezmoi-post-sync"]
+      "post_sync": ["/Users/kevinlin/.config/gitsync/scripts/chezmoi-post-sync"]
     }
   ]
 }
@@ -132,8 +132,9 @@ Hooks run with the repository as their current working directory and receive:
 
 A freshly cloned repository uses its initial checked-out commit as
 `GITSYNC_OLD_HEAD`; old and new heads are normally equal. Hook arguments are
-passed directly to `subprocess.run` with `shell=False`, so shell metacharacters
-are literal.
+passed directly to `subprocess.run` with `shell=False`, so shell metacharacters,
+leading `~`, and environment variables are literal. Hooks outside the
+repository require an absolute executable path.
 
 In pull-only mode, hooks inherit the existing Git wrapper and failing pre-push
 hook. These prevent ordinary accidental Git pushes but are not a security
@@ -147,8 +148,11 @@ their existing claim. Other repositories' scheduled claims are unchanged.
 
 ### Agents repository reconciliation
 
-`kevinlin-agents` configures `./scripts/chezmoi-post-sync`. That repository owns
-the hook; `gitsync` only supplies the generic execution contract.
+`kevinlin-agents` configures its chezmoi-managed
+`~/.config/gitsync/scripts/chezmoi-post-sync` executable. Its `agcron.json`
+template renders the hook's absolute path for the current home directory.
+That repository owns the hook; `gitsync` only supplies the generic execution
+contract.
 
 The hook renders the previous and current standalone chezmoi sources, compares
 them with each local destination, and applies incoming-only changes without

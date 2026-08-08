@@ -15,7 +15,7 @@ The default configuration is `~/.config/gitsync/agcron.json`:
       "repo": "https://github.com/openai/kevinlin-agents.git",
       "sync_schedule": "*/10 * * * *",
       "mode": "pull",
-      "post_sync": ["./scripts/chezmoi-post-sync"]
+      "post_sync": ["/Users/kevinlin/.config/gitsync/scripts/chezmoi-post-sync"]
     }
   ]
 }
@@ -28,7 +28,7 @@ Every entry must contain `name`, `path`, `repo`, and `sync_schedule`. The `path`
 
 ## Post-sync hooks
 
-When configured, `post_sync` runs after every successful Git synchronization, including no-op pulls and newly cloned repositories. The command runs directly without a shell, with the synchronized repository as its working directory. Relative executable paths such as `./scripts/post-sync` are therefore resolved from that repository.
+When configured, `post_sync` runs after every successful Git synchronization, including no-op pulls and newly cloned repositories. The command runs directly without a shell, with the synchronized repository as its working directory. Relative executable paths such as `./scripts/post-sync` are therefore resolved from that repository. Hook arguments do not expand `~` or shell variables; use an absolute path for hooks installed outside the repository.
 
 Hooks inherit the process environment plus:
 
@@ -41,7 +41,7 @@ For a newly cloned repository, `GITSYNC_OLD_HEAD` is the clone's initial checked
 
 ### Example: reconcile `kevinlin-agents` with chezmoi
 
-The configuration above runs `~/agents/scripts/chezmoi-post-sync` after each successful pull of `kevinlin-agents`. The hook explicitly selects `~/agents` as its standalone chezmoi source; `.chezmoiroot` resolves the managed source directory to `~/agents/config`, and `config/.chezmoiignore` keeps repository-local `AGENTS.md` and `README.md` documentation out of the home directory.
+The configuration above runs the chezmoi-managed `~/.config/gitsync/scripts/chezmoi-post-sync` executable after each successful pull of `kevinlin-agents`. The agents repository's `agcron.json` template renders the correct absolute home-directory path for each machine. The hook explicitly selects `~/agents` as its standalone chezmoi source; `.chezmoiroot` resolves the managed source directory to `~/agents/config`, and `config/.chezmoiignore` keeps repository-local `AGENTS.md` and `README.md` documentation out of the home directory.
 
 For each managed file, the hook compares three versions: the rendered source at `GITSYNC_OLD_HEAD`, the rendered source at `GITSYNC_NEW_HEAD`, and the current machine-local destination.
 
@@ -53,9 +53,11 @@ For each managed file, the hook compares three versions: the rendered source at 
 
 Backups and conflict state live under `~/.local/state/kevinlin-agents/chezmoi-post-sync/`; backup directories are private. Scheduled hooks also resolve Homebrew's `chezmoi` and `slack-post` when launchd supplies only a minimal `PATH`.
 
-After changing the repository-managed gitsync configuration, activate only that target:
+After changing the repository-managed hook or gitsync configuration, install the executable before activating the configuration that references it:
 
 ```bash
+chezmoi --source "$HOME/agents" apply --parent-dirs \
+  "$HOME/.config/gitsync/scripts/chezmoi-post-sync"
 chezmoi --source "$HOME/agents" apply "$HOME/.config/gitsync/agcron.json"
 gitsync --config "$HOME/.config/gitsync/agcron.json" validate
 ```
