@@ -34,6 +34,7 @@ A bunch of useful tools. Designed by human. Made by codex.
 
 ## Local apps and extensions
 
+- 🪴 `sprout`: [comodoro](apps/comodoro/README.md); app path `apps/comodoro`; native macOS menu-bar Pomodoro timer with phase-colored progress, configurable cycles, and focus history
 - 🌱 `seed`: [ctrl-tab-chrome](apps/ctrl-tab-chrome/README.md); app path `apps/ctrl-tab-chrome`; local Chrome extension that makes `Ctrl+Tab` switch to the last used tab on normal web pages
 
 ## Projects in planning
