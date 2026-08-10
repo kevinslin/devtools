@@ -61,6 +61,13 @@ class InstallScriptTest(unittest.TestCase):
         )
         self.assertIn("Installed 2 commands", second.stdout)
 
+    def test_installs_successfully_without_executable_commands(self) -> None:
+        result = self.run_installer()
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertTrue((self.home / ".local" / "bin").is_dir())
+        self.assertIn("Installed 0 commands", result.stdout)
+
     def test_refuses_to_replace_an_existing_regular_file(self) -> None:
         self.add_executable("tools", "example", "example")
         destination = self.home / ".local" / "bin" / "example"
