@@ -76,6 +76,8 @@ Do not use a bare or repository-wide `chezmoi apply` to activate the hook: unrel
 ```bash
 gitsync validate
 gitsync status
+gitsync status --filter dirty=true
+gitsync status --filter dirty=false
 gitsync sync --due
 gitsync sync --all
 gitsync sync --force
@@ -128,6 +130,15 @@ creating a missing checkout, or writing state:
   ]
 }
 ```
+
+Use `gitsync status --filter dirty=true` to list only repositories with staged,
+modified, or untracked changes, or `gitsync status --filter dirty=false` to list
+only clean repositories. Both filters preserve configured repository ordering;
+missing or invalid repositories have unknown dirtiness and match neither.
+Unfiltered `gitsync status` continues to include every configured repository.
+Filters must have the form `KEY=VALUE`; currently `dirty` is the only supported
+key and its value must be exactly `true` or `false`. Invalid filters print an
+actionable error and exit with status `2`.
 
 `last_fetched` is the timestamp of the most recent successful fetch, even when
 a later merge, push, or post-sync hook fails. Existing repositories that have

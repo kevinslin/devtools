@@ -759,12 +759,39 @@ def _launchd_plist(config_path: Path, executable: Path) -> str:
 '''
 
 
+def _status_filter(expression: str) -> bool:
+    if expression.count("=") != 1:
+        raise argparse.ArgumentTypeError(
+            "filter must use KEY=VALUE; for example, --filter dirty=true"
+        )
+    key, value = expression.split("=", 1)
+    if not key or not value:
+        raise argparse.ArgumentTypeError(
+            "filter must include a key and value; for example, --filter dirty=true"
+        )
+    if key != "dirty":
+        raise argparse.ArgumentTypeError(f"unknown filter key {key!r}; supported key: dirty")
+    if value not in {"true", "false"}:
+        raise argparse.ArgumentTypeError(
+            f"invalid value {value!r} for filter {key!r}; use true or false"
+        )
+    return value == "true"
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("validate", help="validate configuration")
-    subparsers.add_parser("status", help="show configured repositories, fetch times, and worktree state")
+    status = subparsers.add_parser(
+        "status", help="show configured repositories, fetch times, and worktree state"
+    )
+    status.add_argument(
+        "--filter",
+        type=_status_filter,
+        metavar="KEY=VALUE",
+        help="filter repositories by worktree state: dirty=true or dirty=false",
+    )
     sync = subparsers.add_parser("sync", help="synchronize repositories")
     selection = sync.add_mutually_exclusive_group(required=True)
     selection.add_argument("--due", action="store_true", help="sync repositories due now")
@@ -790,9 +817,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps({"status": "valid", "config": str(config_path), "repos": len(repos)}))
             return 0
         if args.command == "status":
+            statuses = [repository_status(repo) for repo in repos]
+            if args.filter is not None:
+                statuses = [entry for entry in statuses if entry["dirty"] is args.filter]
             print(
                 json.dumps(
-                    {"status": "ok", "repos": [repository_status(repo) for repo in repos]},
+                    {"status": "ok", "repos": statuses},
                     indent=2,
                     sort_keys=True,
                 )

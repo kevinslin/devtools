@@ -124,6 +124,13 @@ class GitsyncTest(unittest.TestCase):
         dirty_repo = self.root / "dirty-repo"
         git(self.root, "clone", str(self.remote), str(dirty_repo))
         (dirty_repo / "untracked.txt").write_text("local change\n", encoding="utf-8")
+        modified_repo = self.root / "modified-repo"
+        git(self.root, "clone", str(self.remote), str(modified_repo))
+        (modified_repo / "README.md").write_text("modified change\n", encoding="utf-8")
+        staged_repo = self.root / "staged-repo"
+        git(self.root, "clone", str(self.remote), str(staged_repo))
+        (staged_repo / "README.md").write_text("staged change\n", encoding="utf-8")
+        git(staged_repo, "add", "README.md")
         missing_repo = self.root / "missing-repo"
         configured = json.loads(self.config.read_text(encoding="utf-8"))["repos"]
         configured.extend(
@@ -134,6 +141,18 @@ class GitsyncTest(unittest.TestCase):
                     "repo": str(self.remote),
                     "sync_schedule": "*/10 * * * *",
                     "mode": "pull",
+                },
+                {
+                    "name": "modified",
+                    "path": str(modified_repo),
+                    "repo": str(self.remote),
+                    "sync_schedule": "*/10 * * * *",
+                },
+                {
+                    "name": "staged",
+                    "path": str(staged_repo),
+                    "repo": str(self.remote),
+                    "sync_schedule": "*/10 * * * *",
                 },
                 {
                     "name": "missing",
@@ -150,15 +169,59 @@ class GitsyncTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["status"], "ok")
+        self.assertEqual(
+            [entry["name"] for entry in payload["repos"]],
+            ["test", "dirty", "modified", "staged", "missing"],
+        )
         entries = {entry["name"]: entry for entry in payload["repos"]}
-        self.assertEqual(set(entries), {"test", "dirty", "missing"})
         self.assertFalse(entries["test"]["dirty"])
         self.assertTrue(entries["dirty"]["dirty"])
+        self.assertTrue(entries["modified"]["dirty"])
+        self.assertTrue(entries["staged"]["dirty"])
         self.assertEqual(entries["dirty"]["mode"], "pull")
         self.assertEqual(entries["missing"]["status"], "missing")
         self.assertIsNone(entries["missing"]["dirty"])
+
+        dirty = self.cli("status", "--filter", "dirty=true")
+
+        self.assertEqual(dirty.returncode, 0, dirty.stderr)
+        dirty_payload = json.loads(dirty.stdout)
+        self.assertEqual(dirty_payload["status"], "ok")
+        self.assertEqual(
+            [entry["name"] for entry in dirty_payload["repos"]],
+            ["dirty", "modified", "staged"],
+        )
+
+        clean = self.cli("status", "--filter", "dirty=false")
+
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        clean_payload = json.loads(clean.stdout)
+        self.assertEqual(clean_payload["status"], "ok")
+        self.assertEqual([entry["name"] for entry in clean_payload["repos"]], ["test"])
         self.assertFalse(missing_repo.exists())
         self.assertFalse(self.state.exists())
+        self.assertFalse(self.logs.exists())
+
+    def test_status_rejects_invalid_filter_expressions(self) -> None:
+        invalid_filters = (
+            ("dirty", "filter must use KEY=VALUE"),
+            ("dirty=true=extra", "filter must use KEY=VALUE"),
+            ("=true", "filter must include a key and value"),
+            ("dirty=", "filter must include a key and value"),
+            ("clean=true", "unknown filter key 'clean'; supported key: dirty"),
+            ("dirty=yes", "invalid value 'yes' for filter 'dirty'; use true or false"),
+            ("dirty=TRUE", "invalid value 'TRUE' for filter 'dirty'; use true or false"),
+        )
+        for expression, error in invalid_filters:
+            with self.subTest(expression=expression):
+                result = self.cli("status", "--filter", expression)
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(error, result.stderr)
+
+        self.assertFalse(self.state.exists())
+        self.assertFalse(self.logs.exists())
 
     def test_status_reports_successful_fetch_from_persistent_state(self) -> None:
         before = self.cli("status")
