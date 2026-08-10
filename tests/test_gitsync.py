@@ -250,24 +250,21 @@ class GitsyncTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["status"], "valid")
 
-    def test_validate_accepts_multiple_post_sync_hook_argument_arrays(self) -> None:
+    def test_validate_accepts_multiple_post_sync_command_argument_arrays(self) -> None:
         configurations = (
-            {"post_sync_hooks": [["./scripts/first"], ["./scripts/second", "--apply"]]},
-            {
-                "post_sync": ["./scripts/legacy", "--legacy"],
-                "post_sync_hooks": [["./scripts/first"], ["./scripts/second", "--apply"]],
-            },
+            [["./scripts/first"], ["./scripts/second", "--apply"]],
+            [["./scripts/only", "--apply"]],
         )
         for configuration in configurations:
             with self.subTest(configuration=configuration):
-                self.write_config(**configuration)
+                self.write_config(post_sync=configuration)
 
                 result = self.cli("validate")
 
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout)["status"], "valid")
 
-    def test_validate_rejects_invalid_post_sync_hooks(self) -> None:
+    def test_validate_rejects_invalid_post_sync_argument_arrays(self) -> None:
         invalid_hooks = [None, "./hook", [], [""], ["   "], ["./hook", 3]]
         for hook in invalid_hooks:
             with self.subTest(hook=hook):
@@ -281,27 +278,25 @@ class GitsyncTest(unittest.TestCase):
                     result.stderr,
                 )
 
-    def test_validate_rejects_invalid_multiple_post_sync_hooks(self) -> None:
+    def test_validate_rejects_invalid_multiple_post_sync_commands(self) -> None:
         invalid_hooks = (
-            None,
-            "./hook",
-            [],
-            ["./hook"],
             [[]],
             [[""]],
             [["   "]],
             [["./hook", 3]],
             [["./hook"], "./other"],
+            [["./hook"], []],
         )
         for hooks in invalid_hooks:
             with self.subTest(hooks=hooks):
-                self.write_config(post_sync_hooks=hooks)
+                self.write_config(post_sync=hooks)
 
                 result = self.cli("validate")
 
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(
-                    "repos[0].post_sync_hooks must be a non-empty array of non-empty argument arrays",
+                    "repos[0].post_sync must be a non-empty array of non-empty strings "
+                    "or non-empty argument arrays",
                     result.stderr,
                 )
 
@@ -376,7 +371,7 @@ class GitsyncTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(json.loads(record.read_text(encoding="utf-8")), ["~/literal-argument"])
 
-    def test_multiple_post_sync_hooks_run_in_order_with_legacy_first(self) -> None:
+    def test_multiple_post_sync_commands_run_in_order_with_literal_arguments(self) -> None:
         record = self.root / "post-sync-order.jsonl"
         executable = self.root / "ordered-post-sync-hook"
         executable.write_text(
@@ -392,8 +387,8 @@ class GitsyncTest(unittest.TestCase):
         )
         executable.chmod(0o755)
         self.write_config(
-            post_sync=[str(executable), str(record), "legacy", "~/legacy-argument"],
-            post_sync_hooks=[
+            post_sync=[
+                [str(executable), str(record), "legacy", "~/legacy-argument"],
                 ["~/ordered-post-sync-hook", str(record), "first", "~/first-argument"],
                 ["~/ordered-post-sync-hook", str(record), "second", "~/second-argument"],
             ],
@@ -461,8 +456,8 @@ class GitsyncTest(unittest.TestCase):
         failure = "import sys; print('second hook rejected',file=sys.stderr); sys.exit(29)"
         later = "from pathlib import Path; import sys; Path(sys.argv[1]).touch()"
         self.write_config(
-            post_sync=[sys.executable, "-c", "pass"],
-            post_sync_hooks=[
+            post_sync=[
+                [sys.executable, "-c", "pass"],
                 [sys.executable, "-c", failure],
                 [sys.executable, "-c", later, str(record)],
             ],
@@ -505,8 +500,10 @@ class GitsyncTest(unittest.TestCase):
         )
         self.write_config(
             mode="pull",
-            post_sync=[sys.executable, "-c", "pass"],
-            post_sync_hooks=[[sys.executable, "-c", hook]],
+            post_sync=[
+                [sys.executable, "-c", "pass"],
+                [sys.executable, "-c", hook],
+            ],
         )
 
         result = self.cli("sync", "--all")
@@ -794,8 +791,10 @@ class GitsyncTest(unittest.TestCase):
         )
         self.write_config(
             sync_schedule=f"{now.minute} {now.hour} * * *",
-            post_sync=[sys.executable, "-c", first, str(first_record)],
-            post_sync_hooks=[[sys.executable, "-c", additional, str(failure_record)]],
+            post_sync=[
+                [sys.executable, "-c", first, str(first_record)],
+                [sys.executable, "-c", additional, str(failure_record)],
+            ],
         )
 
         first_attempt = self.cli("sync", "--due")

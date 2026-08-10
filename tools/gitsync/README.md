@@ -15,8 +15,8 @@ The default configuration is `~/.config/gitsync/agcron.json`:
       "repo": "https://github.com/openai/kevinlin-agents.git",
       "sync_schedule": "*/10 * * * *",
       "mode": "pull",
-      "post_sync": ["~/code/devtools/tools/gitsync/scripts/chezmoi-post-sync"],
-      "post_sync_hooks": [
+      "post_sync": [
+        ["~/code/devtools/tools/gitsync/scripts/chezmoi-post-sync"],
         ["./scripts/refresh-index", "--incremental"],
         ["./scripts/report-sync"]
       ]
@@ -25,14 +25,14 @@ The default configuration is `~/.config/gitsync/agcron.json`:
 }
 ```
 
-Every entry must contain `name`, `path`, `repo`, and `sync_schedule`. The `path` must be absolute after expanding a leading `~`, so `~/agents` is valid; shell variables such as `$HOME/agents` are not expanded. The optional `mode` is either `push/pull` or `pull`; when omitted, it defaults to `push/pull` for compatibility. The optional `post_sync` must be a non-empty argument array whose entries are non-empty strings. The optional `post_sync_hooks` must be a non-empty ordered array of hooks, where each hook is itself a non-empty argument array of non-empty strings. Existing configurations using only `post_sync` remain valid and unchanged. Names and paths must be unique. Schedules are numeric, five-field cron expressions (`minute hour day-of-month month day-of-week`) supporting `*`, lists, ranges, and steps. Sunday is `0` or `7`. As in cron, day-of-month and day-of-week use OR semantics when both are restricted.
+Every entry must contain `name`, `path`, `repo`, and `sync_schedule`. The `path` must be absolute after expanding a leading `~`, so `~/agents` is valid; shell variables such as `$HOME/agents` are not expanded. The optional `mode` is either `push/pull` or `pull`; when omitted, it defaults to `push/pull` for compatibility. The optional `post_sync` accepts either one non-empty argument array, such as `["script", "--arg"]`, or a non-empty ordered array of argument arrays, such as `[["first"], ["second", "--arg"]]`. Every argument array must be non-empty and contain only non-empty strings; mixed single-command and multi-command shapes are invalid. Existing single-command configurations remain valid and unchanged. Names and paths must be unique. Schedules are numeric, five-field cron expressions (`minute hour day-of-month month day-of-week`) supporting `*`, lists, ranges, and steps. Sunday is `0` or `7`. As in cron, day-of-month and day-of-week use OR semantics when both are restricted.
 
 - `push/pull` fetches and merges upstream commits, then pushes local commits. Both the `origin` fetch and push URLs must identify the configured `repo`.
 - `pull` fetches and merges upstream commits but never pushes. Only the `origin` fetch URL is validated, and JSON results report `"push": "skipped"`.
 
 ## Post-sync hooks
 
-When configured, `post_sync` and `post_sync_hooks` run after every successful Git synchronization, including no-op pulls and newly cloned repositories. If both fields are present, the existing `post_sync` hook runs first, followed by each `post_sync_hooks` entry in its configured order. If either field is absent, the configured hooks from the other field still run normally.
+When configured, `post_sync` runs after every successful Git synchronization, including no-op pulls and newly cloned repositories. A single argument array runs one command; an array of argument arrays runs every command in its configured order.
 
 Each command runs directly without a shell, with the synchronized repository as its working directory. A leading `~` is expanded only in each hook's executable path (`argv[0]`); relative executable paths such as `./scripts/post-sync` are resolved from that repository. Hook arguments and shell variables remain literal.
 

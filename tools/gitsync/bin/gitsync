@@ -46,8 +46,7 @@ class RepoConfig:
     repo: str
     sync_schedule: str
     mode: str
-    post_sync: tuple[str, ...] | None
-    post_sync_hooks: tuple[tuple[str, ...], ...]
+    post_sync: tuple[tuple[str, ...], ...]
 
 
 @dataclass(frozen=True)
@@ -323,39 +322,36 @@ def load_config(path: Path) -> list[RepoConfig]:
     paths: set[Path] = set()
     for index, item in enumerate(raw["repos"]):
         required_fields = {"name", "path", "repo", "sync_schedule"}
-        allowed_fields = required_fields | {"mode", "post_sync", "post_sync_hooks"}
+        allowed_fields = required_fields | {"mode", "post_sync"}
         if not isinstance(item, dict) or not required_fields.issubset(item) or not set(item).issubset(allowed_fields):
             raise GitsyncError(
                 f"repos[{index}] must contain name, path, repo, and sync_schedule, "
-                "with optional mode, post_sync, and post_sync_hooks"
+                "with optional mode and post_sync"
             )
         string_fields = required_fields | ({"mode"} if "mode" in item else set())
         if any(not isinstance(item[key], str) or not item[key].strip() for key in string_fields):
             raise GitsyncError(f"repos[{index}] fields must be non-empty strings")
         post_sync = item.get("post_sync")
-        if "post_sync" in item and (
-            not isinstance(post_sync, list)
-            or not post_sync
-            or any(not isinstance(argument, str) or not argument.strip() for argument in post_sync)
-        ):
-            raise GitsyncError(
-                f"repos[{index}].post_sync must be a non-empty array of non-empty strings"
-            )
-        post_sync_hooks = item.get("post_sync_hooks")
-        if "post_sync_hooks" in item and (
-            not isinstance(post_sync_hooks, list)
-            or not post_sync_hooks
-            or any(
-                not isinstance(command, list)
-                or not command
-                or any(not isinstance(argument, str) or not argument.strip() for argument in command)
-                for command in post_sync_hooks
-            )
-        ):
-            raise GitsyncError(
-                f"repos[{index}].post_sync_hooks must be a non-empty array "
-                "of non-empty argument arrays"
-            )
+        post_sync_commands: tuple[tuple[str, ...], ...] = ()
+        if "post_sync" in item:
+            if isinstance(post_sync, list) and post_sync:
+                if all(isinstance(argument, str) for argument in post_sync):
+                    candidates = [post_sync]
+                elif all(isinstance(command, list) for command in post_sync):
+                    candidates = post_sync
+                else:
+                    candidates = []
+                if candidates and all(
+                    command
+                    and all(isinstance(argument, str) and argument.strip() for argument in command)
+                    for command in candidates
+                ):
+                    post_sync_commands = tuple(tuple(command) for command in candidates)
+            if not post_sync_commands:
+                raise GitsyncError(
+                    f"repos[{index}].post_sync must be a non-empty array of non-empty strings "
+                    "or non-empty argument arrays"
+                )
         name = item["name"].strip()
         mode = item.get("mode", PUSH_PULL_MODE).strip()
         if mode not in SYNC_MODES:
@@ -380,10 +376,7 @@ def load_config(path: Path) -> list[RepoConfig]:
                 item["repo"],
                 item["sync_schedule"],
                 mode,
-                tuple(post_sync) if post_sync is not None else None,
-                tuple(tuple(command) for command in post_sync_hooks)
-                if post_sync_hooks is not None
-                else (),
+                post_sync_commands,
             )
         )
     return repos
@@ -603,11 +596,7 @@ def _push(config: RepoConfig, upstream: str) -> str:
 
 
 def _run_post_sync(config: RepoConfig, before: str, after: str) -> None:
-    commands = (
-        (() if config.post_sync is None else (config.post_sync,))
-        + config.post_sync_hooks
-    )
-    if not commands:
+    if not config.post_sync:
         return
 
     with _resolver_environment(config) as guarded_env:
@@ -620,7 +609,7 @@ def _run_post_sync(config: RepoConfig, before: str, after: str) -> None:
                 "GITSYNC_NEW_HEAD": after,
             }
         )
-        for hook in commands:
+        for hook in config.post_sync:
             try:
                 command = (os.path.expanduser(hook[0]), *hook[1:])
                 result = _run(command, cwd=config.path, env=env)

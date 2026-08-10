@@ -20,19 +20,20 @@ When `mode` is omitted, it defaults to `push/pull` for compatibility with
 existing configuration. Mode is owned by `~/.config/gitsync/agcron.json`; CLI
 selectors do not override it.
 
-Support the existing optional per-repository `post_sync` argument array and an
-optional `post_sync_hooks` array of ordered argument arrays. Run the legacy
-`post_sync` hook first when both fields are configured, followed by the
-additional hooks in order. Execute every hook directly, without a shell, after
-every successful Git synchronization, including no-op syncs and newly cloned
-repositories.
+Extend the existing optional per-repository `post_sync` field to accept either
+one argument array or an ordered, non-empty array of argument arrays. Preserve
+existing single-hook configurations unchanged, and run multi-hook
+configurations in their configured order. Execute every hook directly, without
+a shell, after every successful Git synchronization, including no-op syncs and
+newly cloned repositories.
 
 ## Scope
 
 **Changes**
 
-- Extend each repository configuration with optional `mode`, `post_sync`, and
-  `post_sync_hooks` fields without changing existing single-hook behavior.
+- Extend each repository configuration with optional `mode` and `post_sync`
+  fields; support ordered hook lists without changing existing single-hook
+  behavior.
 - Make remote validation and the final push step mode-aware.
 - Report the selected mode and an explicit skipped-push result in JSON output.
 - Execute trusted post-sync hooks in order inside the repository lock with
@@ -77,8 +78,8 @@ repositories.
       "repo": "https://github.com/openai/kevinlin-agents.git",
       "sync_schedule": "*/10 * * * *",
       "mode": "pull",
-      "post_sync": ["~/code/devtools/tools/gitsync/scripts/chezmoi-post-sync"],
-      "post_sync_hooks": [
+      "post_sync": [
+        ["~/code/devtools/tools/gitsync/scripts/chezmoi-post-sync"],
         ["./scripts/refresh-index", "--incremental"],
         ["./scripts/report-sync"]
       ]
@@ -91,12 +92,14 @@ repositories.
 and exits with code `2`. An omitted field is interpreted as `push/pull`.
 
 `path` must resolve to an absolute path after expanding a leading `~`.
-`post_sync`, when present, must be a non-empty array of non-empty string
-arguments. `post_sync_hooks`, when present, must be a non-empty array of hooks;
-each hook must itself be a non-empty array of non-empty string arguments. Both
-fields are optional and independent: existing `post_sync`-only configuration
-remains valid, and `post_sync_hooks` does not require `post_sync`. Invalid
-hooks fail configuration validation with exit code `2` before any Git operation.
+`post_sync`, when present, accepts either one non-empty array of non-empty
+string arguments, such as `["script", "--arg"]`, or a non-empty ordered array
+of argument arrays, such as `[["first"], ["second", "--arg"]]`. Every nested
+argument array must be non-empty and contain only non-empty strings. Mixed
+single-command and multi-command shapes are invalid. Existing single-hook
+configurations remain valid unchanged, and omitting `post_sync` remains valid.
+Invalid hooks fail configuration validation with exit code `2` before any Git
+operation.
 
 | Mode | Fetch and merge | Push | Remote identities checked |
 | --- | --- | --- | --- |
@@ -124,9 +127,8 @@ For each selected repository, [bin/gitsync](../bin/gitsync) must:
 8. Verify that Codex completed the merge, left no unmerged paths, and left a
    clean worktree.
 9. Push only in `push/pull` mode.
-10. Execute the optional `post_sync` hook, then each optional
-    `post_sync_hooks` entry in configured order, while the repository lock
-    remains held. Stop at the first nonzero exit or missing executable and
+10. Execute each configured `post_sync` command in order while the repository
+    lock remains held. Stop at the first nonzero exit or missing executable and
     treat it as a blocked sync.
 
 The dirty-worktree blocker applies to both modes. In particular, `pull` mode
@@ -250,9 +252,10 @@ provides an explicit isolated-test override.
 ## Implementation
 
 1. Extend `RepoConfig` and `load_config` in
-   [bin/gitsync](../bin/gitsync) to accept optional `mode`, `post_sync`, and
-   `post_sync_hooks`, default the mode to `push/pull`, and reject unsupported
-   values, invalid hook argument arrays, or invalid hook lists.
+   [bin/gitsync](../bin/gitsync) to accept optional `mode` and `post_sync`,
+   default the mode to `push/pull`, normalize either supported hook shape into
+   an ordered command sequence, and reject unsupported values, invalid argument
+   arrays, or invalid hook lists.
 2. Split repository validation into shared fetch validation and
    `push/pull`-only push-URL validation.
 3. Keep the shared fetch, comparison, merge, and Codex conflict path, but make
@@ -261,10 +264,9 @@ provides an explicit isolated-test override.
    `_push` and emit `push: "skipped"` for `pull`.
 4. Add `mode` to success and blocked result objects so every selected entry is
    attributable to its configured behavior.
-5. Execute the optional legacy hook followed by each configured additional
-   hook after Git synchronization, passing the repository identity and old/new
-   heads to each while retaining the repository lock and pull-mode guard.
-   Stop at the first failure.
+5. Execute each configured hook in order after Git synchronization, passing
+   the repository identity and old/new heads to each while retaining the
+   repository lock and pull-mode guard. Stop at the first failure.
 6. Release the current-minute due claim only for the repository whose hook
    failed; preserve existing claim behavior for every ordinary repository
    blocker.
@@ -285,8 +287,8 @@ provides an explicit isolated-test override.
 | Pull-only conflicts use the guarded resolver | Create conflicting committed changes, make the fake Codex resolver attempt a push, verify the push is rejected, the local merge is clean, and the remote tip is unchanged. |
 | Unsafe conflict resolution remains blocked | Use a failing fake Codex executable and assert the exact conflict blocker and preserved merge state. |
 | Push URL validation is mode-aware | Configure a different push URL: `pull` succeeds when fetch identity matches; `push/pull` blocks. |
-| Hook configuration fails closed | Reject null, empty, non-array, or non-string `post_sync` values; reject null, empty, non-array, empty-hook, or invalid-argument `post_sync_hooks` values before mutating Git. Omitted hook fields remain valid. |
-| Legacy hook compatibility and ordering are preserved | Verify existing `post_sync`-only configurations still run unchanged; list-only configurations run in order; when both fields are present, the legacy hook runs first, followed by every list entry in order. |
+| Hook configuration fails closed | Reject null, empty, non-array, mixed-shape, empty-hook, or invalid-argument `post_sync` values before mutating Git. Omitting the field remains valid. |
+| Single-hook compatibility and ordered execution are preserved | Verify existing flat `post_sync` argument arrays still run unchanged, while nested argument arrays run every configured command in order. |
 | Hooks receive the correct context | Run no-op, fast-forward, and newly cloned syncs; assert working directory, literal argv, repository identity, and old/new heads. |
 | Pull-only hooks reject ordinary pushes | Execute an ordinary `git push` from a trusted test hook and verify the wrapper blocks it without changing the remote. |
 | Hook failures stop execution and retry without broadening retries | Fail an intermediate hook, verify later hooks do not run and only its due claim is released, then verify a retry starts the sequence from its first hook; an ordinary dirty-worktree blocker keeps its claim. |
@@ -307,8 +309,8 @@ provides an explicit isolated-test override.
   because it cannot exercise push capability.
 - Post-sync hooks are trusted executable argument arrays, not shell strings or
   a sandbox for untrusted code.
-- The existing `post_sync` field remains supported; `post_sync_hooks` extends
-  it with an ordered hook list, and the legacy hook runs first when both exist.
+- The existing `post_sync` field supports its original single-command argument
+  array and an ordered, non-empty array of command argument arrays.
 - Only post-sync failures release their current-minute schedule claim; ordinary
   sync blockers preserve existing suppression.
 
@@ -322,4 +324,4 @@ provides an explicit isolated-test override.
 - 2026-08-06: Implemented mode-aware sync, guarded pull-only conflict resolution, documentation, and focused integration coverage. (019fd480-9f24-7742-bce7-c362e6bc5261)
 - 2026-08-08: Documented optional post-sync hooks, guarded execution and retry semantics, and the agents chezmoi reconciliation workflow.
 - 2026-08-09: Moved the chezmoi reconciliation hook into devtools and expanded home-relative hook executable paths without expanding hook arguments.
-- 2026-08-09: Documented optional ordered `post_sync_hooks`, legacy-hook precedence, fail-fast execution, guarded context, and unchanged retry semantics.
+- 2026-08-09: Documented single-field `post_sync` compatibility, ordered hook lists, fail-fast execution, guarded context, and unchanged retry semantics.
