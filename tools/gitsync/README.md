@@ -15,20 +15,26 @@ The default configuration is `~/.config/gitsync/agcron.json`:
       "repo": "https://github.com/openai/kevinlin-agents.git",
       "sync_schedule": "*/10 * * * *",
       "mode": "pull",
-      "post_sync": ["/Users/kevinlin/.config/gitsync/scripts/chezmoi-post-sync"]
+      "post_sync": ["~/code/devtools/tools/gitsync/scripts/chezmoi-post-sync"],
+      "post_sync_hooks": [
+        ["./scripts/refresh-index", "--incremental"],
+        ["./scripts/report-sync"]
+      ]
     }
   ]
 }
 ```
 
-Every entry must contain `name`, `path`, `repo`, and `sync_schedule`. The `path` must be absolute after expanding a leading `~`, so `~/agents` is valid; shell variables such as `$HOME/agents` are not expanded. The optional `mode` is either `push/pull` or `pull`; when omitted, it defaults to `push/pull` for compatibility. The optional `post_sync` must be a non-empty argument array whose entries are non-empty strings. Names and paths must be unique. Schedules are numeric, five-field cron expressions (`minute hour day-of-month month day-of-week`) supporting `*`, lists, ranges, and steps. Sunday is `0` or `7`. As in cron, day-of-month and day-of-week use OR semantics when both are restricted.
+Every entry must contain `name`, `path`, `repo`, and `sync_schedule`. The `path` must be absolute after expanding a leading `~`, so `~/agents` is valid; shell variables such as `$HOME/agents` are not expanded. The optional `mode` is either `push/pull` or `pull`; when omitted, it defaults to `push/pull` for compatibility. The optional `post_sync` must be a non-empty argument array whose entries are non-empty strings. The optional `post_sync_hooks` must be a non-empty ordered array of hooks, where each hook is itself a non-empty argument array of non-empty strings. Existing configurations using only `post_sync` remain valid and unchanged. Names and paths must be unique. Schedules are numeric, five-field cron expressions (`minute hour day-of-month month day-of-week`) supporting `*`, lists, ranges, and steps. Sunday is `0` or `7`. As in cron, day-of-month and day-of-week use OR semantics when both are restricted.
 
 - `push/pull` fetches and merges upstream commits, then pushes local commits. Both the `origin` fetch and push URLs must identify the configured `repo`.
 - `pull` fetches and merges upstream commits but never pushes. Only the `origin` fetch URL is validated, and JSON results report `"push": "skipped"`.
 
 ## Post-sync hooks
 
-When configured, `post_sync` runs after every successful Git synchronization, including no-op pulls and newly cloned repositories. The command runs directly without a shell, with the synchronized repository as its working directory. Relative executable paths such as `./scripts/post-sync` are therefore resolved from that repository. Hook arguments do not expand `~` or shell variables; use an absolute path for hooks installed outside the repository.
+When configured, `post_sync` and `post_sync_hooks` run after every successful Git synchronization, including no-op pulls and newly cloned repositories. If both fields are present, the existing `post_sync` hook runs first, followed by each `post_sync_hooks` entry in its configured order. If either field is absent, the configured hooks from the other field still run normally.
+
+Each command runs directly without a shell, with the synchronized repository as its working directory. A leading `~` is expanded only in each hook's executable path (`argv[0]`); relative executable paths such as `./scripts/post-sync` are resolved from that repository. Hook arguments and shell variables remain literal.
 
 Hooks inherit the process environment plus:
 
@@ -37,11 +43,13 @@ Hooks inherit the process environment plus:
 - `GITSYNC_OLD_HEAD`: commit before fetching and merging.
 - `GITSYNC_NEW_HEAD`: commit after synchronization.
 
-For a newly cloned repository, `GITSYNC_OLD_HEAD` is the clone's initial checked-out commit; it normally equals `GITSYNC_NEW_HEAD`. In `pull` mode, hooks inherit the same Git push/send-pack guard used for conflict resolution. This prevents ordinary or accidental Git pushes, but is not a security boundary: hooks execute trusted code and a deliberately malicious hook can bypass the guard. Configure only hooks you trust. A failing or missing hook blocks the repository sync, reports its error, and releases that repository's scheduled claim so the same clock-minute run can retry; ordinary repository safety blockers retain their existing once-per-minute claim.
+For a newly cloned repository, `GITSYNC_OLD_HEAD` is the clone's initial checked-out commit; it normally equals `GITSYNC_NEW_HEAD`. Every hook in the sequence receives the same repository context. In `pull` mode, every hook also inherits the same Git push/send-pack guard used for conflict resolution. This prevents ordinary or accidental Git pushes, but is not a security boundary: hooks execute trusted code and a deliberately malicious hook can bypass the guard. Configure only hooks you trust.
+
+The sequence stops at the first failing or missing hook; later hooks do not run. The failure blocks the repository sync, reports its error, and releases that repository's scheduled claim so the same clock-minute run can retry. A retry performs a new synchronization and starts the configured hook sequence from the beginning, so hooks that already succeeded may run again. Ordinary repository safety blockers retain their existing once-per-minute claim.
 
 ### Example: reconcile `kevinlin-agents` with chezmoi
 
-The configuration above runs the chezmoi-managed `~/.config/gitsync/scripts/chezmoi-post-sync` executable after each successful pull of `kevinlin-agents`. The agents repository's `agcron.json` template renders the correct absolute home-directory path for each machine. The hook explicitly selects `~/agents` as its standalone chezmoi source; `.chezmoiroot` resolves the managed source directory to `~/agents/config`, and `config/.chezmoiignore` keeps repository-local `AGENTS.md` and `README.md` documentation out of the home directory.
+The configuration above first runs the repository-owned `~/code/devtools/tools/gitsync/scripts/chezmoi-post-sync` executable after each successful pull of `kevinlin-agents`, before its illustrative additional hooks. The agents repository's `agcron.json` template preserves that portable home-relative path. The hook explicitly selects `~/agents` as its standalone chezmoi source; `.chezmoiroot` resolves the managed source directory to `~/agents/config`, and `config/.chezmoiignore` keeps repository-local `AGENTS.md` and `README.md` documentation out of the home directory.
 
 For each managed file, the hook compares three versions: the rendered source at `GITSYNC_OLD_HEAD`, the rendered source at `GITSYNC_NEW_HEAD`, and the current machine-local destination.
 
@@ -53,11 +61,10 @@ For each managed file, the hook compares three versions: the rendered source at 
 
 Backups and conflict state live under `~/.local/state/kevinlin-agents/chezmoi-post-sync/`; backup directories are private. Scheduled hooks also resolve Homebrew's `chezmoi` and `slack-post` when launchd supplies only a minimal `PATH`.
 
-After changing the repository-managed hook or gitsync configuration, install the executable before activating the configuration that references it:
+After changing the repository-owned hook or gitsync configuration, verify the executable exists before activating the configuration that references it:
 
 ```bash
-chezmoi --source "$HOME/agents" apply --parent-dirs \
-  "$HOME/.config/gitsync/scripts/chezmoi-post-sync"
+test -x "$HOME/code/devtools/tools/gitsync/scripts/chezmoi-post-sync"
 chezmoi --source "$HOME/agents" apply "$HOME/.config/gitsync/agcron.json"
 gitsync --config "$HOME/.config/gitsync/agcron.json" validate
 ```

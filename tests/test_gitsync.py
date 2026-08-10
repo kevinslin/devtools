@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "bin" / "gitsync"
+CLI = ROOT / "tools" / "gitsync" / "bin" / "gitsync"
 
 
 def run(args: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -250,6 +250,23 @@ class GitsyncTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["status"], "valid")
 
+    def test_validate_accepts_multiple_post_sync_hook_argument_arrays(self) -> None:
+        configurations = (
+            {"post_sync_hooks": [["./scripts/first"], ["./scripts/second", "--apply"]]},
+            {
+                "post_sync": ["./scripts/legacy", "--legacy"],
+                "post_sync_hooks": [["./scripts/first"], ["./scripts/second", "--apply"]],
+            },
+        )
+        for configuration in configurations:
+            with self.subTest(configuration=configuration):
+                self.write_config(**configuration)
+
+                result = self.cli("validate")
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["status"], "valid")
+
     def test_validate_rejects_invalid_post_sync_hooks(self) -> None:
         invalid_hooks = [None, "./hook", [], [""], ["   "], ["./hook", 3]]
         for hook in invalid_hooks:
@@ -261,6 +278,30 @@ class GitsyncTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(
                     "repos[0].post_sync must be a non-empty array of non-empty strings",
+                    result.stderr,
+                )
+
+    def test_validate_rejects_invalid_multiple_post_sync_hooks(self) -> None:
+        invalid_hooks = (
+            None,
+            "./hook",
+            [],
+            ["./hook"],
+            [[]],
+            [[""]],
+            [["   "]],
+            [["./hook", 3]],
+            [["./hook"], "./other"],
+        )
+        for hooks in invalid_hooks:
+            with self.subTest(hooks=hooks):
+                self.write_config(post_sync_hooks=hooks)
+
+                result = self.cli("validate")
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(
+                    "repos[0].post_sync_hooks must be a non-empty array of non-empty argument arrays",
                     result.stderr,
                 )
 
@@ -317,6 +358,59 @@ class GitsyncTest(unittest.TestCase):
         self.assertEqual(invocation["argv"], [literal_argument])
         self.assertFalse(injected.exists())
 
+    def test_post_sync_expands_only_the_executable_home_directory(self) -> None:
+        record = self.root / "post-sync-record.json"
+        executable = self.root / "post-sync-hook"
+        executable.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            "Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        self.write_config(post_sync=["~/post-sync-hook", str(record), "~/literal-argument"])
+
+        result = self.cli("sync", "--name", "test", extra_env={"HOME": str(self.root)})
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(record.read_text(encoding="utf-8")), ["~/literal-argument"])
+
+    def test_multiple_post_sync_hooks_run_in_order_with_legacy_first(self) -> None:
+        record = self.root / "post-sync-order.jsonl"
+        executable = self.root / "ordered-post-sync-hook"
+        executable.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "entry = {'name': sys.argv[2], 'argument': sys.argv[3], "
+            "'repo': os.environ['GITSYNC_REPO_PATH'], "
+            "'old': os.environ['GITSYNC_OLD_HEAD'], 'new': os.environ['GITSYNC_NEW_HEAD']}\n"
+            "with Path(sys.argv[1]).open('a', encoding='utf-8') as output:\n"
+            "    output.write(json.dumps(entry) + '\\n')\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        self.write_config(
+            post_sync=[str(executable), str(record), "legacy", "~/legacy-argument"],
+            post_sync_hooks=[
+                ["~/ordered-post-sync-hook", str(record), "first", "~/first-argument"],
+                ["~/ordered-post-sync-hook", str(record), "second", "~/second-argument"],
+            ],
+        )
+
+        result = self.cli("sync", "--name", "test", extra_env={"HOME": str(self.root)})
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        entries = [json.loads(line) for line in record.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([entry["name"] for entry in entries], ["legacy", "first", "second"])
+        self.assertEqual(
+            [entry["argument"] for entry in entries],
+            ["~/legacy-argument", "~/first-argument", "~/second-argument"],
+        )
+        self.assertTrue(all(entry["repo"] == str(self.repo.resolve()) for entry in entries))
+        self.assertTrue(all(entry["old"] == entry["new"] for entry in entries))
+
     def test_post_sync_receives_heads_after_fast_forward(self) -> None:
         peer = self.root / "hook-peer"
         git(self.root, "clone", str(self.remote), str(peer))
@@ -362,6 +456,25 @@ class GitsyncTest(unittest.TestCase):
         repo_result = json.loads(result.stdout)["results"][0]
         self.assertIn("post-sync hook failed: failed to run ./missing-post-sync", repo_result["blocker"])
 
+    def test_post_sync_hook_failure_stops_remaining_hooks(self) -> None:
+        record = self.root / "unexpected-later-hook"
+        failure = "import sys; print('second hook rejected',file=sys.stderr); sys.exit(29)"
+        later = "from pathlib import Path; import sys; Path(sys.argv[1]).touch()"
+        self.write_config(
+            post_sync=[sys.executable, "-c", "pass"],
+            post_sync_hooks=[
+                [sys.executable, "-c", failure],
+                [sys.executable, "-c", later, str(record)],
+            ],
+        )
+
+        result = self.cli("sync", "--all")
+
+        self.assertEqual(result.returncode, 1)
+        blocker = json.loads(result.stdout)["results"][0]["blocker"]
+        self.assertIn("post-sync hook failed (exit 29): second hook rejected", blocker)
+        self.assertFalse(record.exists())
+
     def test_pull_mode_post_sync_hook_rejects_ordinary_git_push(self) -> None:
         (self.repo / "local.txt").write_text("local\n", encoding="utf-8")
         git(self.repo, "add", "local.txt")
@@ -379,6 +492,29 @@ class GitsyncTest(unittest.TestCase):
         repo_result = json.loads(result.stdout)["results"][0]
         self.assertIn("post-sync hook failed", repo_result["blocker"])
         self.assertIn("remote mutation disabled in pull mode", repo_result["blocker"])
+        self.assertEqual(git(self.remote, "rev-parse", "refs/heads/main"), remote_tip)
+
+    def test_pull_mode_additional_post_sync_hook_rejects_ordinary_git_push(self) -> None:
+        (self.repo / "local.txt").write_text("local\n", encoding="utf-8")
+        git(self.repo, "add", "local.txt")
+        git(self.repo, "commit", "-m", "local")
+        remote_tip = git(self.remote, "rev-parse", "refs/heads/main")
+        hook = (
+            "import subprocess,sys; "
+            "sys.exit(subprocess.run(['git','push','origin','HEAD:refs/heads/main']).returncode)"
+        )
+        self.write_config(
+            mode="pull",
+            post_sync=[sys.executable, "-c", "pass"],
+            post_sync_hooks=[[sys.executable, "-c", hook]],
+        )
+
+        result = self.cli("sync", "--all")
+
+        self.assertEqual(result.returncode, 1)
+        blocker = json.loads(result.stdout)["results"][0]["blocker"]
+        self.assertIn("post-sync hook failed", blocker)
+        self.assertIn("remote mutation disabled in pull mode", blocker)
         self.assertEqual(git(self.remote, "rev-parse", "refs/heads/main"), remote_tip)
 
     def test_pull_mode_fast_forwards_without_pushing(self) -> None:
@@ -639,6 +775,39 @@ class GitsyncTest(unittest.TestCase):
         self.assertEqual(json.loads(second.stdout)["selected"], 1)
         self.assertEqual(json.loads(third.stdout)["selected"], 0)
         self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["other"], other_slot)
+
+    def test_failed_additional_post_sync_hook_retries_from_first_hook(self) -> None:
+        now = datetime.now()
+        first_record = self.root / "first-hook-runs"
+        failure_record = self.root / "additional-hook-attempt"
+        first = (
+            "from pathlib import Path; import sys; "
+            "path=Path(sys.argv[1]); "
+            "path.write_text(str(int(path.read_text()) + 1) if path.exists() else '1')"
+        )
+        additional = (
+            "import sys; from pathlib import Path; "
+            "path=Path(sys.argv[1]); failed=not path.exists(); "
+            "path.touch(); "
+            "print('additional retry requested',file=sys.stderr) if failed else None; "
+            "sys.exit(19 if failed else 0)"
+        )
+        self.write_config(
+            sync_schedule=f"{now.minute} {now.hour} * * *",
+            post_sync=[sys.executable, "-c", first, str(first_record)],
+            post_sync_hooks=[[sys.executable, "-c", additional, str(failure_record)]],
+        )
+
+        first_attempt = self.cli("sync", "--due")
+        second_attempt = self.cli("sync", "--due")
+        third_attempt = self.cli("sync", "--due")
+
+        self.assertEqual(first_attempt.returncode, 1)
+        self.assertIn("post-sync hook failed (exit 19): additional retry requested", first_attempt.stdout)
+        self.assertEqual(second_attempt.returncode, 0, second_attempt.stdout + second_attempt.stderr)
+        self.assertEqual(json.loads(second_attempt.stdout)["selected"], 1)
+        self.assertEqual(json.loads(third_attempt.stdout)["selected"], 0)
+        self.assertEqual(first_record.read_text(encoding="utf-8"), "2")
 
     def test_launchd_plist_uses_due_mode_and_minute_trigger(self) -> None:
         result = self.cli("launchd-plist")
