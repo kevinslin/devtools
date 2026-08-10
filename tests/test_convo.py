@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "bin" / "convo"
+CLI = ROOT / "tools" / "convo" / "bin" / "convo"
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:

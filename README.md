@@ -56,8 +56,11 @@ tools/<project>/ or apps/<project>/
 ```
 
 Project directories contain only the optional subdirectories they actually
-need. The root `bin/` directory retains compatibility symlinks for the
-existing shell `PATH`, LaunchAgents, and shared test suite.
+need. Run `scripts/install.sh` to symlink project-owned executable entry points
+into `~/.local/bin`; set `INSTALL_BIN_DIR` to choose a different destination.
+Add the installation directory to your shell `PATH`. LaunchAgents should use
+the installed executable paths, while shared tests invoke project-owned entry
+points directly.
 
 Runtime configuration lives outside the repository under
 `~/.config/<tool>/` or `~/.config/<application>/`. Its portable chezmoi source

@@ -9,15 +9,17 @@ available at `http://cozy.localhost:8080/`.
 ## Install
 
 ```sh
-/Users/kevinlin/code/devtools/tools/cozy/bin/cozy --help
+/Users/kevinlin/code/devtools/scripts/install.sh
+~/.local/bin/cozy --help
 ```
 
-The executable entry point is `tools/cozy/bin/cozy` in the `devtools` repository. It
-automatically builds and caches the Go source from `tools/cozy/src`, rebuilds when
-that source changes, and loads your user-managed default configuration.
-The existing `devtools/bin/cozy` path remains available as a compatibility
-symlink. Add `devtools/tools/cozy/bin` or `devtools/bin` to your `PATH` to run the
-shorter `cozy` commands below.
+The executable entry point is `tools/cozy/bin/cozy` in the `devtools`
+repository. The installer symlinks it into `~/.local/bin` by default; set
+`INSTALL_BIN_DIR` to choose another installation directory. It automatically
+builds and caches the Go source from `tools/cozy/src`, rebuilds when that
+source changes, and loads your user-managed default configuration. Add the
+installation directory to your `PATH` to run the shorter `cozy` commands
+below.
 
 ## Configure
 
@@ -34,7 +36,7 @@ sites:
     run: fishy --host 127.0.0.1 --port "$PORT" --no-open
   - name: agtask.localhost
     url: http://agtask.localhost
-    run: /Users/kevinlin/code/devtools/bin/cozy __agtask_dashboard
+    run: /Users/kevinlin/.local/bin/cozy __agtask_dashboard
 ```
 
 Each site has a unique `.localhost` name, its matching clean `http` URL, and a

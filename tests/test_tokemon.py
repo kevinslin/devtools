@@ -18,7 +18,7 @@ from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "bin" / "tokemon"
+CLI = ROOT / "tools" / "tokemon" / "bin" / "tokemon"
 
 
 def _shift_months(when: datetime, months: int) -> datetime:

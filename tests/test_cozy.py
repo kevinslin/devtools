@@ -8,7 +8,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "bin" / "cozy"
+CLI = ROOT / "tools" / "cozy" / "bin" / "cozy"
 GO_CACHE = Path("/Users/kevinlin/.cache/cozy-go-build")
 
 

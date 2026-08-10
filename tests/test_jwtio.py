@@ -8,7 +8,7 @@ import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "bin" / "jwtio"
+CLI = ROOT / "tools" / "jwtio" / "bin" / "jwtio"
 
 
 def _base64url(data: bytes) -> str:

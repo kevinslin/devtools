@@ -10,7 +10,7 @@ from urllib.request import urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "bin" / "mdpreview"
+CLI = ROOT / "tools" / "mdpreview" / "bin" / "mdpreview"
 
 
 class MdPreviewCliTest(unittest.TestCase):

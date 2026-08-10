@@ -11,7 +11,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "bin" / "codex-tmux"
+CLI = ROOT / "tools" / "codex-tmux" / "bin" / "codex-tmux"
 
 
 def _write_executable(path: Path, text: str) -> None:

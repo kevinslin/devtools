@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "bin" / "arbor"
+CLI = ROOT / "tools" / "arbor" / "bin" / "arbor"
 
 
 class ArborCliTest(unittest.TestCase):

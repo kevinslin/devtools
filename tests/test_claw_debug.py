@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "bin" / "claw-debug"
+CLI = ROOT / "tools" / "claw-debug" / "bin" / "claw-debug"
 
 
 def _write_json(path: Path, payload: object) -> None:

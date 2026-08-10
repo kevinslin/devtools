@@ -8,7 +8,6 @@ devtools/
 ├── .mem.yaml                 # Registers the devtools memory base and schema.
 ├── AGENTS.md                 # Repository-wide agent instructions.
 ├── README.md                 # Human-facing project catalog and CLI index.
-├── bin/                      # Compatibility symlinks for existing commands.
 ├── schemas/
 │   └── devtools/
 │       ├── README.md         # This layout guide.
@@ -31,8 +30,11 @@ devtools/
         └── src/              # Optional implementation sources.
 ```
 
-Create optional files and directories only when a project needs them. Runtime
-configuration belongs under `~/.config/<project>/`, not inside the project.
+Create optional files and directories only when a project needs them. Run
+`scripts/install.sh` to symlink project-owned executable entry points into
+`~/.local/bin`, or set `INSTALL_BIN_DIR` to select a different destination.
+Runtime configuration belongs under `~/.config/<project>/`, not inside the
+project.
 
 Named schemas are resolved from the nearest ancestor `schemas/` directory,
 then `$HOME/.schemas/`, and finally the bundled `$mem` schemas.

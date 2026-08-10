@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "bin" / "tokemon-menuapp"
+CLI = ROOT / "apps" / "tokemon-menuapp" / "bin" / "tokemon-menuapp"
 APP_SOURCE = ROOT / "apps" / "tokemon" / "TokemonMenuApp.swift"
 
 

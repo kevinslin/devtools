@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "bin" / "autocrop-video"
+CLI = ROOT / "tools" / "autocrop-video" / "bin" / "autocrop-video"
 
 
 def _make_fixture(path: Path) -> None:

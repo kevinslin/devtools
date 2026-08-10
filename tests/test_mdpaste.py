@@ -9,7 +9,7 @@ import unittest
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "bin" / "mdpaste"
+CLI = ROOT / "tools" / "mdpaste" / "bin" / "mdpaste"
 
 WRITE_PASTEBOARD_SCRIPT = r"""
 ObjC.import('AppKit')

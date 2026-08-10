@@ -9,7 +9,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "bin" / "diff"
+CLI = ROOT / "tools" / "diff" / "bin" / "diff"
 
 
 class DiffCliTest(unittest.TestCase):

@@ -8,7 +8,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "bin" / "epoch"
+CLI = ROOT / "tools" / "epoch" / "bin" / "epoch"
 
 
 class EpochCliTest(unittest.TestCase):

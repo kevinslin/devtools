@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "bin" / "ag-man"
+CLI = ROOT / "tools" / "ag-man" / "bin" / "ag-man"
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
