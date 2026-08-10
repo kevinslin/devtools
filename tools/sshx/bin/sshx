@@ -21,7 +21,21 @@ RSYNC_RETRY_EXIT_CODE = 255
 RSYNC_RETRY_DELAY_SECONDS = 1
 RSYNC_REMOTE_CHECK_COMMAND = "command -v rsync >/dev/null 2>&1"
 RSYNC_REMOTE_CHECK_TIMEOUT_SECONDS = 8
-TAR_REMOTE_EXTRACT_COMMAND = 'mkdir -p "$HOME" && tar -xzf - -C "$HOME"'
+TAR_REMOTE_EXTRACT_COMMAND = (
+    'set -eu; mkdir -p "$HOME"; '
+    'tmp=$(mktemp -d "${TMPDIR:-/tmp}/sshx.XXXXXX"); '
+    "trap 'rm -rf \"$tmp\"' EXIT HUP INT TERM; "
+    'tar -xzf - -C "$tmp"; cd "$tmp"; '
+    "find . -mindepth 1 -type d -exec sh -c '"
+    "for rel do dst=$HOME/${rel#./}; "
+    "if [ -L \"$dst\" ] || { [ -e \"$dst\" ] && [ ! -d \"$dst\" ]; }; "
+    "then rm -rf -- \"$dst\"; fi; done' sh {} +; "
+    "find . -mindepth 1 ! -type d -exec sh -c '"
+    "for rel do dst=$HOME/${rel#./}; "
+    "if [ -d \"$dst\" ] && [ ! -L \"$dst\" ]; "
+    "then rm -rf -- \"$dst\"; fi; done' sh {} +; "
+    'tar -cf - . | tar -xf - -C "$HOME"'
+)
 
 
 def _build_parser(profile_names: tuple[str, ...]) -> argparse.ArgumentParser:

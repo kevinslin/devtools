@@ -10,7 +10,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "bin" / "sshx"
+CLI = ROOT / "tools" / "sshx" / "bin" / "sshx"
 DEFAULT_PROFILE_PATHS = (
     ".bashrc",
     ".codex/agents",
@@ -151,6 +151,31 @@ def _write_fake_ssh_append(
             "log_path.write_text(json.dumps(calls), encoding='utf-8')\n"
             "if argv and argv[-1] == 'command -v rsync >/dev/null 2>&1':\n"
             f"    raise SystemExit({0 if rsync_available else 1})\n"
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _write_fake_ssh_remote_shell(path: Path, *, remote_home: Path) -> None:
+    path.write_text(
+        (
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "import subprocess\n"
+            "import sys\n"
+            "argv = sys.argv[1:]\n"
+            "if argv and 'tar -xzf' in argv[-1]:\n"
+            "    env = os.environ.copy()\n"
+            f"    env['HOME'] = {str(remote_home)!r}\n"
+            "    result = subprocess.run(\n"
+            "        ['/bin/sh', '-c', argv[-1]],\n"
+            "        env=env,\n"
+            "        stdin=sys.stdin.buffer,\n"
+            "        check=False,\n"
+            "    )\n"
+            "    raise SystemExit(result.returncode)\n"
         ),
         encoding="utf-8",
     )
@@ -602,31 +627,29 @@ class SshxCliTest(unittest.TestCase):
 
             ssh_calls = _read_calls(ssh_log)
             self.assertEqual(
-                ssh_calls,
-                [
-                    {
-                        "argv": [
-                            "-n",
-                            "devbox",
-                            "command -v rsync >/dev/null 2>&1",
-                        ],
-                        "cwd": str(ROOT),
-                        "stdin_len": 0,
-                    },
-                    {
-                        "argv": [
-                            "devbox",
-                            'mkdir -p "$HOME" && tar -xzf - -C "$HOME"',
-                        ],
-                        "cwd": str(ROOT),
-                        "stdin_len": len(b"tar-data"),
-                    },
-                    {
-                        "argv": ["devbox"],
-                        "cwd": str(ROOT),
-                        "stdin_len": 0,
-                    },
-                ],
+                ssh_calls[0],
+                {
+                    "argv": [
+                        "-n",
+                        "devbox",
+                        "command -v rsync >/dev/null 2>&1",
+                    ],
+                    "cwd": str(ROOT),
+                    "stdin_len": 0,
+                },
+            )
+            self.assertEqual(ssh_calls[1]["argv"][:1], ["devbox"])
+            self.assertIn("mktemp -d", ssh_calls[1]["argv"][-1])
+            self.assertIn("tar -xzf -", ssh_calls[1]["argv"][-1])
+            self.assertEqual(ssh_calls[1]["cwd"], str(ROOT))
+            self.assertEqual(ssh_calls[1]["stdin_len"], len(b"tar-data"))
+            self.assertEqual(
+                ssh_calls[2],
+                {
+                    "argv": ["devbox"],
+                    "cwd": str(ROOT),
+                    "stdin_len": 0,
+                },
             )
 
     def test_tar_sync_method_skips_rsync(self) -> None:
@@ -662,6 +685,53 @@ class SshxCliTest(unittest.TestCase):
             self.assertEqual(
                 ssh_calls[-1]["argv"],
                 ["devbox", "uname", "-a"],
+            )
+
+    def test_tar_sync_replaces_remote_directory_with_local_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home = tmp_path / "home"
+            remote_home = tmp_path / "remote-home"
+            local_skills = home / ".codex" / "skills"
+            remote_skills = remote_home / ".codex" / "skills"
+            local_skills.mkdir(parents=True)
+            remote_skills.mkdir(parents=True)
+            (local_skills / "habitat-cli").symlink_to(
+                "../../code/openai/skills/skills/habitat-cli"
+            )
+            _write_file(remote_skills / "habitat-cli" / "SKILL.md", "old copy\n")
+            _write_file(remote_skills / "remote-only" / "SKILL.md", "preserve me\n")
+
+            ssh_bin = tmp_path / "fake-ssh"
+            _write_fake_ssh_remote_shell(ssh_bin, remote_home=remote_home)
+
+            result = self.run_cli(
+                [
+                    "--sync-method",
+                    "tar",
+                    "--no-defaults",
+                    "--path",
+                    ".codex/skills",
+                    "devbox",
+                    "true",
+                ],
+                home=home,
+                ssh_bin=ssh_bin,
+                rsync_bin=tmp_path / "unused-rsync",
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            remote_habitat = remote_skills / "habitat-cli"
+            self.assertTrue(remote_habitat.is_symlink())
+            self.assertEqual(
+                os.readlink(remote_habitat),
+                "../../code/openai/skills/skills/habitat-cli",
+            )
+            self.assertEqual(
+                (remote_skills / "remote-only" / "SKILL.md").read_text(
+                    encoding="utf-8"
+                ),
+                "preserve me\n",
             )
 
 

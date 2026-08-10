@@ -2,7 +2,7 @@
 
 <div align="center"><img src="../../assets/sshx-logo.png" alt="SSH sync terminal mascot" width="120" /></div>
 
-`sshx` syncs a conservative set of local dotfiles and Codex CLI config files to a remote host with `rsync`, then opens `ssh`. If the remote host does not have `rsync`, the default `auto` mode falls back to a `tar` stream over SSH.
+`sshx` syncs a conservative set of local dotfiles and Codex CLI config files to a remote host with `rsync`, then opens `ssh`. If the remote host does not have `rsync`, the default `auto` mode falls back to a staged `tar` stream over SSH. The staged overlay replaces file, directory, and symlink type conflicts inside selected paths while preserving unrelated remote-only entries.
 
 ## Quickstart
 
