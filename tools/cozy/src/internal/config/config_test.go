@@ -20,6 +20,9 @@ sites:
   - name: garden.localhost
     url: http://garden.localhost
     run: "garden --port=8080"
+  - name: tasks.localhost
+    url: http://tasks.localhost
+    redirect_command: agtask dashboard --no-open
 `
 	got, err := Parse([]byte(input))
 	if err != nil {
@@ -28,6 +31,7 @@ sites:
 	want := Config{Version: 1, Sites: []Site{
 		{Name: "fishy.localhost", URL: "http://fishy.localhost", Run: "fishy --message 'hello # world'"},
 		{Name: "garden.localhost", URL: "http://garden.localhost", Run: "garden --port=8080"},
+		{Name: "tasks.localhost", URL: "http://tasks.localhost", RedirectCommand: "agtask dashboard --no-open"},
 	}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Parse() = %#v, want %#v", got, want)
@@ -57,6 +61,8 @@ func TestParseFailures(t *testing.T) {
 		{name: "invalid hostname label", input: "version: 1\nsites:\n  - name: -fishy.localhost\n    url: http://-fishy.localhost\n    run: fishy\n", want: "valid *.localhost hostname"},
 		{name: "url has path", input: "version: 1\nsites:\n  - name: fishy.localhost\n    url: http://fishy.localhost/path\n    run: fishy\n", want: "url must be exactly"},
 		{name: "empty command", input: "version: 1\nsites:\n  - name: fishy.localhost\n    url: http://fishy.localhost\n    run: '  '\n", want: "nonempty command"},
+		{name: "empty redirect command", input: "version: 1\nsites:\n  - name: fishy.localhost\n    url: http://fishy.localhost\n    redirect_command: '  '\n", want: "nonempty command"},
+		{name: "conflicting site commands", input: "version: 1\nsites:\n  - name: fishy.localhost\n    url: http://fishy.localhost\n    run: fishy\n    redirect_command: agtask dashboard --no-open\n", want: "exactly one of run or redirect_command"},
 		{name: "bad indentation", input: "version: 1\nsites:\n - name: fishy.localhost\n", want: "two-space list"},
 		{name: "tab indentation", input: "version: 1\nsites:\n\t- name: fishy.localhost\n", want: "spaces for indentation"},
 		{name: "unterminated quote", input: "version: 1\nsites:\n  - name: 'fishy.localhost\n", want: "unterminated quoted scalar"},
@@ -124,6 +130,7 @@ func TestValidate(t *testing.T) {
 		}, want: "reserved for the Cozy admin"},
 		{name: "url", edit: func(c *Config) { c.Sites[0].URL += "/" }, want: "url must be exactly"},
 		{name: "run", edit: func(c *Config) { c.Sites[0].Run = " \t " }, want: "nonempty command"},
+		{name: "conflicting commands", edit: func(c *Config) { c.Sites[0].RedirectCommand = "agtask dashboard --no-open" }, want: "exactly one of run or redirect_command"},
 		{name: "duplicate", edit: func(c *Config) { c.Sites = append(c.Sites, c.Sites[0]) }, want: "duplicate site name"},
 	}
 	for _, tt := range tests {

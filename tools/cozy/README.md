@@ -36,30 +36,34 @@ sites:
     run: fishy --host 127.0.0.1 --port "$PORT" --no-open
   - name: agtask.localhost
     url: http://agtask.localhost
-    run: /Users/kevinlin/.local/bin/cozy __agtask_dashboard
+    redirect_command: agtask dashboard --no-open
 ```
 
 Each site has a unique `.localhost` name, its matching clean `http` URL, and a
-command to run. Commands are executed by the local shell. Cozy assigns each
-command its own available loopback port and sets both `PORT` and `COZY_PORT`
-to that port; the service must listen on the provided port. Fishy's `--port`
-argument uses that assigned port, and `--no-open` keeps the background service
-from opening its internal backend URL. Treat the site configuration as trusted
-local configuration. Set `COZY_CONFIG` or pass `--config` to select a different
+single `run` or `redirect_command` command. Commands are executed by the local
+shell. Cozy assigns each `run` command its own available loopback port and sets
+both `PORT` and `COZY_PORT` to that port; the service must listen on the
+provided port. Fishy's `--port` argument uses that assigned port, and
+`--no-open` keeps the background service from opening its internal backend URL.
+A `redirect_command` runs once at startup, prints one HTTP or HTTPS URL, and
+exits; Cozy redirects that site's requests to the printed URL while preserving
+their paths and query strings. Treat the site configuration as trusted local
+configuration. Set `COZY_CONFIG` or pass `--config` to select a different
 configuration file.
 
 The `cozy.localhost` hostname is reserved for the admin dashboard and cannot
 be assigned to a managed service.
 
-The `agtask.localhost` entry starts the dashboard using:
+The `agtask.localhost` example resolves its configured dashboard using:
 
 ```text
-/Users/kevinlin/code/skills-public/active/agtask/skills/agtask/scripts/agtask dashboard --no-open
+agtask dashboard --no-open
 ```
 
-Cozy's internal dashboard adapter preserves the dashboard's private token,
-expected backend host, and same-origin request checks while making the
-dashboard available through its `.localhost` site.
+When agtask uses its Sites backend, the command prints the private hosted Site
+URL. Browser authentication and hosted task data remain authoritative, and
+Cozy never handles the Site's credentials. Existing `run` configurations,
+including the internal agtask dashboard adapter, remain supported.
 
 ## Commands
 

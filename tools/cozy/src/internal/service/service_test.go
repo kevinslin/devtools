@@ -75,8 +75,12 @@ func writeSiteConfig(t *testing.T, path string, sites []config.Site) {
 	var contents strings.Builder
 	contents.WriteString("version: 1\nsites:\n")
 	for _, site := range sites {
-		fmt.Fprintf(&contents, "  - name: %s\n    url: %s\n    run: %s\n",
-			site.Name, site.URL, strconv.Quote(site.Run))
+		fmt.Fprintf(&contents, "  - name: %s\n    url: %s\n", site.Name, site.URL)
+		if site.RedirectCommand != "" {
+			fmt.Fprintf(&contents, "    redirect_command: %s\n", strconv.Quote(site.RedirectCommand))
+		} else {
+			fmt.Fprintf(&contents, "    run: %s\n", strconv.Quote(site.Run))
+		}
 	}
 	if err := os.WriteFile(path, []byte(contents.String()), 0o600); err != nil {
 		t.Fatalf("write hermetic site configuration: %v", err)
@@ -177,6 +181,114 @@ func TestStartPersistsDistinctPortsAndPrivateState(t *testing.T) {
 		if got := info.Mode().Perm(); got != check.want {
 			t.Errorf("%s permissions = %04o, want %04o", check.path, got, check.want)
 		}
+	}
+}
+
+func TestRedirectCommandRunsOnceAndPreservesHostedPaths(t *testing.T) {
+	dir := filepath.Join(shortTempDir(t), "runtime")
+	m := startTestManager(t, config.Config{Version: 1, Sites: []config.Site{
+		sleepingSite("fishy.localhost"),
+		{
+			Name: "tasks.localhost", URL: "http://tasks.localhost",
+			RedirectCommand: "printf 'https://example.com/dashboard\\n'",
+		},
+	}}, dir)
+	state := m.State()
+	if len(state.Sites) != 2 || state.Sites[1].RedirectCommand == "" ||
+		state.Sites[1].PID != 0 || state.Sites[1].Port != 0 {
+		t.Fatalf("redirect site should have no persistent child: %+v", state.Sites)
+	}
+
+	client := &http.Client{
+		Timeout: time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	for _, path := range []string{"/", "/tasks/~example?search=cozy"} {
+		request, err := http.NewRequest(http.MethodGet, "http://"+state.Addr+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Host = "tasks.localhost"
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatalf("request redirect site: %v", err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusTemporaryRedirect {
+			t.Fatalf("redirect status = %d, want %d", response.StatusCode, http.StatusTemporaryRedirect)
+		}
+		if got, want := response.Header.Get("Location"), "https://example.com/dashboard"+path; got != want {
+			t.Fatalf("redirect location = %q, want %q", got, want)
+		}
+	}
+
+	if err := m.RestartSite(context.Background(), "tasks.localhost"); err != nil {
+		t.Fatalf("restart redirect site: %v", err)
+	}
+}
+
+func TestRedirectCommandRejectsUnsafeOrInvalidDestinations(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		command string
+	}{
+		{name: "credentials", command: "printf 'https://user:secret@example.com/\\n'"},
+		{name: "wrong scheme", command: "printf 'javascript:alert(1)\\n'"},
+		{name: "multiple destinations", command: "printf 'https://example.com/\\nhttps://other.example/\\n'"},
+		{name: "command failure", command: "exit 7"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Start(config.Config{Version: 1, Sites: []config.Site{{
+				Name: "tasks.localhost", URL: "http://tasks.localhost", RedirectCommand: test.command,
+			}}}, Options{Addr: "127.0.0.1:0", StateDir: filepath.Join(shortTempDir(t), "runtime")})
+			if err == nil {
+				t.Fatal("invalid redirect command unexpectedly started")
+			}
+			if strings.Contains(err.Error(), "secret") {
+				t.Fatalf("redirect error exposed credentials: %v", err)
+			}
+		})
+	}
+}
+
+func TestRefreshSwitchesBetweenRunAndRedirectCommandWithoutRestartingPeers(t *testing.T) {
+	dir := shortTempDir(t)
+	path := filepath.Join(dir, "cozy.yaml")
+	fishy := sleepingSite("fishy.localhost")
+	tasks := sleepingSite("tasks.localhost")
+	writeSiteConfig(t, path, []config.Site{fishy, tasks})
+	m := startConfiguredTestManager(t, config.Config{Version: 1, Sites: []config.Site{fishy, tasks}},
+		filepath.Join(dir, "runtime"), path)
+	originalFishyPID := stateSite(t, m.State(), fishy.Name).PID
+
+	tasks.Run = ""
+	tasks.RedirectCommand = "printf 'https://example.com/\\n'"
+	writeSiteConfig(t, path, []config.Site{fishy, tasks})
+	if _, err := m.controlAction("refresh", ""); err != nil {
+		t.Fatalf("refresh to redirect command: %v", err)
+	}
+	if got := stateSite(t, m.State(), fishy.Name).PID; got != originalFishyPID {
+		t.Fatalf("refresh restarted unchanged peer: got PID %d, want %d", got, originalFishyPID)
+	}
+	redirect := stateSite(t, m.State(), tasks.Name)
+	if redirect.RedirectCommand == "" || redirect.PID != 0 {
+		t.Fatalf("refresh did not activate childless redirect: %+v", redirect)
+	}
+
+	tasks.RedirectCommand = ""
+	tasks.Run = testHTTPCommand(tasks.Name)
+	writeSiteConfig(t, path, []config.Site{fishy, tasks})
+	if _, err := m.controlAction("refresh", ""); err != nil {
+		t.Fatalf("refresh back to managed service: %v", err)
+	}
+	if got := stateSite(t, m.State(), fishy.Name).PID; got != originalFishyPID {
+		t.Fatalf("second refresh restarted unchanged peer: got PID %d, want %d", got, originalFishyPID)
+	}
+	managed := stateSite(t, m.State(), tasks.Name)
+	if managed.RedirectCommand != "" || managed.PID == 0 {
+		t.Fatalf("refresh did not restore managed service: %+v", managed)
 	}
 }
 

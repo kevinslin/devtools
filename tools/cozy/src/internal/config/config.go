@@ -20,9 +20,10 @@ type Config struct {
 
 // Site describes one locally managed HTTP service.
 type Site struct {
-	Name string
-	URL  string
-	Run  string
+	Name            string
+	URL             string
+	Run             string
+	RedirectCommand string
 }
 
 // Load reads, parses, and validates the configuration at path.
@@ -190,6 +191,8 @@ func Parse(data []byte) (Config, error) {
 			site.URL = value
 		case "run":
 			site.Run = value
+		case "redirect_command":
+			site.RedirectCommand = value
 		default:
 			return Config{}, fmt.Errorf("line %d: unknown site key %q", lineNumber, key)
 		}
@@ -232,8 +235,13 @@ func (c Config) Validate() error {
 		if expected := "http://" + site.Name; site.URL != expected {
 			return fmt.Errorf("site %q: url must be exactly %q", site.Name, expected)
 		}
-		if strings.TrimSpace(site.Run) == "" {
-			return fmt.Errorf("site %q: run must be a nonempty command", site.Name)
+		hasRun := strings.TrimSpace(site.Run) != ""
+		hasRedirectCommand := strings.TrimSpace(site.RedirectCommand) != ""
+		if !hasRun && !hasRedirectCommand {
+			return fmt.Errorf("site %q: run or redirect_command must be a nonempty command", site.Name)
+		}
+		if hasRun && hasRedirectCommand {
+			return fmt.Errorf("site %q: configure exactly one of run or redirect_command", site.Name)
 		}
 	}
 	return nil

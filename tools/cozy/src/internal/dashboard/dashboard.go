@@ -1,4 +1,4 @@
-// Package dashboard adapts the local agtask dashboard to a Cozy-managed port.
+// Package dashboard adapts the configured agtask dashboard to a Cozy-managed port.
 package dashboard
 
 import (
@@ -17,8 +17,8 @@ import (
 	"time"
 )
 
-// Run starts agtask and proxies a Cozy-assigned loopback port to its private
-// dashboard. The dashboard's capability token never becomes a public path.
+// Run starts agtask and proxies its private local dashboard or redirects to its
+// authenticated hosted Site without exposing dashboard credentials.
 func Run(ctx context.Context, port int, executable string, stdout, stderr io.Writer) error {
 	if port < 1 || port > 65535 {
 		return fmt.Errorf("dashboard port must be between 1 and 65535")
@@ -63,24 +63,45 @@ func Run(ctx context.Context, port int, executable string, stdout, stderr io.Wri
 		_ = cmd.Wait()
 		return err
 	}
+	hosted := target.Scheme == "https"
+	if hosted {
+		if err := cmd.Wait(); err != nil {
+			return fmt.Errorf("hosted dashboard exited after printing its startup URL: %w", err)
+		}
+	}
 
 	listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 	if err != nil {
 		cancel()
-		_ = cmd.Wait()
+		if !hosted {
+			_ = cmd.Wait()
+		}
 		return fmt.Errorf("bind assigned dashboard loopback port %d: %w", port, err)
 	}
 
-	proxy := newProxy(target)
-	server := &http.Server{Handler: proxy, ReadHeaderTimeout: 5 * time.Second}
+	var handler http.Handler = newProxy(target)
+	if hosted {
+		handler = http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+			location := *target
+			location.Path = request.URL.Path
+			location.RawPath = request.URL.RawPath
+			location.RawQuery = request.URL.RawQuery
+			http.Redirect(response, request, location.String(), http.StatusTemporaryRedirect)
+		})
+	}
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	serveDone := make(chan error, 1)
-	childDone := make(chan error, 1)
-	go func() {
-		for scanner.Scan() {
-			fmt.Fprintln(stdout, scanner.Text())
-		}
-		childDone <- cmd.Wait()
-	}()
+	var childDone <-chan error
+	if !hosted {
+		done := make(chan error, 1)
+		childDone = done
+		go func() {
+			for scanner.Scan() {
+				fmt.Fprintln(stdout, scanner.Text())
+			}
+			done <- cmd.Wait()
+		}()
+	}
 	go func() { serveDone <- server.Serve(listener) }()
 	fmt.Fprintln(stdout, "agtask dashboard ready on managed loopback port")
 
@@ -94,7 +115,9 @@ func Run(ctx context.Context, port int, executable string, stdout, stderr io.Wri
 	select {
 	case <-ctx.Done():
 		shutdown()
-		<-childDone
+		if childDone != nil {
+			<-childDone
+		}
 		return ctx.Err()
 	case err := <-childDone:
 		shutdown()
@@ -104,7 +127,9 @@ func Run(ctx context.Context, port int, executable string, stdout, stderr io.Wri
 		return fmt.Errorf("agtask dashboard exited unexpectedly")
 	case err := <-serveDone:
 		shutdown()
-		<-childDone
+		if childDone != nil {
+			<-childDone
+		}
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return fmt.Errorf("serve managed dashboard: %w", err)
 		}
@@ -118,10 +143,22 @@ func Run(ctx context.Context, port int, executable string, stdout, stderr io.Wri
 func parseTarget(line string) (*url.URL, error) {
 	target, err := url.Parse(strings.TrimSpace(line))
 	if err != nil || target == nil {
-		return nil, fmt.Errorf("dashboard printed an invalid local startup URL")
+		return nil, fmt.Errorf("dashboard printed an invalid startup URL")
 	}
-	if target.Scheme != "http" || target.User != nil || target.Fragment != "" {
-		return nil, fmt.Errorf("dashboard printed an invalid local startup URL")
+	if target.User != nil || target.Fragment != "" {
+		return nil, fmt.Errorf("dashboard printed an invalid startup URL")
+	}
+	if target.Scheme == "https" {
+		if !strings.HasSuffix(target.Hostname(), ".openai.chatgpt.site") ||
+			target.Port() != "" || target.RawQuery != "" || target.ForceQuery ||
+			(target.EscapedPath() != "" && target.EscapedPath() != "/") {
+			return nil, fmt.Errorf("dashboard startup URL must be a trusted hosted Site root")
+		}
+		target.Path = "/"
+		return target, nil
+	}
+	if target.Scheme != "http" {
+		return nil, fmt.Errorf("dashboard printed an invalid startup URL")
 	}
 	ip := net.ParseIP(target.Hostname())
 	if ip == nil || !ip.IsLoopback() || target.Port() == "" {

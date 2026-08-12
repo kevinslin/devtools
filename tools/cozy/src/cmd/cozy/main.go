@@ -478,6 +478,10 @@ func status(opts commandOptions, output io.Writer) error {
 	fmt.Fprintf(output, "Cozy is running on %s (PID %d)\n", state.Addr, state.PID)
 	fmt.Fprintf(output, "Admin: %s\n", admin)
 	for _, site := range state.Sites {
+		if site.RedirectCommand != "" {
+			fmt.Fprintf(output, "%s\tredirect\t%s\n", site.URL, site.RedirectCommand)
+			continue
+		}
 		fmt.Fprintf(output, "%s\tPID %d\t%s\n", site.URL, site.PID, site.LogPath)
 	}
 	return nil

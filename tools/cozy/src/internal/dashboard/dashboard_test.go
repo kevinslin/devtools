@@ -25,6 +25,12 @@ func TestParseTarget(t *testing.T) {
 	}{
 		{name: "loopback token", line: "http://127.0.0.1:34567/private-token/", valid: true},
 		{name: "IPv6 loopback token", line: "http://[::1]:34567/private-token/", valid: true},
+		{name: "hosted private site", line: "https://agtask-example.openai.chatgpt.site", valid: true},
+		{name: "hosted private site root", line: "https://agtask-example.openai.chatgpt.site/", valid: true},
+		{name: "untrusted hosted domain", line: "https://example.com/"},
+		{name: "hosted site query", line: "https://agtask-example.openai.chatgpt.site/?token=secret"},
+		{name: "hosted site nested path", line: "https://agtask-example.openai.chatgpt.site/private"},
+		{name: "hosted site port", line: "https://agtask-example.openai.chatgpt.site:8443/"},
 		{name: "missing token", line: "http://127.0.0.1:34567/"},
 		{name: "nonloopback host", line: "http://example.com:34567/private-token/"},
 		{name: "missing port", line: "http://127.0.0.1/private-token/"},
@@ -165,6 +171,69 @@ func TestRunRoutesDashboardAndPreservesSecurity(t *testing.T) {
 	}
 }
 
+func TestRunRedirectsHostedDashboardWithoutBypassingAuthentication(t *testing.T) {
+	executable := helperExecutable(t, "hosted")
+	port := availablePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, port, executable, &stdout, &stderr) }()
+
+	client := &http.Client{
+		Timeout: time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	address := "http://127.0.0.1:" + strconv.Itoa(port)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		response, err := client.Get(address + "/")
+		if err == nil {
+			_ = response.Body.Close()
+			if response.StatusCode == http.StatusTemporaryRedirect {
+				break
+			}
+		}
+		select {
+		case runErr := <-done:
+			t.Fatalf("hosted dashboard adapter exited before readiness: %v; stderr: %s", runErr, stderr.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("hosted dashboard adapter did not become ready: %v; stderr: %s", err, stderr.String())
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	for _, path := range []string{"/", "/tasks/~example", "/?search=cozy"} {
+		t.Run(path, func(t *testing.T) {
+			response, err := client.Get(address + path)
+			if err != nil {
+				t.Fatalf("request hosted dashboard redirect: %v", err)
+			}
+			_ = response.Body.Close()
+			if response.StatusCode != http.StatusTemporaryRedirect {
+				t.Fatalf("hosted dashboard status = %d, want %d", response.StatusCode, http.StatusTemporaryRedirect)
+			}
+			if got, want := response.Header.Get("Location"), "https://agtask-example.openai.chatgpt.site"+path; got != want {
+				t.Fatalf("hosted dashboard redirect = %q, want %q", got, want)
+			}
+		})
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != context.Canceled {
+			t.Fatalf("hosted dashboard cancellation = %v, want context canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("hosted dashboard adapter did not stop on cancellation")
+	}
+}
+
 func TestRunReportsInvalidStartupURL(t *testing.T) {
 	executable := helperExecutable(t, "invalid")
 	var stdout, stderr bytes.Buffer
@@ -202,6 +271,10 @@ func TestDashboardHelperProcess(t *testing.T) {
 	if len(os.Args) < 2 || os.Args[len(os.Args)-2] != "dashboard" || os.Args[len(os.Args)-1] != "--no-open" {
 		fmt.Fprintln(os.Stderr, "dashboard helper received unexpected arguments")
 		os.Exit(2)
+	}
+	if mode == "hosted" {
+		fmt.Println("https://agtask-example.openai.chatgpt.site")
+		return
 	}
 	if mode == "invalid" {
 		fmt.Println("http://example.com:34567/not-local/")

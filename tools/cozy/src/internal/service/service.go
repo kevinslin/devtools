@@ -2,6 +2,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -60,12 +61,13 @@ type controlResponse struct {
 
 // SiteState is the persisted runtime information for a site.
 type SiteState struct {
-	Name    string `json:"name"`
-	URL     string `json:"url"`
-	Run     string `json:"run"`
-	PID     int    `json:"pid"`
-	Port    int    `json:"port"`
-	LogPath string `json:"log_path"`
+	Name            string `json:"name"`
+	URL             string `json:"url"`
+	Run             string `json:"run"`
+	RedirectCommand string `json:"redirect_command,omitempty"`
+	PID             int    `json:"pid"`
+	Port            int    `json:"port"`
+	LogPath         string `json:"log_path"`
 }
 
 // State is the persisted runtime information for the proxy and its sites.
@@ -104,7 +106,7 @@ type Manager struct {
 	control     net.Listener
 	controlInfo os.FileInfo
 	children    map[string]*child
-	routes      map[string]*httputil.ReverseProxy
+	routes      map[string]http.Handler
 	generation  atomic.Uint64
 	childExit   chan childExit
 	serveErr    chan error
@@ -230,8 +232,12 @@ func (m *Manager) Sites() []admin.Site {
 	state := m.State()
 	sites := make([]admin.Site, 0, len(state.Sites))
 	for _, site := range state.Sites {
+		command := site.Run
+		if command == "" {
+			command = site.RedirectCommand
+		}
 		sites = append(sites, admin.Site{
-			Name: site.Name, URL: site.URL, Run: site.Run,
+			Name: site.Name, URL: site.URL, Run: command,
 			PID: site.PID, Port: site.Port, LogPath: site.LogPath,
 		})
 	}
@@ -380,7 +386,7 @@ func Start(cfg config.Config, opts Options) (_ *Manager, resultErr error) {
 		configPath: opts.ConfigPath,
 		listener:   listener,
 		children:   make(map[string]*child, len(cfg.Sites)),
-		routes:     make(map[string]*httputil.ReverseProxy, len(cfg.Sites)),
+		routes:     make(map[string]http.Handler, len(cfg.Sites)),
 		childExit:  make(chan childExit, 256),
 		serveErr:   make(chan error, 1),
 		stopCh:     make(chan struct{}),
@@ -403,7 +409,9 @@ func Start(cfg config.Config, opts Options) (_ *Manager, resultErr error) {
 			return nil, err
 		}
 		m.mu.Lock()
-		m.children[site.Name] = process
+		if process != nil {
+			m.children[site.Name] = process
+		}
 		m.routes[strings.ToLower(site.Name)] = proxy
 		m.state.Sites = append(m.state.Sites, siteState)
 		m.mu.Unlock()
@@ -440,8 +448,11 @@ func Start(cfg config.Config, opts Options) (_ *Manager, resultErr error) {
 	return m, nil
 }
 
-func (m *Manager) startSite(site config.Site) (*child, SiteState, *httputil.ReverseProxy, error) {
+func (m *Manager) startSite(site config.Site) (*child, SiteState, http.Handler, error) {
 	var empty SiteState
+	if site.RedirectCommand != "" {
+		return m.startRedirectSite(site)
+	}
 	reservation, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, empty, nil, fmt.Errorf("allocate loopback port for %s: %w", site.Name, err)
@@ -498,6 +509,46 @@ func (m *Manager) startSite(site config.Site) (*child, SiteState, *httputil.Reve
 		return nil, empty, nil, err
 	}
 	return process, siteState, httputil.NewSingleHostReverseProxy(backend), nil
+}
+
+func (m *Manager) startRedirectSite(site config.Site) (*child, SiteState, http.Handler, error) {
+	var empty SiteState
+	logPath := filepath.Join(m.stateDir, site.Name+".log")
+	log, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, empty, nil, fmt.Errorf("open log for %s: %w", site.Name, err)
+	}
+	defer log.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, "sh", "-c", site.RedirectCommand)
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = log
+	if err := command.Run(); err != nil {
+		return nil, empty, nil, fmt.Errorf("run redirect command for %s: %w; inspect %s", site.Name, err, logPath)
+	}
+	destination := strings.TrimSpace(output.String())
+	if destination == "" || strings.ContainsAny(destination, "\r\n") || len(destination) > 16<<10 {
+		return nil, empty, nil, fmt.Errorf("redirect command for %s must print exactly one valid HTTP URL", site.Name)
+	}
+	target, err := url.Parse(destination)
+	if err != nil || target == nil || (target.Scheme != "http" && target.Scheme != "https") ||
+		target.Hostname() == "" || target.User != nil || target.Fragment != "" {
+		return nil, empty, nil, fmt.Errorf("redirect command for %s must print exactly one valid HTTP URL without credentials or fragments", site.Name)
+	}
+	route := http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		location := *target
+		location.Path = strings.TrimRight(target.Path, "/") + request.URL.Path
+		location.RawPath = ""
+		location.RawQuery = request.URL.RawQuery
+		http.Redirect(response, request, location.String(), http.StatusTemporaryRedirect)
+	})
+	state := SiteState{
+		Name: site.Name, URL: site.URL, RedirectCommand: site.RedirectCommand, LogPath: logPath,
+	}
+	return nil, state, route, nil
 }
 
 func stopChild(ctx context.Context, process *child) error {
@@ -653,6 +704,7 @@ func (m *Manager) controlActionLocked(action, site string) (ControlResult, error
 		for _, existing := range state.Sites {
 			cfg.Sites = append(cfg.Sites, config.Site{
 				Name: existing.Name, URL: existing.URL, Run: existing.Run,
+				RedirectCommand: existing.RedirectCommand,
 			})
 			if site == "" || site == existing.Name {
 				restart[existing.Name] = true
@@ -670,7 +722,7 @@ func (m *Manager) controlActionLocked(action, site string) (ControlResult, error
 type stagedSite struct {
 	process *child
 	state   SiteState
-	proxy   *httputil.ReverseProxy
+	proxy   http.Handler
 }
 
 func (m *Manager) reconcile(cfg config.Config, restart map[string]bool, refresh bool) (ControlResult, error) {
@@ -680,7 +732,7 @@ func (m *Manager) reconcile(cfg config.Config, restart map[string]bool, refresh 
 	current := m.State()
 	m.mu.RLock()
 	currentChildren := make(map[string]*child, len(m.children))
-	currentRoutes := make(map[string]*httputil.ReverseProxy, len(m.routes))
+	currentRoutes := make(map[string]http.Handler, len(m.routes))
 	for name, process := range m.children {
 		currentChildren[name] = process
 	}
@@ -703,7 +755,8 @@ func (m *Manager) reconcile(cfg config.Config, restart map[string]bool, refresh 
 	added, changed, unchanged := 0, 0, 0
 	for _, site := range cfg.Sites {
 		existing, exists := byName[site.Name]
-		if exists && !restart[site.Name] && existing.URL == site.URL && existing.Run == site.Run {
+		if exists && !restart[site.Name] && existing.URL == site.URL &&
+			existing.Run == site.Run && existing.RedirectCommand == site.RedirectCommand {
 			unchanged++
 			continue
 		}
@@ -722,22 +775,26 @@ func (m *Manager) reconcile(cfg config.Config, restart map[string]bool, refresh 
 	next := current
 	next.Sites = make([]SiteState, 0, len(cfg.Sites))
 	nextChildren := make(map[string]*child, len(cfg.Sites))
-	nextRoutes := make(map[string]*httputil.ReverseProxy, len(cfg.Sites))
+	nextRoutes := make(map[string]http.Handler, len(cfg.Sites))
 	for _, site := range cfg.Sites {
 		if candidate, ok := staged[site.Name]; ok {
-			select {
-			case <-candidate.process.done:
-				cleanupStaged()
-				return ControlResult{}, fmt.Errorf("replacement service %s exited before activation; inspect %s", site.Name, candidate.state.LogPath)
-			default:
+			if candidate.process != nil {
+				select {
+				case <-candidate.process.done:
+					cleanupStaged()
+					return ControlResult{}, fmt.Errorf("replacement service %s exited before activation; inspect %s", site.Name, candidate.state.LogPath)
+				default:
+				}
+				nextChildren[site.Name] = candidate.process
 			}
 			next.Sites = append(next.Sites, candidate.state)
-			nextChildren[site.Name] = candidate.process
 			nextRoutes[strings.ToLower(site.Name)] = candidate.proxy
 			continue
 		}
 		next.Sites = append(next.Sites, byName[site.Name])
-		nextChildren[site.Name] = currentChildren[site.Name]
+		if process := currentChildren[site.Name]; process != nil {
+			nextChildren[site.Name] = process
+		}
 		nextRoutes[strings.ToLower(site.Name)] = currentRoutes[strings.ToLower(site.Name)]
 	}
 	if err := persistState(m.stateDir, next); err != nil {
@@ -747,22 +804,24 @@ func (m *Manager) reconcile(cfg config.Config, restart map[string]bool, refresh 
 	oldProcesses := make([]*child, 0, len(currentChildren))
 	m.mu.Lock()
 	for name, candidate := range staged {
-		select {
-		case <-candidate.process.done:
-			m.mu.Unlock()
-			restoreErr := persistState(m.stateDir, current)
-			cleanupStaged()
-			if restoreErr != nil {
+		if candidate.process != nil {
+			select {
+			case <-candidate.process.done:
+				m.mu.Unlock()
+				restoreErr := persistState(m.stateDir, current)
+				cleanupStaged()
+				if restoreErr != nil {
+					return ControlResult{}, fmt.Errorf(
+						"replacement service %s exited before activation and restoring running state failed: %w; inspect %s",
+						name, restoreErr, candidate.state.LogPath,
+					)
+				}
 				return ControlResult{}, fmt.Errorf(
-					"replacement service %s exited before activation and restoring running state failed: %w; inspect %s",
-					name, restoreErr, candidate.state.LogPath,
+					"replacement service %s exited before activation; inspect %s",
+					name, candidate.state.LogPath,
 				)
+			default:
 			}
-			return ControlResult{}, fmt.Errorf(
-				"replacement service %s exited before activation; inspect %s",
-				name, candidate.state.LogPath,
-			)
-		default:
 		}
 	}
 	for name, process := range currentChildren {
