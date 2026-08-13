@@ -80,8 +80,7 @@ newly cloned repositories.
       "mode": "pull",
       "post_sync": [
         ["~/code/devtools/tools/gitsync/scripts/chezmoi-post-sync"],
-        ["./scripts/refresh-index", "--incremental"],
-        ["./scripts/report-sync"]
+        ["~/code/devtools/tools/gitsync/scripts/launchd-sync"]
       ]
     }
   ]
@@ -175,10 +174,11 @@ therefore run again. Other repositories' scheduled claims are unchanged.
 ### Agents repository reconciliation
 
 `kevinlin-agents` configures the devtools-owned
-`~/code/devtools/tools/gitsync/scripts/chezmoi-post-sync` executable. Its
-`agcron.json` template preserves the portable home-relative hook path.
-The devtools repository owns the hook and supplies the generic execution
-contract.
+`~/code/devtools/tools/gitsync/scripts/chezmoi-post-sync` and
+`~/code/devtools/tools/gitsync/scripts/launchd-sync` executables, in that order.
+Its `agcron.json` template preserves their portable home-relative paths. The
+devtools repository owns both hooks and supplies the generic execution
+contract; pull-only synchronization applies the same Git push guard to each.
 
 The hook renders the previous and current standalone chezmoi sources, compares
 them with each local destination, and applies incoming-only changes without
@@ -193,6 +193,13 @@ dereferencing them, directories are never recursively copied, and removed
 managed entries do not delete existing destination files. Repository-local
 `config/AGENTS.md` and `config/README.md` are excluded through
 `config/.chezmoiignore`.
+
+After chezmoi reconciliation succeeds, `launchd-sync` reconciles owned
+LaunchAgents against `~/.config/gitsync/launchd-jobs.json` and the staged plist
+files under `~/.config/gitsync/`. The shared policy and staged plists are
+chezmoi-managed configuration; the executable remains in devtools. The policy
+alone declares each job's ownership and `all_machine` or `primary_only`
+placement, without hardcoded label-prefix restrictions.
 
 ### Result output
 

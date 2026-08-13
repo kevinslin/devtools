@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+"""Reconcile explicitly owned LaunchAgents against shared machine placement."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import plistlib
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import uuid
+
+
+SCHEMA_VERSION = 1
+PLACEMENTS = {"all_machine", "primary_only"}
+OWNERSHIPS = {"existing_chezmoi", "installer"}
+POLICY_FIELDS = {"schema_version", "primary_machine_id", "default_placement", "jobs"}
+JOB_FIELDS = {"label", "placement", "ownership", "source"}
+LABEL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+UUID_PATTERN = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
+)
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+ABSENT_SERVICE_DIAGNOSTICS = (
+    "could not find service",
+    "could not find specified service",
+    "service could not be found",
+    "no such process",
+)
+
+
+class SyncError(Exception):
+    """An unsafe policy, local state, or launchd operation."""
+
+
+def unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise SyncError(f"duplicate JSON field: {key}")
+        result[key] = value
+    return result
+
+
+def read_json(path: Path, description: str) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_json_object)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SyncError(f"cannot read {description} {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise SyncError(f"{description} must be a JSON object")
+    return value
+
+
+def require_uuid(value: object, description: str) -> str:
+    if not isinstance(value, str) or UUID_PATTERN.fullmatch(value) is None:
+        raise SyncError(f"{description} must be a canonical hardware UUID")
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError as error:
+        raise SyncError(f"{description} is not a valid hardware UUID") from error
+    return str(parsed).upper()
+
+
+def validate_label(value: object, description: str) -> str:
+    if not isinstance(value, str) or LABEL_PATTERN.fullmatch(value) is None:
+        raise SyncError(f"{description} is not a safe launchd label")
+    return value
+
+
+def validate_policy(policy: dict[str, object]) -> tuple[str, list[dict[str, object]]]:
+    unknown = set(policy) - POLICY_FIELDS
+    if unknown:
+        raise SyncError(f"unknown placement policy fields: {', '.join(sorted(unknown))}")
+    missing = POLICY_FIELDS - set(policy)
+    if missing:
+        raise SyncError(f"missing placement policy fields: {', '.join(sorted(missing))}")
+    if type(policy["schema_version"]) is not int or policy["schema_version"] != SCHEMA_VERSION:
+        raise SyncError("unsupported placement policy schema_version")
+    primary_uuid = require_uuid(policy["primary_machine_id"], "primary_machine_id")
+    default_placement = policy["default_placement"]
+    if not isinstance(default_placement, str) or default_placement not in PLACEMENTS:
+        raise SyncError("invalid default_placement")
+    raw_jobs = policy["jobs"]
+    if not isinstance(raw_jobs, list):
+        raise SyncError("placement policy jobs must be an array")
+
+    jobs: list[dict[str, object]] = []
+    labels: set[str] = set()
+    for index, raw_job in enumerate(raw_jobs):
+        if not isinstance(raw_job, dict):
+            raise SyncError(f"job {index} must be an object")
+        unknown = set(raw_job) - JOB_FIELDS
+        if unknown:
+            raise SyncError(f"job {index} has unknown fields: {', '.join(sorted(unknown))}")
+        if "label" not in raw_job or "ownership" not in raw_job:
+            raise SyncError(f"job {index} requires label and ownership")
+        label = validate_label(raw_job["label"], f"job {index} label")
+        if label in labels:
+            raise SyncError(f"duplicate launchd label: {label}")
+        labels.add(label)
+        placement = raw_job.get("placement", default_placement)
+        if not isinstance(placement, str) or placement not in PLACEMENTS:
+            raise SyncError(f"invalid placement for {label}")
+        ownership = raw_job["ownership"]
+        if not isinstance(ownership, str) or ownership not in OWNERSHIPS:
+            raise SyncError(f"invalid ownership for {label}")
+        if ownership == "existing_chezmoi":
+            if "source" in raw_job:
+                raise SyncError(f"existing chezmoi job {label} cannot have an installer source")
+        else:
+            source = raw_job.get("source")
+            if not isinstance(source, str) or source != f"{label}.plist":
+                raise SyncError(f"unsafe or unexpected source basename for {label}")
+        jobs.append({**raw_job, "placement": placement})
+    return primary_uuid, jobs
+
+
+def hardware_uuid() -> str:
+    executable = "/usr/sbin/ioreg" if Path("/usr/sbin/ioreg").is_file() else "ioreg"
+    try:
+        result = subprocess.run(
+            [executable, "-rd1", "-c", "IOPlatformExpertDevice"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise SyncError(f"cannot determine macOS hardware UUID: {error}") from error
+    if result.returncode != 0:
+        raise SyncError(f"cannot determine macOS hardware UUID: {result.stderr.strip()}")
+    match = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', result.stdout)
+    if match is None:
+        raise SyncError("cannot determine macOS hardware UUID: IOPlatformUUID is unavailable")
+    return require_uuid(match.group(1), "IOPlatformUUID")
+
+
+def plist_contents(path: Path, expected_label: str) -> dict[str, object]:
+    try:
+        with path.open("rb") as stream:
+            value = plistlib.load(stream)
+    except (OSError, ValueError, plistlib.InvalidFileException) as error:
+        raise SyncError(f"cannot parse LaunchAgent plist {path}: {error}") from error
+    if not isinstance(value, dict) or value.get("Label") != expected_label:
+        raise SyncError(f"LaunchAgent plist label does not match {expected_label}: {path}")
+    return value
+
+
+def run_checked(command: list[str], description: str) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+    except OSError as error:
+        raise SyncError(f"{description} failed: {error}") from error
+    if result.returncode:
+        diagnostic = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+        raise SyncError(f"{description} failed: {diagnostic}")
+    return result
+
+
+def stage_job(job: dict[str, object], configuration_root: Path, plutil: str) -> dict[str, object]:
+    label = str(job["label"])
+    path = configuration_root / str(job["source"])
+    if path.is_symlink() or not path.is_file():
+        raise SyncError(f"staged LaunchAgent source must be a nonsymlink regular file: {path}")
+    try:
+        resolved_root = configuration_root.resolve(strict=True)
+        resolved_path = path.resolve(strict=True)
+    except OSError as error:
+        raise SyncError(f"cannot resolve staged LaunchAgent source {path}: {error}") from error
+    if resolved_path.parent != resolved_root:
+        raise SyncError(f"staged LaunchAgent source escapes the gitsync directory: {path}")
+    contents = plist_contents(path, label)
+    run_checked([plutil, "-lint", str(path)], f"plutil validation for {label}")
+    return {"path": path, "contents": contents}
+
+
+def content_hash(path: Path) -> str:
+    try:
+        with path.open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+    except OSError as error:
+        raise SyncError(f"cannot hash LaunchAgent plist {path}: {error}") from error
+
+
+def load_manifest(path: Path, launchagents: Path) -> dict[str, dict[str, str]]:
+    if path.is_symlink():
+        raise SyncError(f"ownership manifest must not be a symlink: {path}")
+    if not path.exists():
+        return {}
+    if not path.is_file():
+        raise SyncError(f"ownership manifest must be a regular file: {path}")
+    manifest = read_json(path, "LaunchAgent ownership manifest")
+    if set(manifest) != {"schema_version", "jobs"}:
+        raise SyncError("LaunchAgent ownership manifest has unsupported fields")
+    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != SCHEMA_VERSION:
+        raise SyncError("unsupported LaunchAgent ownership manifest schema_version")
+    raw_jobs = manifest["jobs"]
+    if not isinstance(raw_jobs, dict):
+        raise SyncError("LaunchAgent ownership manifest jobs must be an object")
+
+    jobs: dict[str, dict[str, str]] = {}
+    for raw_label, raw_record in raw_jobs.items():
+        label = validate_label(raw_label, "owned LaunchAgent label")
+        if not isinstance(raw_record, dict) or set(raw_record) != {"path", "sha256"}:
+            raise SyncError(f"invalid ownership record for {label}")
+        destination = raw_record["path"]
+        digest = raw_record["sha256"]
+        expected = launchagents / f"{label}.plist"
+        if not isinstance(destination, str) or destination != str(expected):
+            raise SyncError(f"ownership destination is outside the exact LaunchAgent target: {label}")
+        if not isinstance(digest, str) or SHA256_PATTERN.fullmatch(digest) is None:
+            raise SyncError(f"invalid ownership content hash for {label}")
+        jobs[label] = {"path": destination, "sha256": digest}
+    return jobs
+
+
+def atomic_write(path: Path, contents: bytes, mode: int) -> None:
+    descriptor: int | None = None
+    temporary: str | None = None
+    try:
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            os.fchmod(stream.fileno(), mode)
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    except OSError as error:
+        raise SyncError(f"cannot atomically write {path}: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def save_manifest(path: Path, jobs: dict[str, dict[str, str]]) -> None:
+    directory = path.parent
+    if directory.is_symlink():
+        raise SyncError(f"ownership state directory must not be a symlink: {directory}")
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not directory.is_dir():
+            raise SyncError(f"ownership state path must be a directory: {directory}")
+        os.chmod(directory, 0o700)
+    except OSError as error:
+        raise SyncError(f"cannot prepare private ownership state {directory}: {error}") from error
+    serialized = json.dumps({"schema_version": SCHEMA_VERSION, "jobs": jobs}, indent=2, sort_keys=True)
+    atomic_write(path, f"{serialized}\n".encode("utf-8"), 0o600)
+
+
+def service_loaded(launchctl: str, domain: str, label: str) -> bool:
+    try:
+        result = subprocess.run(
+            [launchctl, "print", f"{domain}/{label}"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise SyncError(f"cannot inspect launchd service {label}: {error}") from error
+    if result.returncode == 0:
+        return True
+    diagnostic = f"{result.stderr}\n{result.stdout}".lower()
+    if any(message in diagnostic for message in ABSENT_SERVICE_DIAGNOSTICS):
+        return False
+    detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+    raise SyncError(f"cannot inspect launchd service {label}: {detail}")
+
+
+def verify_prerequisites(label: str, contents: dict[str, object]) -> None:
+    arguments = contents.get("ProgramArguments")
+    program = contents.get("Program")
+    if program is not None and not isinstance(program, str):
+        raise SyncError(f"LaunchAgent {label} has an invalid Program executable")
+    if arguments is not None and (
+        not isinstance(arguments, list)
+        or not arguments
+        or any(not isinstance(argument, str) for argument in arguments)
+    ):
+        raise SyncError(f"LaunchAgent {label} has invalid ProgramArguments")
+    if isinstance(program, str):
+        executable = Path(program)
+    elif isinstance(arguments, list):
+        executable = Path(arguments[0])
+    else:
+        raise SyncError(f"LaunchAgent {label} needs a Program or ProgramArguments executable")
+    if not executable.is_absolute() or not executable.is_file() or not os.access(executable, os.X_OK):
+        raise SyncError(f"LaunchAgent executable is unavailable for {label}: {executable}")
+    if "WorkingDirectory" in contents:
+        directory = contents["WorkingDirectory"]
+        if not isinstance(directory, str) or not Path(directory).is_absolute() or not Path(directory).is_dir():
+            raise SyncError(f"LaunchAgent working directory is unavailable for {label}: {directory}")
+
+
+def check_destination(path: Path, label: str, record: dict[str, str] | None) -> dict[str, object] | None:
+    if path.is_symlink():
+        raise SyncError(f"LaunchAgent destination must not be a symlink: {path}")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise SyncError(f"LaunchAgent destination must be a regular file: {path}")
+    contents = plist_contents(path, label)
+    if record is not None and content_hash(path) != record["sha256"]:
+        raise SyncError(f"installer-owned LaunchAgent changed outside launchd-sync: {path}")
+    return contents
+
+
+def preflight(
+    jobs: list[dict[str, object]],
+    stages: dict[str, dict[str, object]],
+    owned: dict[str, dict[str, str]],
+    launchagents: Path,
+    launchctl: str,
+    domain: str,
+    is_primary: bool,
+) -> list[dict[str, object]]:
+    installer_jobs = {str(job["label"]): job for job in jobs if job["ownership"] == "installer"}
+    plans: list[dict[str, object]] = []
+    for label in sorted(set(installer_jobs) | set(owned)):
+        job = installer_jobs.get(label)
+        record = owned.get(label)
+        target = launchagents / f"{label}.plist"
+        destination = check_destination(target, label, record)
+        loaded = service_loaded(launchctl, domain, label)
+        eligible = job is not None and (
+            job["placement"] == "all_machine" or (job["placement"] == "primary_only" and is_primary)
+        )
+
+        if not eligible:
+            if record is None:
+                if destination is not None or loaded:
+                    raise SyncError(f"unmanaged ineligible LaunchAgent requires explicit review: {label}")
+                continue
+            plans.append({"action": "remove", "label": label, "target": target, "loaded": loaded})
+            continue
+
+        stage = stages[label]
+        equivalent = destination is not None and destination == stage["contents"]
+        if record is None and destination is not None and not equivalent:
+            raise SyncError(f"unmanaged conflicting LaunchAgent requires reviewed adoption: {target}")
+        if record is None and destination is None and loaded:
+            raise SyncError(f"unmanaged loaded LaunchAgent requires reviewed adoption: {label}")
+        changed = destination is None or not equivalent
+        needs_bootstrap = not loaded or changed
+        if needs_bootstrap:
+            verify_prerequisites(label, stage["contents"])
+        if changed or needs_bootstrap or record is None:
+            plans.append(
+                {
+                    "action": "install",
+                    "label": label,
+                    "target": target,
+                    "stage": stage["path"],
+                    "changed": changed,
+                    "loaded": loaded,
+                    "bootstrap": needs_bootstrap,
+                }
+            )
+    return plans
+
+
+def bootout(launchctl: str, domain: str, label: str) -> None:
+    try:
+        result = subprocess.run(
+            [launchctl, "bootout", f"{domain}/{label}"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise SyncError(f"launchctl bootout for {label} failed: {error}") from error
+    if result.returncode and not any(
+        message in f"{result.stderr}\n{result.stdout}".lower() for message in ABSENT_SERVICE_DIAGNOSTICS
+    ):
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+        raise SyncError(f"launchctl bootout for {label} failed: {detail}")
+
+
+def apply_plans(
+    plans: list[dict[str, object]],
+    owned: dict[str, dict[str, str]],
+    manifest_path: Path,
+    launchagents: Path,
+    launchctl: str,
+    domain: str,
+) -> None:
+    for plan in plans:
+        label = str(plan["label"])
+        target = plan["target"]
+        assert isinstance(target, Path)
+        if plan["action"] == "remove":
+            if plan["loaded"]:
+                bootout(launchctl, domain, label)
+            if target.exists():
+                try:
+                    target.unlink()
+                except OSError as error:
+                    raise SyncError(f"cannot remove owned LaunchAgent {target}: {error}") from error
+            owned.pop(label)
+            save_manifest(manifest_path, owned)
+            continue
+
+        stage = plan["stage"]
+        assert isinstance(stage, Path)
+        if plan["changed"]:
+            if plan["loaded"]:
+                bootout(launchctl, domain, label)
+            try:
+                launchagents.mkdir(mode=0o700, parents=True, exist_ok=True)
+                contents = stage.read_bytes()
+                mode = stat.S_IMODE(stage.stat().st_mode)
+            except OSError as error:
+                raise SyncError(f"cannot install LaunchAgent {label}: {error}") from error
+            atomic_write(target, contents, mode)
+
+        current = {"path": str(target), "sha256": content_hash(target)}
+        if owned.get(label) != current:
+            owned[label] = current
+            save_manifest(manifest_path, owned)
+        if plan["bootstrap"]:
+            run_checked([launchctl, "bootstrap", domain, str(target)], f"launchctl bootstrap for {label}")
+
+
+def main() -> int:
+    if platform.system() != "Darwin":
+        return 0
+
+    home_value = os.environ.get("HOME")
+    if not home_value:
+        raise SyncError("HOME is required to locate launchd placement configuration")
+    home = Path(home_value)
+    if not home.is_absolute():
+        raise SyncError("HOME must be an absolute path")
+    configuration = home / ".config" / "gitsync"
+    launchagents = home / "Library" / "LaunchAgents"
+    if launchagents.is_symlink():
+        raise SyncError(f"LaunchAgents directory must not be a symlink: {launchagents}")
+    state_root = home / ".local" / "state" / "kevinlin-agents" / "chezmoi-post-sync"
+    if state_root.is_symlink():
+        raise SyncError(f"ownership state directory must not be a symlink: {state_root}")
+    manifest_path = state_root / "launchagents-owned.json"
+    launchctl = "launchctl"
+    plutil = "plutil"
+
+    policy = read_json(configuration / "launchd-jobs.json", "launchd placement policy")
+    primary_uuid, jobs = validate_policy(policy)
+    actual_uuid = hardware_uuid()
+    owned = load_manifest(manifest_path, launchagents)
+    observed = {str(job["label"]) for job in jobs if job["ownership"] == "existing_chezmoi"}
+    reassigned = observed & set(owned)
+    if reassigned:
+        raise SyncError(
+            "existing chezmoi LaunchAgents cannot appear in installer ownership: "
+            + ", ".join(sorted(reassigned))
+        )
+    domain = f"gui/{os.getuid()}"
+    stages = {
+        str(job["label"]): stage_job(job, configuration, plutil)
+        for job in jobs
+        if job["ownership"] == "installer"
+    }
+    plans = preflight(jobs, stages, owned, launchagents, launchctl, domain, actual_uuid == primary_uuid)
+    apply_plans(plans, owned, manifest_path, launchagents, launchctl, domain)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SyncError as error:
+        print(f"launchd-sync: {error}", file=sys.stderr)
+        sys.exit(1)

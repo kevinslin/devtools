@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""Apply the agents chezmoi source without overwriting machine-local edits."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Conflict:
+    target: str
+    reason: str
+    local: bytes | None
+    baseline: bytes | None
+    incoming: bytes | None
+    backup: Path | None
+
+
+class ReconcileError(Exception):
+    """A source or destination cannot be reconciled safely."""
+
+
+class Reconciler:
+    def __init__(self) -> None:
+        self.repository = Path(
+            os.environ.get("GITSYNC_REPO_PATH", Path.home() / "agents")
+        ).expanduser().resolve()
+        self.destination = Path(
+            os.environ.get("CHEZMOI_POST_SYNC_DESTINATION", Path.home())
+        ).expanduser().resolve()
+        state_root = Path(
+            os.environ.get(
+                "CHEZMOI_POST_SYNC_STATE_DIR",
+                Path.home() / ".local" / "state" / "kevinlin-agents" / "chezmoi-post-sync",
+            )
+        ).expanduser()
+        self.state_root = state_root.resolve()
+        self.pending_path = self.state_root / "pending.json"
+        self.last_reconciled_path = self.state_root / "last-reconciled.json"
+        self.notifier = Path(
+            os.environ.get(
+                "CHEZMOI_POST_SYNC_NOTIFIER",
+                Path.home() / ".codex" / "skills" / "slack-notify" / "scripts" / "slack-notify",
+            )
+        ).expanduser()
+        self.environment = os.environ.copy()
+        self._prepare_path()
+        self.chezmoi = self._resolve_binary(
+            "chezmoi", ("/opt/homebrew/bin/chezmoi", "/usr/local/bin/chezmoi")
+        )
+        self.git = self._resolve_binary("git", ("/usr/bin/git",))
+        self.persistent_state = os.environ.get("CHEZMOI_POST_SYNC_PERSISTENT_STATE")
+        self.new_head = ""
+        self.backup_directory: Path | None = None
+
+    def _prepare_path(self) -> None:
+        existing = self.environment.get("PATH", "")
+        entries = existing.split(os.pathsep) if existing else []
+        candidates = (
+            self.repository / "tools" / "devtools" / "bin",
+            Path.home() / "code" / "devtools" / "bin",
+            Path("/opt/homebrew/bin"),
+            Path("/usr/local/bin"),
+            Path("/usr/bin"),
+            Path("/bin"),
+        )
+        for candidate in candidates:
+            value = str(candidate)
+            if candidate.is_dir() and value not in entries:
+                entries.append(value)
+        # Append instead of prepend so gitsync's pull-only Git guard remains first.
+        self.environment["PATH"] = os.pathsep.join(entries)
+
+    def _resolve_binary(self, name: str, fallbacks: tuple[str, ...]) -> str:
+        resolved = shutil.which(name, path=self.environment["PATH"])
+        if resolved:
+            return resolved
+        for fallback in fallbacks:
+            if os.access(fallback, os.X_OK):
+                return fallback
+        raise ReconcileError(f"required executable is unavailable: {name}")
+
+    def _run(self, arguments: list[str], *, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+        try:
+            result = subprocess.run(
+                arguments,
+                cwd=self.repository,
+                env=self.environment,
+                capture_output=True,
+                check=False,
+            )
+        except OSError as error:
+            raise ReconcileError(f"could not execute {arguments[0]}: {error}") from error
+        if check and result.returncode:
+            message = result.stderr.decode(errors="replace").strip()
+            raise ReconcileError(f"{Path(arguments[0]).name} failed: {message}")
+        return result
+
+    def _chezmoi_arguments(self, source: Path) -> list[str]:
+        arguments = [
+            self.chezmoi,
+            "--source",
+            str(source),
+            "--destination",
+            str(self.destination),
+            "--no-tty",
+        ]
+        if self.persistent_state:
+            arguments.extend(("--persistent-state", self.persistent_state))
+        return arguments
+
+    def _managed(self, source: Path, entry_types: str) -> set[str]:
+        result = self._run(
+            self._chezmoi_arguments(source)
+            + ["managed", f"--include={entry_types}", "--path-style=relative", "--nul-path-separator"]
+        )
+        paths: set[str] = set()
+        for raw_path in result.stdout.split(b"\0"):
+            if not raw_path:
+                continue
+            path = os.fsdecode(raw_path)
+            relative = Path(path)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ReconcileError(f"chezmoi reported an unsafe target path: {path}")
+            paths.add(path)
+        return paths
+
+    def _contents(self, source: Path, target: str) -> bytes:
+        result = self._run(self._chezmoi_arguments(source) + ["cat", str(self.destination / target)])
+        return result.stdout
+
+    def _state_directory(self) -> None:
+        self.state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.state_root.chmod(0o700)
+
+    def _load_last_reconciled(self) -> str | None:
+        if not self.last_reconciled_path.exists():
+            return None
+        try:
+            payload = json.loads(self.last_reconciled_path.read_text())
+            if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+                raise ValueError("last reconciled state has an unsupported schema")
+            head = payload.get("head")
+            if not isinstance(head, str) or not head:
+                raise ValueError("last reconciled state has no associated Git head")
+        except (OSError, json.JSONDecodeError, ValueError, TypeError) as error:
+            raise ReconcileError(f"could not read last reconciled state: {error}") from error
+        return self._head(head)
+
+    def _save_last_reconciled(self) -> None:
+        self._state_directory()
+        payload = {"head": self.new_head, "schema_version": 1}
+        self._atomic_write(
+            self.last_reconciled_path,
+            (json.dumps(payload, sort_keys=True) + "\n").encode(),
+            0o600,
+        )
+
+    def _load_pending(self) -> dict[str, bytes | None]:
+        if not self.pending_path.exists():
+            return {}
+        try:
+            payload = json.loads(self.pending_path.read_text())
+            if not isinstance(payload.get("head"), str):
+                raise ValueError("pending state has no associated Git head")
+            # A second upstream update must not discard the original common
+            # ancestor of a conflict that the previous update left unresolved.
+            return {
+                target: None if encoded is None else base64.b64decode(encoded, validate=True)
+                for target, encoded in payload["baselines"].items()
+            }
+        except (OSError, KeyError, ValueError, TypeError) as error:
+            raise ReconcileError(f"could not read pending reconciliation state: {error}") from error
+
+    def _save_pending(self, conflicts: list[Conflict]) -> None:
+        self._state_directory()
+        payload = {
+            "head": self.new_head,
+            "baselines": {
+                conflict.target: (
+                    None
+                    if conflict.baseline is None
+                    else base64.b64encode(conflict.baseline).decode("ascii")
+                )
+                for conflict in conflicts
+            },
+        }
+        self._atomic_write(self.pending_path, (json.dumps(payload, sort_keys=True) + "\n").encode(), 0o600)
+
+    def _backup(self, target: str, destination: Path) -> Path | None:
+        if not destination.exists() and not destination.is_symlink():
+            return None
+        if not destination.is_symlink() and not destination.is_file():
+            return None
+        if self.backup_directory is None:
+            self._state_directory()
+            backup_root = self.state_root / "backups"
+            backup_root.mkdir(mode=0o700, exist_ok=True)
+            backup_root.chmod(0o700)
+            self.backup_directory = Path(
+                tempfile.mkdtemp(prefix=f"{time.strftime('%Y%m%d-%H%M%S')}-", dir=backup_root)
+            )
+        backup = self.backup_directory / target
+        backup.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        parent = backup.parent
+        while parent != self.backup_directory:
+            parent.chmod(0o700)
+            parent = parent.parent
+        if destination.is_symlink():
+            os.symlink(os.readlink(destination), backup)
+        else:
+            shutil.copy2(destination, backup)
+        return backup
+
+    def _atomic_write(self, destination: Path, content: bytes, mode: int) -> None:
+        destination.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, stat.S_IMODE(mode))
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def _merge(self, target: str, local: bytes, baseline: bytes, incoming: bytes) -> bytes | None:
+        if b"\0" in local or b"\0" in baseline or b"\0" in incoming:
+            return None
+        with tempfile.TemporaryDirectory(prefix="chezmoi-merge-") as temporary:
+            root = Path(temporary)
+            local_path = root / "local"
+            base_path = root / "baseline"
+            incoming_path = root / "incoming"
+            local_path.write_bytes(local)
+            base_path.write_bytes(baseline)
+            incoming_path.write_bytes(incoming)
+            result = self._run(
+                [
+                    self.git,
+                    "merge-file",
+                    "--stdout",
+                    "-L",
+                    f"local:{target}",
+                    "-L",
+                    f"baseline:{target}",
+                    "-L",
+                    f"incoming:{target}",
+                    str(local_path),
+                    str(base_path),
+                    str(incoming_path),
+                ],
+                check=False,
+            )
+            if result.returncode == 0:
+                return result.stdout
+            if result.returncode < 0 or result.returncode > 127:
+                raise ReconcileError("git merge-file could not complete")
+            return None
+
+    def _notify(self, conflicts: list[Conflict], extra: str = "") -> None:
+        digest = hashlib.sha256(self.new_head.encode())
+        for conflict in sorted(conflicts, key=lambda value: value.target):
+            digest.update(conflict.target.encode())
+            digest.update(hashlib.sha256(conflict.local or b"").digest())
+            digest.update(hashlib.sha256(conflict.incoming or b"").digest())
+        digest.update(extra.encode())
+        fingerprint = digest.hexdigest()
+        self._state_directory()
+        notifications = self.state_root / "notifications"
+        notifications.mkdir(mode=0o700, exist_ok=True)
+        marker = notifications / fingerprint
+        if marker.exists():
+            return
+        paths = ", ".join(conflict.target for conflict in conflicts) or "repository source"
+        backup = str(self.backup_directory) if self.backup_directory else "none created"
+        detail = f" Error: {extra}." if extra else ""
+        message = (
+            f"Kevin: chezmoi post-sync needs help on {socket.gethostname()} "
+            f"for {self.repository}; targets: {paths}; backup: {backup}.{detail}"
+        )
+        result = self._run([str(self.notifier), message], check=False)
+        if result.returncode:
+            error = result.stderr.decode(errors="replace").strip()
+            print(f"Slack notification failed: {error}", file=sys.stderr)
+            return
+        marker.touch(mode=0o600)
+
+    def _head(self, value: str) -> str:
+        return self._run([self.git, "rev-parse", "--verify", f"{value}^{{commit}}"]).stdout.decode().strip()
+
+    def _old_source(self, revision: str, archive_root: Path) -> Path:
+        archive = subprocess.Popen(
+            [self.git, "archive", revision],
+            cwd=self.repository,
+            env=self.environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert archive.stdout is not None
+        try:
+            with tarfile.open(fileobj=archive.stdout, mode="r|") as stream:
+                if sys.version_info >= (3, 12):
+                    stream.extractall(archive_root, filter="data")
+                else:
+                    # Git itself supplies the archive, and older macOS system
+                    # Pythons do not support tarfile's data-filter argument.
+                    stream.extractall(archive_root)
+        except (OSError, tarfile.TarError) as error:
+            archive.kill()
+            archive.wait()
+            raise ReconcileError(f"could not extract previous Git source: {error}") from error
+        _, stderr = archive.communicate()
+        if archive.returncode:
+            raise ReconcileError(
+                f"could not archive previous Git source: {stderr.decode(errors='replace').strip()}"
+            )
+        return archive_root
+
+    def _apply(self, target: str) -> None:
+        self._run(
+            self._chezmoi_arguments(self.repository)
+            + ["--force", "apply", "--parent-dirs", str(self.destination / target)]
+        )
+
+    def run(self) -> int:
+        current_head = self._head("HEAD")
+        self.new_head = self._head(os.environ.get("GITSYNC_NEW_HEAD", current_head))
+        if self.new_head != current_head:
+            raise ReconcileError("gitsync new head does not match the checked-out repository")
+        previous_head = self._head(os.environ.get("GITSYNC_OLD_HEAD", self.new_head))
+        last_reconciled = self._load_last_reconciled()
+        if last_reconciled is not None:
+            ancestry = self._run(
+                [self.git, "merge-base", "--is-ancestor", last_reconciled, self.new_head],
+                check=False,
+            )
+            if ancestry.returncode == 1:
+                raise ReconcileError(
+                    "last reconciled Git head is not an ancestor of the current Git head; "
+                    "refusing unsafe reconciliation"
+                )
+            if ancestry.returncode:
+                error = ancestry.stderr.decode(errors="replace").strip()
+                raise ReconcileError(f"could not verify last reconciled Git ancestry: {error}")
+            previous_head = last_reconciled
+        pending = self._load_pending()
+        with tempfile.TemporaryDirectory(prefix="chezmoi-prior-source-") as temporary:
+            previous_source = self._old_source(previous_head, Path(temporary))
+            current_symlinks = self._managed(self.repository, "symlinks")
+            previous_symlinks = self._managed(previous_source, "symlinks")
+            unsupported = current_symlinks | previous_symlinks
+            if unsupported:
+                conflicts = [Conflict(target, "managed symlinks are unsupported", None, None, None, None)
+                             for target in sorted(unsupported)]
+                self._save_pending(conflicts)
+                self._notify(conflicts)
+                print("Unsupported managed symlinks require manual reconciliation", file=sys.stderr)
+                return 1
+
+            current_targets = self._managed(self.repository, "files")
+            previous_targets = self._managed(previous_source, "files")
+            conflicts: list[Conflict] = []
+            applications: list[str] = []
+            merges: list[tuple[Path, bytes, int]] = []
+
+            for target in sorted(current_targets):
+                destination = self.destination / target
+                incoming = self._contents(self.repository, target)
+                if target in pending:
+                    baseline = pending[target]
+                elif target in previous_targets:
+                    baseline = self._contents(previous_source, target)
+                else:
+                    baseline = None
+
+                if destination.is_symlink():
+                    backup = self._backup(target, destination)
+                    conflicts.append(
+                        Conflict(target, "unsupported destination symlink", None, baseline, incoming, backup)
+                    )
+                    continue
+                if destination.exists() and not destination.is_file():
+                    reason = (
+                        "unsupported destination directory; recursive backup refused"
+                        if destination.is_dir()
+                        else "unsupported destination shape; non-file backup refused"
+                    )
+                    conflicts.append(
+                        Conflict(target, reason, None, baseline, incoming, None)
+                    )
+                    continue
+
+                if not destination.exists():
+                    # Fresh clones and no-op syncs still bootstrap missing managed files.
+                    if baseline is not None and baseline != incoming and previous_head != self.new_head:
+                        conflicts.append(
+                            Conflict(target, "local deletion conflicts with incoming edit", None, baseline, incoming, None)
+                        )
+                    else:
+                        applications.append(target)
+                    continue
+
+                local = destination.read_bytes()
+                if local == incoming:
+                    continue
+                if baseline is None:
+                    backup = self._backup(target, destination)
+                    conflicts.append(
+                        Conflict(target, "existing destination has no safe merge baseline", local, None, incoming, backup)
+                    )
+                    continue
+                if baseline == incoming:
+                    # The source has not changed: keep machine-local customization.
+                    continue
+                if local == baseline:
+                    applications.append(target)
+                    continue
+
+                backup = self._backup(target, destination)
+                merged = self._merge(target, local, baseline, incoming)
+                if merged is None:
+                    conflicts.append(Conflict(target, "overlapping or binary edits", local, baseline, incoming, backup))
+                    continue
+                merges.append((destination, merged, destination.stat().st_mode))
+
+            # A target removed from the source is no longer managed. Leave its
+            # destination untouched, including any machine-local customization.
+            for target in applications:
+                self._apply(target)
+            for destination, merged, mode in merges:
+                self._atomic_write(destination, merged, mode)
+
+            if conflicts:
+                self._save_pending(conflicts)
+                self._notify(conflicts)
+                for conflict in conflicts:
+                    print(f"{conflict.target}: {conflict.reason}", file=sys.stderr)
+                return 1
+
+            if self.pending_path.exists():
+                self.pending_path.unlink()
+            self._save_last_reconciled()
+            return 0
+
+
+def main() -> int:
+    reconciler: Reconciler | None = None
+    try:
+        reconciler = Reconciler()
+        return reconciler.run()
+    except (OSError, ReconcileError) as error:
+        print(f"chezmoi post-sync failed: {error}", file=sys.stderr)
+        if reconciler is not None:
+            try:
+                reconciler._notify([], str(error))
+            except (OSError, ReconcileError) as notification_error:
+                print(f"Slack notification failed: {notification_error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
