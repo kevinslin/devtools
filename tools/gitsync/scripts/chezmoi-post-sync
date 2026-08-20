@@ -305,8 +305,17 @@ class Reconciler:
         return self._run([self.git, "rev-parse", "--verify", f"{value}^{{commit}}"]).stdout.decode().strip()
 
     def _old_source(self, revision: str, archive_root: Path) -> Path:
+        root_result = self._run([self.git, "show", f"{revision}:.chezmoiroot"])
+        try:
+            configured_root = root_result.stdout.decode().strip()
+        except UnicodeDecodeError as error:
+            raise ReconcileError("previous chezmoi source root is not valid UTF-8") from error
+        source_root = Path(configured_root)
+        if not configured_root or source_root.is_absolute() or ".." in source_root.parts:
+            raise ReconcileError(f"previous chezmoi source root is unsafe: {configured_root!r}")
+
         archive = subprocess.Popen(
-            [self.git, "archive", revision],
+            [self.git, "archive", revision, "--", ".chezmoiroot", str(source_root)],
             cwd=self.repository,
             env=self.environment,
             stdout=subprocess.PIPE,
