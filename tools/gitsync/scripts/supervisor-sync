@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Reconcile only the existing supervised gitsync program after config changes."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+
+PROGRAM = "kevinlin-gitsync"
+DEFERRED_ARGUMENT = "--deferred-update"
+
+
+class SupervisorSyncError(Exception):
+    """A supervisor configuration or narrowly scoped reconciliation failure."""
+
+
+def supervisor_command() -> list[str]:
+    config = Path.home() / ".config" / "supervisor" / "supervisord.conf"
+    if not config.is_file():
+        raise SupervisorSyncError(f"supervisor configuration does not exist: {config}")
+
+    executable = shutil.which("supervisorctl")
+    if executable is None:
+        raise SupervisorSyncError("supervisorctl is not available on PATH")
+    return [executable, "-c", str(config)]
+
+
+def run_supervisor(command: list[str], operation: str) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except OSError as error:
+        raise SupervisorSyncError(f"supervisor {operation} failed: {error}") from error
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+        raise SupervisorSyncError(f"supervisor {operation} failed: {detail}")
+    return result
+
+
+def private_log():
+    configured_state = os.environ.get("XDG_STATE_HOME")
+    state = Path(configured_state).expanduser() if configured_state else Path.home() / ".local" / "state"
+    directory = state / "gitsync"
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(directory / "supervisor-sync.log", flags, 0o600)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+                raise SupervisorSyncError("supervisor update log must be an owned regular file")
+            if stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise SupervisorSyncError("supervisor update log must not be accessible to other users")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return os.fdopen(descriptor, "a", encoding="utf-8")
+    except OSError as error:
+        raise SupervisorSyncError(f"cannot open private supervisor update log: {error}") from error
+
+
+def defer_update() -> None:
+    command = [sys.executable, str(Path(__file__).resolve()), DEFERRED_ARGUMENT, str(os.getpid())]
+    try:
+        with private_log() as log:
+            subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                close_fds=True,
+                start_new_session=True,
+            )
+    except OSError as error:
+        raise SupervisorSyncError(f"cannot start detached supervisor update: {error}") from error
+
+
+def wait_for_hook(pid: int) -> None:
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        except OSError as error:
+            raise SupervisorSyncError(f"cannot inspect initiating hook process {pid}: {error}") from error
+        if time.monotonic() >= deadline:
+            raise SupervisorSyncError(f"initiating hook process {pid} did not exit")
+        time.sleep(0.05)
+
+
+def deferred_update(pid_argument: str) -> None:
+    try:
+        pid = int(pid_argument)
+    except ValueError as error:
+        raise SupervisorSyncError("invalid initiating hook process identifier") from error
+    if pid <= 0:
+        raise SupervisorSyncError("invalid initiating hook process identifier")
+
+    wait_for_hook(pid)
+    run_supervisor([*supervisor_command(), "update", PROGRAM], f"targeted update of {PROGRAM}")
+    print(f"supervisor-sync: updated {PROGRAM}", flush=True)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) == 2 and argv[0] == DEFERRED_ARGUMENT:
+        deferred_update(argv[1])
+        return 0
+    if argv:
+        raise SupervisorSyncError("supervisor-sync does not accept arguments")
+    if sys.platform != "linux":
+        return 0
+
+    result = run_supervisor([*supervisor_command(), "reread"], "configuration reread")
+    changed = re.compile(rf"^\s*{re.escape(PROGRAM)}:\s+changed\s*$")
+    if not any(changed.fullmatch(line) for line in result.stdout.splitlines()):
+        return 0
+
+    defer_update()
+    print(f"supervisor-sync: queued targeted update for {PROGRAM}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except SupervisorSyncError as error:
+        print(f"supervisor-sync failed: {error}", file=sys.stderr, flush=True)
+        raise SystemExit(1) from error

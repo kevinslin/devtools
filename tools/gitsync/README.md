@@ -282,96 +282,50 @@ finishes; do not unload the running service from its own hook. Never perform a
 bare or repository-wide `chezmoi apply`, replace unrelated LaunchAgents, or
 register a second gitsync label while the previous scheduler remains active.
 
-### Supervised foreground daemon on a Linux DevBox
+### Supervised foreground daemon on Linux
 
-On a Linux DevBox, the existing user-owned supervisord can run the
-`kevinlin-gitsync` program alongside unrelated application programs. Its
-supervisor configuration is
-`/home/dev-user/.config/supervisor/supervisord.conf`, and the existing gitsync
-program drop-in is
-`/home/dev-user/.config/supervisor/conf.d/kevinlin-gitsync.conf`. Systemd and
-cron are unnecessary; restarting or replacing supervisord can lose the
-private Git authorization already present in its process environment.
-
-The DevBox uses its own `~/.config/gitsync/devbox.json` profile. Do not replace
-it with the shared `agcron.json`: that profile contains laptop paths that do
-not exist on the DevBox. The Linux-only chezmoi source files are:
-
-- `~/agents/config/dot_config/private_gitsync/private_devbox.json.tmpl` for
-  `~/.config/gitsync/devbox.json`.
-- `~/agents/config/dot_config/private_supervisor/private_conf.d/private_kevinlin-gitsync.conf.tmpl`
-  for `~/.config/supervisor/conf.d/kevinlin-gitsync.conf`.
-
-The DevBox profile preserves the existing pull-only `agents`, `skills-local`,
-and `skills-public` entries and adds the existing `~/code/devtools` checkout as
-a pull-only `devtools` entry. The skills use their existing checkout paths and
-retain their existing post-sync hooks. The `agents` hook performs a
-targeted chezmoi apply of `agcron.json`, `devbox.json`, and the supervisor
-drop-in only; it never restarts the supervisor or its own gitsync process.
-Review and activate changed supervisor directives separately.
-
-First update the DevBox's existing devtools checkout from its public
-`https://github.com/kevinslin/devtools.git` remote and ensure that the
-installed `gitsync` executable resolves the updated version. Before changing
-the existing supervisor program, confirm that the executable supports the
-`daemon` subcommand, preview the two Linux-managed targets, and apply only
-those files:
+An existing user-owned supervisord can run the foreground daemon without
+systemd or cron. Configure its existing gitsync program to execute:
 
 ```bash
-"$HOME/.local/bin/gitsync" daemon --help
-"$HOME/.local/bin/chezmoi" --source "$HOME/agents" diff \
-  "$HOME/.config/gitsync/devbox.json" \
-  "$HOME/.config/supervisor/conf.d/kevinlin-gitsync.conf"
-"$HOME/.local/bin/chezmoi" --source "$HOME/agents" apply --parent-dirs \
-  "$HOME/.config/gitsync/devbox.json" \
-  "$HOME/.config/supervisor/conf.d/kevinlin-gitsync.conf"
-"$HOME/.local/bin/gitsync" \
-  --config "$HOME/.config/gitsync/devbox.json" validate
+"$HOME/.local/bin/gitsync" daemon \
+  --config "$HOME/.config/gitsync/profile.json" --interval 15
 ```
 
-On this DevBox, `$HOME` is `/home/dev-user`. Stop without changing the existing
-supervisor program if `daemon --help` or profile validation fails. A valid
-configuration only confirms its schema; inspect the configured checkouts and
-observed synchronization results separately.
+Preserve the existing program name, environment, working directory, restart
+policy, stop settings, log destinations, and unrelated supervisor programs.
+Validate the selected profile before activating it; machine-specific profiles
+must keep the appropriate repository paths, schedules, modes, and hooks.
 
-The managed supervisor drop-in replaces the existing polling wrapper with the
-foreground daemon while preserving the existing program label and other
-directives:
+For automatic configuration updates, add two ordered post-sync hooks: first
+apply only the managed gitsync profiles and supervisor program configuration;
+then run `tools/gitsync/scripts/supervisor-sync`. The Linux-only helper rereads
+`$HOME/.config/supervisor/supervisord.conf` and inspects the exact managed
+program. Unchanged configuration and changes to unrelated programs are no-ops.
+When the managed program changes, a fully detached worker waits for the active
+hook to exit before updating that program alone. Deferring the update avoids
+terminating the running daemon from within its own hook, including when
+supervisord stops an entire process group.
 
-```ini
-[program:kevinlin-gitsync]
-command=/home/dev-user/.local/bin/gitsync daemon --config /home/dev-user/.config/gitsync/devbox.json --interval 15
-; Keep every other existing program directive unchanged.
-```
+The existing supervisord remains running, preserving its environment and
+unrelated programs. Reread failures fail the hook and follow normal gitsync
+retry behavior; deferred update failures are written to
+`$XDG_STATE_HOME/gitsync/supervisor-sync.log`, or
+`~/.local/state/gitsync/supervisor-sync.log` when `XDG_STATE_HOME` is unset.
+Never restart supervisord, update unrelated groups, replace the inherited
+environment, or perform a broad configuration-manager apply.
 
-Keep the existing socket at
-`/home/dev-user/.config/supervisor/supervisor.sock`, working directory
-`/home/dev-user/agents`, `HOME=/home/dev-user`, existing `PATH`, process
-environment, restart policy, stop settings, and sibling programs unchanged.
-Preserve the existing `/home/dev-user/.local/state/gitsync/supervisor.log` and
-`supervisor.err` log paths. Refresh only the existing gitsync program through
-the already-running supervisor:
+To inspect the existing service manually, substitute its current program name:
 
 ```bash
-supervisorctl -c "$HOME/.config/supervisor/supervisord.conf" reread
+SUPERVISOR_PROGRAM="<existing-gitsync-program>"
 supervisorctl -c "$HOME/.config/supervisor/supervisord.conf" \
-  update kevinlin-gitsync
-supervisorctl -c "$HOME/.config/supervisor/supervisord.conf" \
-  status kevinlin-gitsync
-tail -n 20 "$HOME/.local/state/gitsync/supervisor.log"
-tail -n 20 "$HOME/.local/state/gitsync/supervisor.err"
+  status "$SUPERVISOR_PROGRAM"
 ```
 
-Do not start another supervisord or gitsync program, restart the existing
-supervisor, disturb unrelated application programs, copy or print credentials,
-or overwrite inherited Git authorization. Direct SSH shells may
-not inherit the supervisor's private Git authorization, so a manual sync from
-such a shell does not establish what the supervised daemon can access. Verify
-that the existing program reports `RUNNING`, its command uses `devbox.json`,
-and its logs show successive scheduling cycles and successful repository
-synchronization. Machine-local edits and dirty repositories remain protected
-by gitsync's existing safety checks; report authentication, checkout, or hook
-failures without claiming the affected repository synchronized.
+Confirm the program reports `RUNNING` and its logs show successful scheduling
+cycles. Existing repository locks, dirty-worktree protections, pull-only
+behavior, scheduled claims, and post-sync hooks remain unchanged.
 
 ## Safety behavior
 
