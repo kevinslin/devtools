@@ -94,13 +94,48 @@ gitsync sync --all
 gitsync sync --force
 gitsync sync --name agents
 gitsync --config /path/to/agcron.json sync --all
+gitsync daemon --config /path/to/agcron.json --interval 15
+gitsync --config /path/to/agcron.json daemon --interval 15
 ```
 
-`--due` claims each matching repository once per local clock minute. `--all` and its manual-friendly alias `--force` ignore schedules and sync every configured repository. Here, “force” only forces an immediate run: it never overrides the configured mode or enables Git force-push, reset, discard, or safety-check bypasses. `--name` selects one configured repository. Results are JSON; exit `0` means all selected repositories synced, `1` means at least one repository was safely blocked, and `2` means the command or configuration was invalid.
+`--due` claims each matching repository once per local clock minute. `--all` and its manual-friendly alias `--force` ignore schedules and sync every configured repository. Here, “force” only forces an immediate run: it never overrides the configured mode or enables Git force-push, reset, discard, or safety-check bypasses. `--name` selects one configured repository. One-shot sync results are JSON; exit `0` means all selected repositories synced, `1` means at least one repository was safely blocked, and `2` means the command or configuration was invalid.
+
+## Foreground daemon
+
+`gitsync daemon` stays in the foreground so launchd, supervisord, or another
+existing process supervisor can own its lifecycle:
+
+```bash
+gitsync daemon --config "$HOME/.config/gitsync/agcron.json" --interval 15
+```
+
+The first cycle runs immediately; later cycles run after the requested interval,
+which defaults to 15 seconds and must be a positive, finite number. Each cycle
+reloads the configuration and performs the existing `sync --due` operation.
+The polling interval does not replace or bypass each repository's cron
+schedule: existing local-clock-minute claims prevent repeated synchronization
+during the same scheduled minute, and repository locks, pull-only protections,
+Git authorization inheritance, post-sync hooks, and structured daily run logs
+retain their normal behavior. Configuration changes take effect on a later
+cycle without restarting the supervisor or daemon.
+
+Per-cycle JSON sync results are written to stdout; lifecycle messages and
+errors go to stderr. A blocked repository or invalid configuration is reported
+without terminating the daemon, and the next cycle retries; fixing the
+configuration therefore restores synchronization without restarting the
+service. Unexpected process failures remain visible to the supervisor so its
+normal restart policy can apply. `SIGTERM` and `SIGINT` interrupt an idle wait
+promptly or allow an active sync cycle to finish, then exit successfully.
+
+Run only one scheduler for the same profile. On macOS, one persistent launchd
+job supervises the daemon while gitsync evaluates every repository's cron
+schedule itself. Claims and locks still protect repositories if schedulers
+temporarily overlap during migration, but concurrent schedulers are unnecessary.
 
 ## Daily run logs
 
-Every `gitsync sync` invocation appends one JSON record to:
+Every `gitsync sync` invocation, including each daemon polling cycle, appends
+one JSON record to:
 
 ```text
 /tmp/gitsync-YYYY-MM-DD.log
@@ -165,26 +200,178 @@ tests or an explicitly managed deployment.
 
 ## Scheduling with launchd
 
-No resident daemon is needed. Generate a macOS launch agent that wakes once a minute and lets `gitsync sync --due` evaluate each cron schedule:
+`gitsync launchd-plist` generates one persistent macOS LaunchAgent that starts
+the foreground daemon immediately and keeps it running. The daemon polls every
+15 seconds, reloads its configuration on each cycle, and evaluates each
+repository's existing cron schedule; launchd supervises the process rather than
+managing individual synchronization runs. Manual one-shot commands such as
+`gitsync sync --due`, `gitsync sync --all`, and `gitsync sync --name agents`
+remain supported.
+
+For an unmanaged LaunchAgent, generate and register the single
+`com.kevinlin.gitsync` label:
 
 ```bash
-mkdir -p ~/Library/LaunchAgents
-gitsync launchd-plist > ~/Library/LaunchAgents/com.kevinlin.gitsync.plist
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.kevinlin.gitsync.plist
-launchctl kickstart -k "gui/$(id -u)/com.kevinlin.gitsync"
+mkdir -p "$HOME/Library/LaunchAgents"
+gitsync launchd-plist > "$HOME/Library/LaunchAgents/com.kevinlin.gitsync.plist"
+plutil -lint "$HOME/Library/LaunchAgents/com.kevinlin.gitsync.plist"
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/com.kevinlin.gitsync.plist"
+launchctl print "gui/$(id -u)/com.kevinlin.gitsync"
 ```
 
-To replace an existing registration, boot it out first, regenerate the plist, and bootstrap it again:
+The generated plist uses the resolved executable and configuration paths,
+enables `RunAtLoad` and `KeepAlive`, and has no `StartInterval`:
 
-```bash
-launchctl bootout "gui/$(id -u)/com.kevinlin.gitsync"
+```xml
+<key>Label</key>
+<string>com.kevinlin.gitsync</string>
+<key>ProgramArguments</key>
+<array>
+  <string>/Users/kevinlin/.local/bin/gitsync</string>
+  <string>daemon</string>
+  <string>--config</string>
+  <string>/Users/kevinlin/.config/gitsync/agcron.json</string>
+  <string>--interval</string>
+  <string>15</string>
+</array>
+<key>RunAtLoad</key>
+<true/>
+<key>KeepAlive</key>
+<true/>
 ```
 
-The generated plist uses the resolved CLI and config paths. Launchd still
-captures raw stdout and stderr in `~/Library/Logs/com.kevinlin.gitsync.log`
-and `.error.log`; each scheduled sync also appends its structured result to
-`/tmp/gitsync-YYYY-MM-DD.log`. Scheduled runs keep claim and lock files under
+Existing `EnvironmentVariables`, the executable search path, Git authorization,
+`Background` process classification, and log destinations are preserved.
+Launchd captures daemon stdout and stderr in
+`~/Library/Logs/com.kevinlin.gitsync.log` and `.error.log`; each daemon cycle
+also appends its structured sync result to `/tmp/gitsync-YYYY-MM-DD.log`.
+Scheduled claims and repository locks remain under
 `$XDG_STATE_HOME/gitsync/`, defaulting to `~/.local/state/gitsync/`.
+
+### Migrating an existing managed macOS LaunchAgent
+
+When the existing LaunchAgent belongs to the `~/agents` chezmoi source, update
+its source-of-truth template at
+`~/agents/config/Library/LaunchAgents/com.kevinlin.gitsync.plist.tmpl` to match
+the daemon configuration above. Preserve the existing label,
+`EnvironmentVariables`, executable search path, log paths, and Git
+authorization. Review and apply only that specific destination, then replace
+the existing registration under the same label:
+
+```bash
+chezmoi --source "$HOME/agents" diff \
+  "$HOME/Library/LaunchAgents/com.kevinlin.gitsync.plist"
+chezmoi --source "$HOME/agents" apply --parent-dirs \
+  "$HOME/Library/LaunchAgents/com.kevinlin.gitsync.plist"
+plutil -lint "$HOME/Library/LaunchAgents/com.kevinlin.gitsync.plist"
+launchctl bootout "gui/$(id -u)/com.kevinlin.gitsync"
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/com.kevinlin.gitsync.plist"
+launchctl print "gui/$(id -u)/com.kevinlin.gitsync"
+```
+
+Verify that `launchctl print` reports the existing
+`com.kevinlin.gitsync` service running with one daemon process, that its
+arguments include `daemon --config` and `--interval 15`, and that no
+`StartInterval` remains. Inspect the launchd output and daily structured log to
+confirm successive daemon cycles and normal repository scheduling.
+
+Run migration from a separate shell after any active gitsync post-sync hook
+finishes; do not unload the running service from its own hook. Never perform a
+bare or repository-wide `chezmoi apply`, replace unrelated LaunchAgents, or
+register a second gitsync label while the previous scheduler remains active.
+
+### Supervised foreground daemon on a Linux DevBox
+
+On a Linux DevBox, the existing user-owned supervisord can run the
+`kevinlin-gitsync` program alongside unrelated application programs. Its
+supervisor configuration is
+`/home/dev-user/.config/supervisor/supervisord.conf`, and the existing gitsync
+program drop-in is
+`/home/dev-user/.config/supervisor/conf.d/kevinlin-gitsync.conf`. Systemd and
+cron are unnecessary; restarting or replacing supervisord can lose the
+private Git authorization already present in its process environment.
+
+The DevBox uses its own `~/.config/gitsync/devbox.json` profile. Do not replace
+it with the shared `agcron.json`: that profile contains laptop paths that do
+not exist on the DevBox. The Linux-only chezmoi source files are:
+
+- `~/agents/config/dot_config/private_gitsync/private_devbox.json.tmpl` for
+  `~/.config/gitsync/devbox.json`.
+- `~/agents/config/dot_config/private_supervisor/private_conf.d/private_kevinlin-gitsync.conf.tmpl`
+  for `~/.config/supervisor/conf.d/kevinlin-gitsync.conf`.
+
+The DevBox profile preserves the existing pull-only `agents`, `skills-local`,
+and `skills-public` entries and adds the existing `~/code/devtools` checkout as
+a pull-only `devtools` entry. The skills use their existing checkout paths and
+retain their existing post-sync hooks. The `agents` hook performs a
+targeted chezmoi apply of `agcron.json`, `devbox.json`, and the supervisor
+drop-in only; it never restarts the supervisor or its own gitsync process.
+Review and activate changed supervisor directives separately.
+
+First update the DevBox's existing devtools checkout from its public
+`https://github.com/kevinslin/devtools.git` remote and ensure that the
+installed `gitsync` executable resolves the updated version. Before changing
+the existing supervisor program, confirm that the executable supports the
+`daemon` subcommand, preview the two Linux-managed targets, and apply only
+those files:
+
+```bash
+"$HOME/.local/bin/gitsync" daemon --help
+"$HOME/.local/bin/chezmoi" --source "$HOME/agents" diff \
+  "$HOME/.config/gitsync/devbox.json" \
+  "$HOME/.config/supervisor/conf.d/kevinlin-gitsync.conf"
+"$HOME/.local/bin/chezmoi" --source "$HOME/agents" apply --parent-dirs \
+  "$HOME/.config/gitsync/devbox.json" \
+  "$HOME/.config/supervisor/conf.d/kevinlin-gitsync.conf"
+"$HOME/.local/bin/gitsync" \
+  --config "$HOME/.config/gitsync/devbox.json" validate
+```
+
+On this DevBox, `$HOME` is `/home/dev-user`. Stop without changing the existing
+supervisor program if `daemon --help` or profile validation fails. A valid
+configuration only confirms its schema; inspect the configured checkouts and
+observed synchronization results separately.
+
+The managed supervisor drop-in replaces the existing polling wrapper with the
+foreground daemon while preserving the existing program label and other
+directives:
+
+```ini
+[program:kevinlin-gitsync]
+command=/home/dev-user/.local/bin/gitsync daemon --config /home/dev-user/.config/gitsync/devbox.json --interval 15
+; Keep every other existing program directive unchanged.
+```
+
+Keep the existing socket at
+`/home/dev-user/.config/supervisor/supervisor.sock`, working directory
+`/home/dev-user/agents`, `HOME=/home/dev-user`, existing `PATH`, process
+environment, restart policy, stop settings, and sibling programs unchanged.
+Preserve the existing `/home/dev-user/.local/state/gitsync/supervisor.log` and
+`supervisor.err` log paths. Refresh only the existing gitsync program through
+the already-running supervisor:
+
+```bash
+supervisorctl -c "$HOME/.config/supervisor/supervisord.conf" reread
+supervisorctl -c "$HOME/.config/supervisor/supervisord.conf" \
+  update kevinlin-gitsync
+supervisorctl -c "$HOME/.config/supervisor/supervisord.conf" \
+  status kevinlin-gitsync
+tail -n 20 "$HOME/.local/state/gitsync/supervisor.log"
+tail -n 20 "$HOME/.local/state/gitsync/supervisor.err"
+```
+
+Do not start another supervisord or gitsync program, restart the existing
+supervisor, disturb unrelated application programs, copy or print credentials,
+or overwrite inherited Git authorization. Direct SSH shells may
+not inherit the supervisor's private Git authorization, so a manual sync from
+such a shell does not establish what the supervised daemon can access. Verify
+that the existing program reports `RUNNING`, its command uses `devbox.json`,
+and its logs show successive scheduling cycles and successful repository
+synchronization. Machine-local edits and dirty repositories remain protected
+by gitsync's existing safety checks; report authentication, checkout, or hook
+failures without claiming the affected repository synchronized.
 
 ## Safety behavior
 

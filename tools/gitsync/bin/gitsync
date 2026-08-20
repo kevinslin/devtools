@@ -7,13 +7,16 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -730,13 +733,25 @@ def _launchd_plist(config_path: Path, executable: Path) -> str:
     from xml.sax.saxutils import escape
 
     log_dir = Path("~/Library/Logs").expanduser()
+    home_dir = Path.home()
+    launchd_path = ":".join(
+        (
+            str(home_dir / ".local/bin"),
+            str(home_dir / "code/openai/project/dotslash-gen/bin"),
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        )
+    )
     codex_bin = os.environ.get("GITSYNC_CODEX_BIN") or shutil.which("codex")
     codex_environment = ""
     if codex_bin:
         codex_environment = (
-            "  <key>EnvironmentVariables</key>\n"
-            "  <dict><key>GITSYNC_CODEX_BIN</key>"
-            f"<string>{escape(str(Path(codex_bin).expanduser().resolve(strict=False)))}</string></dict>\n"
+            "    <key>GITSYNC_CODEX_BIN</key>"
+            f"<string>{escape(str(Path(codex_bin).expanduser().resolve(strict=False)))}</string>\n"
         )
     return f'''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -746,11 +761,17 @@ def _launchd_plist(config_path: Path, executable: Path) -> str:
   <key>ProgramArguments</key>
   <array>
     <string>{escape(str(executable))}</string>
+    <string>daemon</string>
     <string>--config</string><string>{escape(str(config_path))}</string>
-    <string>sync</string><string>--due</string>
+    <string>--interval</string><string>15</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>{escape(launchd_path)}</string>
 {codex_environment}\
-  <key>StartInterval</key><integer>60</integer>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>{escape(str(log_dir / (LAUNCHD_LABEL + '.log')))}</string>
   <key>StandardErrorPath</key><string>{escape(str(log_dir / (LAUNCHD_LABEL + '.error.log')))}</string>
@@ -778,6 +799,20 @@ def _status_filter(expression: str) -> bool:
     return value == "true"
 
 
+def _daemon_interval(value: str) -> float:
+    try:
+        interval = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "interval must be a positive, finite number of seconds"
+        ) from exc
+    if interval <= 0 or not math.isfinite(interval):
+        raise argparse.ArgumentTypeError(
+            "interval must be a positive, finite number of seconds"
+        )
+    return interval
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -803,14 +838,69 @@ def _parser() -> argparse.ArgumentParser:
         help="manually sync every repository, ignoring schedules (never force-pushes)",
     )
     selection.add_argument("--name", help="sync one repository by name")
+    daemon = subparsers.add_parser("daemon", help="continuously synchronize due repositories")
+    daemon.add_argument("--config", type=Path, default=argparse.SUPPRESS)
+    daemon.add_argument(
+        "--interval",
+        type=_daemon_interval,
+        default=15.0,
+        metavar="SECONDS",
+        help="seconds between scheduled sync cycles (default: 15)",
+    )
     launchd = subparsers.add_parser("launchd-plist", help="print a launchd agent plist")
     launchd.add_argument("--executable", type=Path, default=Path(__file__).resolve())
     return parser
 
 
+def _run_daemon(config_path: Path, interval: float) -> int:
+    shutdown = threading.Event()
+    shutdown_signal: int | None = None
+
+    def request_shutdown(signum: int, _frame: object) -> None:
+        nonlocal shutdown_signal
+        shutdown_signal = signum
+        shutdown.set()
+
+    previous_handlers = {
+        signum: signal.signal(signum, request_shutdown)
+        for signum in (signal.SIGINT, signal.SIGTERM)
+    }
+    print(
+        f"gitsync daemon: started (config={config_path}, interval={interval:g}s)",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        while not shutdown.is_set():
+            exit_code = main(("--config", str(config_path), "sync", "--due"))
+            sys.stdout.flush()
+            if shutdown.is_set():
+                break
+            if exit_code:
+                print(
+                    "gitsync daemon: scheduled sync exited with status "
+                    f"{exit_code}; retrying in {interval:g}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            shutdown.wait(interval)
+    finally:
+        for signum, previous_handler in previous_handlers.items():
+            signal.signal(signum, previous_handler)
+        signal_name = (
+            f" ({signal.Signals(shutdown_signal).name})"
+            if shutdown_signal is not None
+            else ""
+        )
+        print(f"gitsync daemon: stopped{signal_name}", file=sys.stderr, flush=True)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     config_path = args.config.expanduser().resolve(strict=False)
+    if args.command == "daemon":
+        return _run_daemon(config_path, args.interval)
     try:
         repos = load_config(config_path)
         if args.command == "validate":

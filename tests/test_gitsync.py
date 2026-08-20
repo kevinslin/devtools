@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -31,6 +35,7 @@ def git(repo: Path, *args: str) -> str:
 class GitsyncTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
+        self.daemon_processes: list[subprocess.Popen[str]] = []
         self.root = Path(self.temp.name)
         self.state = self.root / "state"
         self.logs = self.root / "logs"
@@ -54,6 +59,8 @@ class GitsyncTest(unittest.TestCase):
         self.write_config()
 
     def tearDown(self) -> None:
+        for process in self.daemon_processes:
+            self.stop_daemon(process)
         self.temp.cleanup()
 
     def write_config(self, **overrides: object) -> None:
@@ -71,6 +78,296 @@ class GitsyncTest(unittest.TestCase):
         if extra_env:
             env.update(extra_env)
         return run([sys.executable, str(CLI), "--config", str(self.config), *args], env=env)
+
+    def start_daemon(
+        self,
+        *,
+        interval: str = "0.05",
+        config_first: bool = False,
+        extra_env: dict[str, str] | None = None,
+    ) -> tuple[subprocess.Popen[str], Path]:
+        arguments = (
+            ["--config", str(self.config), "daemon", "--interval", interval]
+            if config_first
+            else ["daemon", "--config", str(self.config), "--interval", interval]
+        )
+        env = os.environ.copy()
+        env.update({"GITSYNC_STATE_DIR": str(self.state), "GITSYNC_LOG_DIR": str(self.logs)})
+        if extra_env:
+            env.update(extra_env)
+        stderr_path = self.root / f"daemon-{time.monotonic_ns()}.stderr"
+        with stderr_path.open("w", encoding="utf-8") as stderr:
+            process = subprocess.Popen(
+                [sys.executable, str(CLI), *arguments],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr,
+                text=True,
+            )
+        self.daemon_processes.append(process)
+        return process, stderr_path
+
+    @staticmethod
+    def stop_daemon(process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    def wait_for_daemon_log(
+        self,
+        process: subprocess.Popen[str],
+        stderr_path: Path,
+        predicate: Callable[[list[dict[str, object]]], bool],
+    ) -> list[dict[str, object]]:
+        deadline = time.monotonic() + 10
+        entries: list[dict[str, object]] = []
+        while time.monotonic() < deadline:
+            entries = []
+            for log_path in sorted(self.logs.glob("gitsync-*.log")) if self.logs.exists() else []:
+                for line in log_path.read_text(encoding="utf-8").splitlines():
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+            if predicate(entries):
+                return entries
+            if process.poll() is not None:
+                self.fail(
+                    f"daemon exited with status {process.returncode}: "
+                    f"{stderr_path.read_text(encoding='utf-8')}"
+                )
+            time.sleep(0.02)
+        self.fail(
+            f"daemon did not produce expected log entries: {entries!r}; "
+            f"stderr: {stderr_path.read_text(encoding='utf-8')}"
+        )
+
+    def test_daemon_reloads_schedules_and_preserves_claims_pull_safety_hooks_and_environment(self) -> None:
+        (self.repo / "local.txt").write_text("local commit stays local\n", encoding="utf-8")
+        git(self.repo, "add", "local.txt")
+        git(self.repo, "commit", "-m", "local pull-only commit")
+        local_tip = git(self.repo, "rev-parse", "HEAD")
+        remote_tip = git(self.remote, "rev-parse", "refs/heads/main")
+        hook_record = self.root / "hook-environment.json"
+        hook = (
+            "import json,os,sys; from pathlib import Path; "
+            "Path(sys.argv[1]).write_text(json.dumps({"
+            "'repo':os.environ['GITSYNC_REPO_NAME'],"
+            "'inherited':os.environ['GITSYNC_TEST_SUPERVISOR_CONTEXT']}))"
+        )
+        self.write_config(sync_schedule="0 0 31 2 *", mode="pull")
+        process, stderr_path = self.start_daemon(
+            extra_env={"GITSYNC_TEST_SUPERVISOR_CONTEXT": "inherited-test-context"}
+        )
+
+        initial = self.wait_for_daemon_log(
+            process, stderr_path, lambda entries: len(entries) >= 1
+        )
+        self.assertEqual(initial[0]["selection"], "due")
+        self.assertEqual(initial[0]["selected"], 0)
+        self.assertFalse(hook_record.exists())
+
+        self.write_config(
+            sync_schedule="* * * * *",
+            mode="pull",
+            post_sync=[sys.executable, "-c", hook, str(hook_record)],
+        )
+        self.wait_for_daemon_log(
+            process,
+            stderr_path,
+            lambda entries: any(entry.get("selected") == 1 for entry in entries),
+        )
+        entries = self.wait_for_daemon_log(
+            process,
+            stderr_path,
+            lambda current: any(entry.get("selected") == 1 for entry in current)
+            and current[-1].get("selected") == 0,
+        )
+        self.stop_daemon(process)
+
+        selected = [entry for entry in entries if entry.get("selected") == 1]
+        self.assertEqual(len(selected), 1)
+        result = selected[0]["results"][0]
+        self.assertEqual(result["mode"], "pull")
+        self.assertEqual(result["push"], "skipped")
+        self.assertEqual(
+            json.loads(hook_record.read_text(encoding="utf-8")),
+            {"repo": "test", "inherited": "inherited-test-context"},
+        )
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), local_tip)
+        self.assertEqual(git(self.remote, "rev-parse", "refs/heads/main"), remote_tip)
+
+    def test_daemon_recovers_from_missing_and_invalid_configuration(self) -> None:
+        self.config.unlink()
+        process, stderr_path = self.start_daemon()
+
+        self.wait_for_daemon_log(
+            process,
+            stderr_path,
+            lambda entries: any(
+                entry.get("exit_code") == 2
+                and "failed to read config" in str(entry.get("error", ""))
+                for entry in entries
+            ),
+        )
+
+        self.config.write_text("not valid JSON\n", encoding="utf-8")
+        self.wait_for_daemon_log(
+            process,
+            stderr_path,
+            lambda entries: any(
+                entry.get("exit_code") == 2
+                and "invalid config JSON" in str(entry.get("error", ""))
+                for entry in entries
+            ),
+        )
+
+        self.write_config(sync_schedule="* * * * *")
+        entries = self.wait_for_daemon_log(
+            process,
+            stderr_path,
+            lambda current: any(
+                entry.get("exit_code") == 0 and entry.get("selected") == 1
+                for entry in current
+            ),
+        )
+        self.stop_daemon(process)
+
+        self.assertEqual(entries[-1]["status"], "ok")
+        self.assertIn("scheduled sync exited with status 2", stderr_path.read_text(encoding="utf-8"))
+
+    def test_daemon_retries_failed_post_sync_hooks_and_preserves_due_claims(self) -> None:
+        attempts = self.root / "hook-attempts.txt"
+        hook = (
+            "import sys; from pathlib import Path; "
+            "record=Path(sys.argv[1]); "
+            "attempt=int(record.read_text())+1 if record.exists() else 1; "
+            "record.write_text(str(attempt)); "
+            "print('retry requested',file=sys.stderr) if attempt == 1 else None; "
+            "sys.exit(17 if attempt == 1 else 0)"
+        )
+        self.write_config(
+            sync_schedule="* * * * *",
+            post_sync=[sys.executable, "-c", hook, str(attempts)],
+        )
+        process, stderr_path = self.start_daemon()
+
+        entries = self.wait_for_daemon_log(
+            process,
+            stderr_path,
+            lambda current: any(entry.get("exit_code") == 1 for entry in current)
+            and any(
+                entry.get("exit_code") == 0 and entry.get("selected") == 1
+                for entry in current
+            ),
+        )
+        self.stop_daemon(process)
+
+        selected = [entry for entry in entries if entry.get("selected") == 1]
+        self.assertEqual([entry["exit_code"] for entry in selected], [1, 0])
+        self.assertIn("post-sync hook failed (exit 17)", selected[0]["results"][0]["blocker"])
+        self.assertEqual(attempts.read_text(encoding="utf-8"), "2")
+        self.assertIn("scheduled sync exited with status 1", stderr_path.read_text(encoding="utf-8"))
+
+    def test_daemon_accepts_both_config_positions_and_shutdown_signals_interrupt_wait(self) -> None:
+        for shutdown_signal, config_first in ((signal.SIGTERM, False), (signal.SIGINT, True)):
+            with self.subTest(signal=shutdown_signal.name, config_first=config_first):
+                existing = (
+                    sum(
+                        len(path.read_text(encoding="utf-8").splitlines())
+                        for path in self.logs.glob("gitsync-*.log")
+                    )
+                    if self.logs.exists()
+                    else 0
+                )
+                process, stderr_path = self.start_daemon(interval="30", config_first=config_first)
+                self.wait_for_daemon_log(
+                    process,
+                    stderr_path,
+                    lambda entries: len(entries) > existing,
+                )
+
+                started = time.monotonic()
+                process.send_signal(shutdown_signal)
+                process.wait(timeout=5)
+
+                self.assertLess(time.monotonic() - started, 5)
+                self.assertEqual(process.returncode, 0)
+                stderr = stderr_path.read_text(encoding="utf-8")
+                self.assertIn("gitsync daemon: started", stderr)
+                self.assertIn(f"gitsync daemon: stopped ({shutdown_signal.name})", stderr)
+
+    def test_daemon_finishes_active_post_sync_hook_before_shutdown(self) -> None:
+        started = self.root / "hook-started"
+        release = self.root / "hook-release"
+        completed = self.root / "hook-completed"
+        hook_script = self.root / "wait-for-release.py"
+        hook_script.write_text(
+            "import sys,time\n"
+            "from pathlib import Path\n"
+            "started,release,completed=map(Path,sys.argv[1:])\n"
+            "started.touch()\n"
+            "deadline=time.monotonic()+10\n"
+            "while not release.exists():\n"
+            "    if time.monotonic() >= deadline:\n"
+            "        raise SystemExit('hook release timed out')\n"
+            "    time.sleep(0.02)\n"
+            "completed.write_text('completed\\n')\n",
+            encoding="utf-8",
+        )
+        self.write_config(
+            sync_schedule="* * * * *",
+            post_sync=[sys.executable, str(hook_script), str(started), str(release), str(completed)],
+        )
+        process, stderr_path = self.start_daemon(interval="30")
+
+        deadline = time.monotonic() + 5
+        while not started.exists() and time.monotonic() < deadline:
+            if process.poll() is not None:
+                self.fail(
+                    f"daemon exited before hook started: "
+                    f"{stderr_path.read_text(encoding='utf-8')}"
+                )
+            time.sleep(0.02)
+        self.assertTrue(started.exists(), stderr_path.read_text(encoding="utf-8"))
+
+        process.terminate()
+        self.assertIsNone(process.poll())
+        release.touch()
+        process.wait(timeout=5)
+
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(completed.read_text(encoding="utf-8"), "completed\n")
+        daily_log = self.logs / f"gitsync-{datetime.now().astimezone():%Y-%m-%d}.log"
+        entries = [json.loads(line) for line in daily_log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["exit_code"], 0)
+        self.assertEqual(entries[0]["selected"], 1)
+        self.assertIn("gitsync daemon: stopped (SIGTERM)", stderr_path.read_text(encoding="utf-8"))
+
+    def test_daemon_rejects_nonpositive_nonfinite_and_invalid_intervals(self) -> None:
+        for interval in ("0", "-1", "nan", "inf", "-inf", "not-a-number"):
+            with self.subTest(interval=interval):
+                result = run(
+                    [
+                        sys.executable,
+                        str(CLI),
+                        "daemon",
+                        "--config",
+                        str(self.config),
+                        f"--interval={interval}",
+                    ],
+                    env={"GITSYNC_STATE_DIR": str(self.state), "GITSYNC_LOG_DIR": str(self.logs)},
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("interval must be a positive, finite number of seconds", result.stderr)
+        self.assertFalse(self.logs.exists())
 
     def test_sync_appends_success_and_blocked_runs_to_private_daily_log(self) -> None:
         successful = self.cli("sync", "--all")
@@ -871,12 +1168,59 @@ class GitsyncTest(unittest.TestCase):
         self.assertEqual(json.loads(third_attempt.stdout)["selected"], 0)
         self.assertEqual(first_record.read_text(encoding="utf-8"), "2")
 
-    def test_launchd_plist_uses_due_mode_and_minute_trigger(self) -> None:
-        result = self.cli("launchd-plist")
+    def test_launchd_plist_supervises_one_foreground_daemon(self) -> None:
+        executable = self.root / "gitsync & launcher"
+        codex_bin = self.root / "codex & binary"
+        result = self.cli(
+            "launchd-plist",
+            "--executable",
+            str(executable),
+            extra_env={"GITSYNC_CODEX_BIN": str(codex_bin)},
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("<integer>60</integer>", result.stdout)
-        self.assertIn("<string>--due</string>", result.stdout)
-        self.assertIn(str(self.config), result.stdout)
+
+        job = plistlib.loads(result.stdout.encode("utf-8"))
+        self.assertEqual(job["Label"], "com.kevinlin.gitsync")
+        self.assertEqual(
+            job["ProgramArguments"],
+            [
+                str(executable.resolve(strict=False)),
+                "daemon",
+                "--config",
+                str(self.config.resolve(strict=False)),
+                "--interval",
+                "15",
+            ],
+        )
+        self.assertIs(job["RunAtLoad"], True)
+        self.assertIs(job["KeepAlive"], True)
+        self.assertNotIn("StartInterval", job)
+        self.assertEqual(job["ProcessType"], "Background")
+        launchd_path = ":".join(
+            [
+                str(Path.home() / ".local/bin"),
+                str(Path.home() / "code/openai/project/dotslash-gen/bin"),
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+                "/usr/bin",
+                "/bin",
+                "/usr/sbin",
+                "/sbin",
+            ]
+        )
+        self.assertEqual(
+            job["EnvironmentVariables"],
+            {
+                "PATH": launchd_path,
+                "GITSYNC_CODEX_BIN": str(codex_bin.resolve(strict=False)),
+            },
+        )
+        log_dir = Path("~/Library/Logs").expanduser()
+        self.assertEqual(job["StandardOutPath"], str(log_dir / "com.kevinlin.gitsync.log"))
+        self.assertEqual(
+            job["StandardErrorPath"],
+            str(log_dir / "com.kevinlin.gitsync.error.log"),
+        )
 
     def test_cron_day_fields_follow_standard_wildcard_and_or_semantics(self) -> None:
         import importlib.machinery
