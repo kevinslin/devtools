@@ -298,8 +298,9 @@ Validate the selected profile before activating it; machine-specific profiles
 must keep the appropriate repository paths, schedules, modes, and hooks.
 
 For automatic configuration updates, add two ordered post-sync hooks: first
-apply only the managed gitsync profiles and supervisor program configuration;
-then run `tools/gitsync/scripts/supervisor-sync`. The Linux-only helper rereads
+run noninteractive `chezmoi apply --force` against only the explicitly listed
+managed gitsync profiles and supervisor program configuration; then run
+`tools/gitsync/scripts/supervisor-sync`. The Linux-only helper rereads
 `$HOME/.config/supervisor/supervisord.conf` and inspects the exact managed
 program. Unchanged configuration and changes to unrelated programs are no-ops.
 When the managed program changes, a fully detached worker waits for the active
